@@ -33,6 +33,7 @@ Responsibilities:
 - Returns translated markdown output
 - Keeps model communication logic separate from batch execution logic
 
+
 `scripts/run_raw_markdown_translation.py`
 
 Batch runner for markdown translation across page folders.
@@ -45,6 +46,7 @@ Responsibilities:
 - Writes translated markdown outputs
 - Records success and failure status in a summary file
 
+
 `scripts/markdown_to_pdf_batch_nosudo.py`
 
 Batch markdown-to-PDF conversion utility.
@@ -53,6 +55,7 @@ Responsibilities:
 - Reads translated markdown outputs
 - Converts markdown files into PDFs
 - Uses a Python-based conversion approach
+
 
 `prompts/raw_markdown_prompt.txt`
 
@@ -64,7 +67,7 @@ Responsibilities:
 - Maintains fidelity for technical agricultural terminology
 - Reduces semantic substitution during translation
 
-##Workflow
+## Workflow
 
 The pipeline follows a two-stage process:
 
@@ -80,28 +83,28 @@ The pipeline follows a two-stage process:
 
 This page-based workflow is intentionally designed to support easier validation, QA, and targeted correction of individual pages.
 
-##Model and Configuration
+## Model and Configuration
 
-###Hosted Model Endpoint
+### Hosted Model Endpoint
 - Endpoint: http://100.100.108.44:8013/v1/chat/completions
 - Model: google/gemma-4-26B-A4B-it
 
-###Generation Settings
+### Generation Settings
 - temperature: 0.0
 - max_tokens: 8192
 - top_p: 0.95
 - timeout: 300
 
-##Usage
+## Usage
 
-###Prerequisites
+### Prerequisites
 
 Before running the pipeline:
 - Ensure the environment variables expected by `scripts/gemma_client.py` are configured
 - Prepare page-wise source markdown inputs locally
 - Use a Python environment with the dependencies required by the scripts
 
-###Run Translation
+### Run Translation
 
 ```
 python3 scripts/run_raw_markdown_translation.py \
@@ -116,7 +119,7 @@ This step:
 - Generates translated markdown under `--output_root`
 - Writes execution status information to a summary log
 
-###Generate PDFs from Translated Markdown
+### Generate PDFs from Translated Markdown
 
 ```
 ./pdf_env/bin/python scripts/markdown_to_pdf_batch_nosudo.py \
@@ -129,11 +132,10 @@ This step:
 - Converts them into PDFs
 - Writes PDF outputs to `--output_root`
 
-##Notes and Limitations
+## Notes and Limitations
 
 - The quality of translation depends on the hosted model behavior and the effectiveness of the prompt.
 - Markdown preservation is a design goal but complex formatting may still require manual review.
 - Table fidelity is prioritized but edge cases in malformed or highly irregular source markdown may need correction after translation.
 - PDF generation is a separate downstream step and may surface formatting differences relative to the markdown source.
 - The repository currently provides the pipeline implementation only; users are responsible for supplying their own input data and managing local output directories.
-
