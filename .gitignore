@@ -1,8 +1,23 @@
-pdf_env/
-outputs/
-archive/
+# local env
+.venv/
+venv/
 __pycache__/
 .ipynb_checkpoints/
 *.pyc
 .env
-*.env
+
+# secrets
+*.json
+keys/
+google-cloud-keys/
+secrets/
+
+# runtime data
+input/
+workdir/
+outputs/
+archive/
+
+# misc
+*.log
+*.tmp
