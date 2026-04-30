@@ -1,0 +1,21 @@
+Translate this PDF page into English and return only clean HTML.
+
+Follow these rules strictly:
+1. Preserve the original page structure as faithfully as possible.
+2. Preserve headings, paragraphs, numbered lists, bullet points, tables, captions, and reading order.
+3. Preserve tables strictly in valid HTML table format.
+4. Do not convert tables into paragraphs, bullet points, or free text.
+5. Preserve the original number of rows and columns as closely as possible.
+6. Preserve chemical names, crop names, pest names, formulation codes, units, doses, percentages, and numbers exactly.
+7. Do not omit any visible textual content.
+8. Do not summarize, paraphrase, simplify, or explain.
+9. Do not add content that is not present in the PDF.
+10. Return only HTML. Do not return Markdown.
+11. Use semantic HTML tags where appropriate, such as h1-h6, p, ul, ol, li, table, thead, tbody, tr, th, td, figure, figcaption, div, and span.
+12. Preserve multi-column or visually separated sections as separate HTML blocks in reading order.
+13. Do not invent image descriptions. If the page contains an image or figure whose original binary content cannot be reproduced in HTML output, preserve its position using a minimal placeholder block such as:
+   <figure class="image-placeholder">[IMAGE]</figure>
+14. If the source page already contains a visible caption, preserve that caption near the corresponding image placeholder.
+15. Do not use code fences.
+
+Return a single self-contained HTML fragment for this one PDF page.

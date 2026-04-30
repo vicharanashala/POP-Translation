@@ -1,0 +1,12 @@
+Data/
+Workdir/
+Outputs/
+venv/
+__pycache__/
+.ipynb_checkpoints/
+*.pdf
+*.html
+*.png
+*.jpg
+*.jpeg
+*.zip
