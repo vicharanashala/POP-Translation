@@ -13,9 +13,9 @@ The pipeline is designed to process a source POP document in a controlled, page-
 ### Final workflow
 
 1. Split the source POP document into **page-wise PDF files**
-2. Send each page PDF directly to **Gemini** for English translation
-3. Save the translated output as **Markdown**
-4. Convert translated Markdown into **page-wise PDF files**
+2. Send each page PDF directly to **Gemini** for English translation to get output in HTML file
+3. Extract images from the original PDF and then inject them back into the **Translated HTML File**
+4. Convert translated HTML files into **page-wise PDF files**
 5. Merge all translated page PDFs into one **final translated PDF**
 
 ---
@@ -25,12 +25,13 @@ The pipeline is designed to process a source POP document in a controlled, page-
 ```text
 POP-Translation/
 ├── notebooks/
-│   ├── 01_document_pdf_to_pagewise_pdf.ipynb
-│   ├── 02_page_pdf_to_translated_output.ipynb
-│   ├── 03_translated_output_to_page_pdf.ipynb
-│   └── 04_merge_page_pdfs_to_final_pdf.ipynb
+│   ├── 01_document_to_pagewise_pdf.ipynb
+│   ├── 02_page_pdf_to_translated_html.ipynb
+│   ├── 03_extract_and_inject_images.ipynb
+│   ├── 04_final_html_to_page_pdf.ipynb
+│   └── 05_merge_page_pdfs.ipynb
 ├── prompts/
-│   └── gemini_direct_pdf_translation_prompt.txt
+│   └── page_to_pdf.txt
 ├── .gitignore
 └── README.md
 ```
@@ -39,17 +40,20 @@ POP-Translation/
 
 ## Notebook Pipeline
 
-1. ```01_document_pdf_to_pagewise_pdf.ipynb```
-Splits the source POP document into page-wise PDF files for a selected page range.
+1. ```01_document_to_pagewise_pdf.ipynb```
+Splits the source POP document into page-wise PDF files for a selected page range and document.
 
-2. ```02_page_pdf_to_translated_output.ipynb```
-Reads each page-wise PDF and sends it directly to Gemini for English translation while attempting to preserve structure.
+2. ```02_page_pdf_to_translated_html.ipynb```
+Reads each page-wise PDF and sends it directly to Gemini for English translation while attempting to preserve structure by converting it into an HTML file.
 
-3. ```03_translated_output_to_page_pdf.ipynb```
-Converts each translated Markdown file into a page-wise PDF.
+3. ```03_extract_and_inject_images.ipynb```
+Extracts the images from the original page-wise PDF and injects them back into the translated HTML File.
 
-4. ```04_merge_page_pdfs_to_final_pdf.ipynb```
-Merges all page-wise translated PDFs into one final translated PDF.
+4. ```04_final_html_to_page_pdf.ipynb```
+Converts the HTML files into PDF page-wise files.
+
+5. ```05_merge_page_pdfs.ipynb```
+Merges all the page-wise PDF files into one final translated PDF file.
 
 ---
 
@@ -62,17 +66,17 @@ python3 -m venv venv
 source venv/bin/activate
 
 pip install --upgrade pip
-pip install google-genai pymupdf markdown-pdf ipykernel
+pip install google-genai pymupdf beautifulsoup4 weasyprint ipykernel
 ```
 Register the environment as a Jupyter kernel:
 ```
 python -m ipykernel install --user \
-  --name pop_translation_pipeline \
-  --display-name "Python (pop_translation_pipeline)"
+  --name  gemini_html_output \
+  --display-name "Python (gemini_html_output)"
 ```
 In Jupyter, switch the notebook kernel to:
 ```
-Python (pop_translation_pipeline)
+Python (gemini_html_output)
 ```
 
 ---
@@ -83,8 +87,9 @@ This project uses:
 
 1. google-genai
 2. pymupdf
-3. markdown-pdf
-4. ipykernel
+3. beautifulsoup4
+4. weasyprint
+5. ipykernel
 
 ---
 
@@ -93,9 +98,9 @@ This project uses:
 Place the source POP document PDF locally before running the notebooks.
 Example source file:
 ```
-input/Kannada POP.pdf
+Hindi/POP.pdf
 ```
-The notebooks are designed so that the source PDF path, page range, job name, and model configuration can be changed from the config cell.
+The notebooks are designed so that the source PDF path, page range and model configuration can be changed from the config cell.
 
 ---
 
@@ -115,17 +120,27 @@ The translation notebook reads the key from the environment.
 A typical local working structure looks like this:
 
 ```
-workdir/<job_name>/
-├── pages_pdf/
-│   ├── page_16/
-│   │   ├── page_16.pdf
-│   │   ├── translated_en.md
-│   │   └── translated_en.pdf
-│   ├── page_17/
-│   │   ├── page_17.pdf
-│   │   ├── translated_en.md
-│   │   └── translated_en.pdf
-│   └── ...
-└── final_output/
-    └── <job_name>_translated_pages_<start>_to_<end>.pdf
+Workdir/
+└── Hindi/
+    └── source/
+        ├── page_001/
+        │   ├── page_001.pdf
+        │   ├── translated.html
+        │   ├── images/
+        │   │   ├── image_1.png
+        │   │   └── image_2.png
+        │   ├── final_with_images.html
+        │   ├── final_with_images_preview.html
+        │   └── final_page.pdf
+        ├── page_002/
+        │   ├── page_002.pdf
+        │   ├── translated.html
+        │   ├── images/
+        │   ├── final_with_images.html
+        │   ├── final_with_images_preview.html
+        │   └── final_page.pdf
+        ├── page_003/
+        │   └── ...
+        └── final_output/
+             └── source_translated_pages_001_to_227.pdf
 ```
