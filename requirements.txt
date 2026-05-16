@@ -1,0 +1,5 @@
+google-genai
+pymupdf
+beautifulsoup4
+python-docx
+docxcompose
