@@ -173,17 +173,18 @@ python scripts\run_pop_to_docx.py --source-pdf "Data\Karnataka\Ginger\Rhizome ro
 
 ## Important Command Arguments
 
-Argument	Purpose
---source-pdf :	Path to input PDF
---workdir-root :	Working/output folder for that document
---doc-name :	Base name used for combined HTML and DOCX
---prompt-file :	Path to translation prompt
---start-page :	First page to process
---end-page :	Last page to process
---concurrency :	Number of pages translated in parallel
---overwrite :	Reprocess existing outputs
---skip-translation :	Skip Gemini translation and reuse existing translated.html
---skip-image-injection :	Skip image extraction/injection and reuse existing final_with_images.html
+Argument	Purpose:
+
+- --source-pdf :	Path to input PDF
+- --workdir-root :	Working/output folder for that document
+- --doc-name :	Base name used for combined HTML and DOCX
+- --prompt-file :	Path to translation prompt
+- --start-page :	First page to process
+- --end-page :	Last page to process
+- --concurrency :	Number of pages translated in parallel
+- --overwrite :	Reprocess existing outputs
+- --skip-translation :	Skip Gemini translation and reuse existing translated.html
+- --skip-image-injection :	Skip image extraction/injection and reuse existing final_with_images.html
 
 ## Resume Behaviour
 
