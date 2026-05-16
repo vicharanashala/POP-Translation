@@ -1,146 +1,274 @@
 # POP Translation Pipeline
 
-A notebook-based pipeline for translating agricultural POP (Package of Practices) document pages directly from PDF into English while preserving structure as closely as possible.
+This repository contains a production-oriented pipeline for translating agricultural POP (Package of Practices) PDF documents into English using the Gemini API and generating editable Word (`.docx`) outputs for review by agriculture experts.
 
-This project uses a **PDF-page translation workflow** with Gemini. In testing, this method produced stronger overall results and better structure preservation, especially when paired with the **Gemini Pro** model for difficult pages containing complex tables.
-
----
-
-## Overview
-
-The pipeline is designed to process a source POP document in a controlled, page-range-based workflow.
-
-### Final workflow
-
-1. Split the source POP document into **page-wise PDF files**
-2. Send each page PDF directly to **Gemini** for English translation to get output in HTML file
-3. Extract images from the original PDF and then inject them back into the **Translated HTML File**
-4. Convert translated HTML files into **page-wise PDF files**
-5. Merge all translated page PDFs into one **final translated PDF**
+The pipeline was designed for POP documents that contain agricultural instructions, tables, chemical names, crop names, pest/disease names, formulation codes, units, doses, percentages, images, and structured technical content.
 
 ---
 
-## Repository Structure
+## Objective
+
+The objective of this project is to translate priority agricultural POP documents into English while preserving the document structure as much as possible.
+
+The final output is generated as an editable `.docx` file so that agriculture experts can easily:
+
+- review translations,
+- correct technical terms,
+- edit table values,
+- add missing points,
+- add comments or suggestions,
+- and finalize the document for downstream use.
+
+---
+
+## Current Pipeline
+
+The current pipeline processes a source PDF page-by-page.
 
 ```text
+Source PDF
+   ↓
+Split into page-wise PDFs
+   ↓
+Send each page PDF to Gemini
+   ↓
+Generate translated HTML per page
+   ↓
+Extract and inject original page images
+   ↓
+Merge translated HTML pages
+   ↓
+Convert combined HTML to DOCX using Pandoc
+   ↓
+Final editable Word file
+```
+
+The pipeline is implemented in:
+```scripts/run_pop_to_docx.py```
+
+The translation prompt is stored separately in:
+```prompts/page_to_pdf.txt```
+
+## Repository Structure
+```
 POP-Translation/
-├── notebooks/
-│   ├── 01_document_to_pagewise_pdf.ipynb
-│   ├── 02_page_pdf_to_translated_html.ipynb
-│   ├── 03_extract_and_inject_images.ipynb
-│   ├── 04_final_html_to_page_pdf.ipynb
-│   └── 05_merge_page_pdfs.ipynb
 ├── prompts/
 │   └── page_to_pdf.txt
-├── .gitignore
+│
+├── scripts/
+│   └── run_pop_to_docx.py
+│
+├── requirements.txt
+├── README.md
+└── .gitignore
+```
+
+Recommended local working structure:
+```
+POP_Work/
+├── Data/
+│   └── Karnataka/
+│       ├── Ginger/
+│       ├── Onion/
+│       ├── Bengal gram/
+│       ├── Sugarcane/
+│       └── ...
+│
+├── Workdir/
+│   └── Karnataka/
+│       └── <Crop>/
+│           └── <Document_Output_Folder>/
+│
+├── prompts/
+├── scripts/
+├── requirements.txt
 └── README.md
 ```
 
----
+## Main Features
 
-## Notebook Pipeline
+- Page-wise PDF splitting
+- Gemini-based translation
+- HTML output generation
+- Original image extraction from PDF pages
+- Image injection into translated HTML
+- Combined HTML generation
+- DOCX generation using Pandoc
+- Resume support
+- Page-wise intermediate outputs
+- Runtime logging
+- Parallel page translation using concurrency
+- Optional page range processing
+- Skip translation and rebuild DOCX from existing HTML
+- Safe reruns without overwriting completed pages
 
-1. ```01_document_to_pagewise_pdf.ipynb```
-Splits the source POP document into page-wise PDF files for a selected page range and document.
+## Gemini Translation Configuration
 
-2. ```02_page_pdf_to_translated_html.ipynb```
-Reads each page-wise PDF and sends it directly to Gemini for English translation while attempting to preserve structure by converting it into an HTML file.
+Current configuration:
+```
+Model: gemini-3.1-pro-preview
+Thinking level: HIGH
+Google Search: Enabled
+Input: Page-wise PDF bytes
+Output: Clean translated HTML
+```
 
-3. ```03_extract_and_inject_images.ipynb```
-Extracts the images from the original page-wise PDF and injects them back into the translated HTML File.
+## Requirements
 
-4. ```04_final_html_to_page_pdf.ipynb```
-Converts the HTML files into PDF page-wise files.
+Recommended Python version:
+```
+Python 3.11+
+```
 
-5. ```05_merge_page_pdfs.ipynb```
-Merges all the page-wise PDF files into one final translated PDF file.
+Install required Python packages using:
+```
+pip install -r requirements.txt
+```
 
----
+Pandoc is required for converting combined HTML into .docx.
+Install Pandoc separately and check installation:
+```
+pandoc --version
+```
 
 ## Environment Setup
 
-Create a virtual environment and install the required packages:
+1. Clone the repository:
 ```
-cd ~/POP-Translation
-python3 -m venv venv
-source venv/bin/activate
-
-pip install --upgrade pip
-pip install google-genai pymupdf beautifulsoup4 weasyprint ipykernel
+git clone https://github.com/vicharanashala/POP-Translation.git
+cd POP-Translation
 ```
-Register the environment as a Jupyter kernel:
+2. Create virtual environment:
 ```
-python -m ipykernel install --user \
-  --name  gemini_html_output \
-  --display-name "Python (gemini_html_output)"
+python -m venv venv
+venv\Scripts\activate
 ```
-In Jupyter, switch the notebook kernel to:
+3. Install dependencies:
 ```
-Python (gemini_html_output)
+pip install -r requirements.txt
+```
+4. Set Gemini API key:
+```
+set GEMINI_API_KEY=PASTE_YOUR_GEMINI_API_KEY_HERE
 ```
 
----
+## Input Folder
 
-## Required Dependencies
-
-This project uses:
-
-1. google-genai
-2. pymupdf
-3. beautifulsoup4
-4. weasyprint
-5. ipykernel
-
----
-
-## Input Requirements
-
-Place the source POP document PDF locally before running the notebooks.
-Example source file:
+Place source PDFs inside the Data/ folder.
+Example:
 ```
-Hindi/POP.pdf
+Data/
+└── Karnataka/
+    └── Ginger/
+        └── Rhizome rot management in ginger_KVK Krishi Vigyana Kendra, Shivamogga, Karnataka.pdf
 ```
-The notebooks are designed so that the source PDF path, page range and model configuration can be changed from the config cell.
 
----
+## Basic Usage
 
-## API Key Setup
-
-Set your Gemini API key before running the translation notebook.
-Recommended method: environment variable
+Run the pipeline from the project root.
+Example:
 ```
-export GEMINI_API_KEY="YOUR_GEMINI_API_KEY"
+python scripts\run_pop_to_docx.py --source-pdf "Data\Karnataka\Ginger\Rhizome rot management in ginger_KVK Krishi Vigyana Kendra, Shivamogga, Karnataka.pdf" --workdir-root "Workdir\Karnataka\Ginger\Rhizome rot management in ginger_KVK Krishi Vigyana Kendra, Shivamogga, Karnataka" --doc-name "Rhizome rot management in ginger_KVK Krishi Vigyana Kendra, Shivamogga, Karnataka" --prompt-file "prompts\page_to_pdf.txt" --start-page 1 --end-page 1 --concurrency 1
 ```
-The translation notebook reads the key from the environment.
 
----
+## Important Command Arguments
+
+Argument	Purpose
+--source-pdf :	Path to input PDF
+--workdir-root :	Working/output folder for that document
+--doc-name :	Base name used for combined HTML and DOCX
+--prompt-file :	Path to translation prompt
+--start-page :	First page to process
+--end-page :	Last page to process
+--concurrency :	Number of pages translated in parallel
+--overwrite :	Reprocess existing outputs
+--skip-translation :	Skip Gemini translation and reuse existing translated.html
+--skip-image-injection :	Skip image extraction/injection and reuse existing final_with_images.html
+
+## Resume Behaviour
+
+The pipeline is resumable.
+
+Each page has its own folder:
+```
+page_001/
+├── page_001.pdf
+├── translated.html
+├── images/
+└── final_with_images.html
+```
+If the script stops midway, rerun the same command without --overwrite.
+
+The script will skip completed pages:
+```
+translated.html already exists
+final_with_images.html already exists
+```
+Only missing pages will be processed again.
 
 ## Output Structure
 
-A typical local working structure looks like this:
+For each processed document, the output folder contains:
+```
+Workdir/<State>/<Crop>/<Document_Name>/
+├── page_001/
+│   ├── page_001.pdf
+│   ├── translated.html
+│   ├── images/
+│   └── final_with_images.html
+│
+├── page_002/
+│   ├── page_002.pdf
+│   ├── translated.html
+│   ├── images/
+│   └── final_with_images.html
+│
+├── translation_summary.json
+├── image_injection_summary.json
+├── pipeline_runtime.log
+├── <doc-name>_combined_pages_001_to_XXX.html
+└── final_output/
+    └── <doc-name>_translated_pages_001_to_XXX.docx
+```
 
+Final DOCX output is saved inside:
 ```
-Workdir/
-└── Hindi/
-    └── source/
-        ├── page_001/
-        │   ├── page_001.pdf
-        │   ├── translated.html
-        │   ├── images/
-        │   │   ├── image_1.png
-        │   │   └── image_2.png
-        │   ├── final_with_images.html
-        │   ├── final_with_images_preview.html
-        │   └── final_page.pdf
-        ├── page_002/
-        │   ├── page_002.pdf
-        │   ├── translated.html
-        │   ├── images/
-        │   ├── final_with_images.html
-        │   ├── final_with_images_preview.html
-        │   └── final_page.pdf
-        ├── page_003/
-        │   └── ...
-        └── final_output/
-             └── source_translated_pages_001_to_227.pdf
+final_output/
 ```
+
+## Runtime Logs
+
+The script creates a runtime log:
+```
+pipeline_runtime.log
+```
+
+This log records:
+
+- pipeline configuration,
+- page splitting status,
+- translation progress,
+- Gemini request timing,
+- retry attempts,
+- image injection progress,
+- combined HTML generation,
+- DOCX conversion,
+- final output path.
+
+## Parallel Processing
+
+The pipeline supports concurrent page translation.
+Example:
+```
+--concurrency 2
+```
+Higher concurrency may increase speed, but can also increase the chance of API rate-limit errors or stuck requests.
+
+## Known Limitations
+
+1. Pandoc may produce incomplete DOCX files for some very large or complex HTML documents.
+2. Some documents may need chunk-wise DOCX generation.
+3. A few problematic pages may need to be generated separately. 
+4. The script currently assumes Pandoc is installed and available in system PATH.
+5. API rate limits may affect concurrency. 
+6. Output quality depends on the source PDF quality and Gemini response.
