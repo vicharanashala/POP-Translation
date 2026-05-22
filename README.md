@@ -36,15 +36,13 @@ Generate translated HTML per page
    ↓
 Extract and inject original page images
    ↓
-Merge translated HTML pages
-   ↓
-Convert combined HTML to DOCX using Pandoc
+Convert HTML to DOCX using Pandoc
    ↓
 Final editable Word file
 ```
 
 The pipeline is implemented in:
-```scripts/run_pop_to_docx.py```
+```scripts/run_pop_to_docx_updated_pagewise_docx.py```
 
 The translation prompt is stored separately in:
 ```prompts/page_to_pdf.txt```
@@ -56,7 +54,7 @@ POP-Translation/
 │   └── page_to_pdf.txt
 │
 ├── scripts/
-│   └── run_pop_to_docx.py
+│   └── run_pop_to_docx_updated_pagewise_docx.py
 │
 ├── requirements.txt
 ├── README.md
@@ -168,7 +166,7 @@ Data/
 Run the pipeline from the project root.
 Example:
 ```
-python scripts\run_pop_to_docx.py --source-pdf "Data\Karnataka\Ginger\Rhizome rot management in ginger_KVK Krishi Vigyana Kendra, Shivamogga, Karnataka.pdf" --workdir-root "Workdir\Karnataka\Ginger\Rhizome rot management in ginger_KVK Krishi Vigyana Kendra, Shivamogga, Karnataka" --doc-name "Rhizome rot management in ginger_KVK Krishi Vigyana Kendra, Shivamogga, Karnataka" --prompt-file "prompts\page_to_pdf.txt" --start-page 1 --end-page 1 --concurrency 1
+python scripts\run_pop_to_docx_updated_pagewise_docx.py --source-pdf "Data\Karnataka\Ginger\Rhizome rot management in ginger_KVK Krishi Vigyana Kendra, Shivamogga, Karnataka.pdf" --workdir-root "Workdir\Karnataka\Ginger\Rhizome rot management in ginger_KVK Krishi Vigyana Kendra, Shivamogga, Karnataka" --doc-name "Rhizome rot management in ginger_KVK Krishi Vigyana Kendra, Shivamogga, Karnataka" --prompt-file "prompts\page_to_pdf.txt" --start-page 1 --end-page 1 --concurrency 1
 ```
 
 ## Important Command Arguments
@@ -267,9 +265,7 @@ Higher concurrency may increase speed, but can also increase the chance of API r
 
 ## Known Limitations
 
-1. Pandoc may produce incomplete DOCX files for some very large or complex HTML documents.
-2. Some documents may need chunk-wise DOCX generation.
-3. A few problematic pages may need to be generated separately. 
-4. The script currently assumes Pandoc is installed and available in system PATH.
-5. API rate limits may affect concurrency. 
-6. Output quality depends on the source PDF quality and Gemini response.
+1. Some documents may need chunk-wise DOCX generation.
+2. The script currently assumes Pandoc is installed and available in system PATH.
+3. API rate limits may affect concurrency. 
+4. Output quality depends on the source PDF quality and Gemini response.
