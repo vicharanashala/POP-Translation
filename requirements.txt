@@ -3,3 +3,7 @@ pymupdf
 beautifulsoup4
 python-docx
 docxcompose
+fastapi
+uvicorn[standard]
+python-multipart
+pandoc
