@@ -9,6 +9,7 @@ import threading
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
@@ -76,8 +77,6 @@ POP_STORE = POP_WORK / "Data"   # canonical store: pop-data/POP_Work/Data/<state
 PROMPT_FILE = Path(__file__).resolve().parent / "prompts" / "page_to_pdf.txt"
 _CHUNK_TMP = Path(tempfile.gettempdir()) / "pop_chunks"
 
-POP_STORE.mkdir(parents=True, exist_ok=True)
-POP_WORK.joinpath("Workdir").mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Path safety
@@ -484,7 +483,15 @@ def _build_tree(root: Path) -> dict:
 # App
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="POP Translation Server")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    POP_STORE.mkdir(parents=True, exist_ok=True)
+    (POP_WORK / "Workdir").mkdir(parents=True, exist_ok=True)
+    yield
+
+
+app = FastAPI(title="POP Translation Server", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

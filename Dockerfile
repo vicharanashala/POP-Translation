@@ -15,6 +15,6 @@ RUN mkdir -p pop-data/POP_Work/Data pop-data/POP_Work/Workdir
 
 VOLUME ["/app/pop-data"]
 
-EXPOSE 8000
+EXPOSE 8032
 
 CMD ["uvicorn", "pop_server:app", "--host", "0.0.0.0", "--port", "8032"]

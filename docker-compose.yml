@@ -1,0 +1,20 @@
+services:
+  pipeline:
+    image: vicharanashala/pop-translation:latest
+    network_mode: host
+    expose:
+      - "8032"
+    volumes:
+      - pop-data:/app/pop-data
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8032/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+volumes:
+  pop-data:
