@@ -1,0 +1,9 @@
+.git
+.github
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+*.egg-info
+pop-data
