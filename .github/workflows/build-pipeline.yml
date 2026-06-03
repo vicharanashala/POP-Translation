@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+      - "feature/**"
+      - "fix/**"
     paths:
       - "pop_server.py"
       - "_job_ctl.py"
@@ -11,6 +13,8 @@ on:
       - "prompts/**"
       - "Dockerfile"
       - "requirements.lock"
+      - "requirements.txt"
+      - "pyproject.toml"
 
 jobs:
   build-and-push:
