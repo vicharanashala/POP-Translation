@@ -1,22 +1,27 @@
 import asyncio
 import json
 import os
+
+from dotenv import load_dotenv
+load_dotenv()
 import re
 import shutil
 import sys
 import tempfile
 import threading
+import time as _time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
+import requests as _requests
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
@@ -68,59 +73,441 @@ from run_pop_to_docx_updated_pagewise_docx import (  # noqa: E402
 import _job_ctl as ctl  # noqa: E402
 
 # ---------------------------------------------------------------------------
-# Paths
+# Paths — POP_WORK / Workdir is local scratch; all persistent data lives in Zoho
 # ---------------------------------------------------------------------------
 
 POP_DATA = Path(__file__).resolve().parent / "pop-data"
 POP_WORK = POP_DATA / "POP_Work"
-POP_STORE = POP_WORK / "Data"   # canonical store: pop-data/POP_Work/Data/<state>/<crop>/
 PROMPT_FILE = Path(__file__).resolve().parent / "prompts" / "page_to_pdf.txt"
 _CHUNK_TMP = Path(tempfile.gettempdir()) / "pop_chunks"
 
+# ---------------------------------------------------------------------------
+# Zoho WorkDrive singleton
+# ---------------------------------------------------------------------------
+
+_zoho_instance = None
+_zoho_lock = threading.Lock()
+
+
+def _get_zoho():
+    global _zoho_instance
+    if _zoho_instance is None:
+        with _zoho_lock:
+            if _zoho_instance is None:
+                from helpers.zoho_workdrive import ZohoWorkDrive
+                _zoho_instance = ZohoWorkDrive()
+    return _zoho_instance
+
 
 # ---------------------------------------------------------------------------
-# Path safety
+# Master JSON cache — single source of truth for all state-table data
+# ---------------------------------------------------------------------------
+
+_master_ready = threading.Event()
+_master_lock = threading.Lock()
+_master_data: dict = {}
+
+
+def _upload_master_json():
+    # Must be called under _master_lock.
+    # NEVER raises — upload failures are logged but must not roll back the
+    # in-memory _master_data that the caller already updated.  The next
+    # successful upload will persist the correct state.
+    try:
+        zwd = _get_zoho()
+        # Snapshot existing IDs before uploading so we can prune stale duplicates
+        # after.  Zoho sometimes creates a new copy instead of replacing in-place
+        # even with override-name-exist=true; we delete only IDs that differ from
+        # the new file's ID so we never delete the file we just wrote.
+        old_ids = {i["id"] for i in zwd.list_folder(zwd.root_folder_id) if i["name"] == "master.json"}
+        payload = json.dumps({
+            "built_at": datetime.now(timezone.utc).isoformat(),
+            "data": _master_data,
+        }).encode()
+        new_id = zwd.upload_file("master.json", payload, zwd.root_folder_id)
+        for old_id in old_ids:
+            if old_id != new_id:
+                try:
+                    zwd.delete(old_id)
+                except Exception as e:
+                    print(f"[MASTER] cleanup of old master.json copy failed: {e}")
+    except Exception as e:
+        print(f"[MASTER] upload_master_json failed (in-memory state is still correct): {e}")
+
+
+def _update_master_crop(state: str, crop: str, stem: str, **updates):
+    with _master_lock:
+        entry = _master_data.setdefault(state, {}).setdefault(crop, {}).setdefault(stem, {})
+        entry.update(updates)
+        _upload_master_json()
+
+
+def _remove_master_crop(state: str, crop: str, stem: str):
+    with _master_lock:
+        if state in _master_data and crop in _master_data[state]:
+            _master_data[state][crop].pop(stem, None)
+            if not _master_data[state][crop]:
+                del _master_data[state][crop]
+            if not _master_data[state]:
+                del _master_data[state]
+            _upload_master_json()
+
+
+def _master_sync_deleted_file(path: str):
+    """Update master.json when a file is deleted via the generic DELETE /files/ endpoint."""
+    if not _master_ready.is_set():
+        return
+    parts = path.strip("/").split("/")
+    # Data/<state>/<crop>/<stem>.pdf
+    if len(parts) == 4 and parts[0] == "Data" and parts[3].lower().endswith(".pdf"):
+        _remove_master_crop(parts[1], parts[2], Path(parts[3]).stem)
+        return
+    # Workdir/<state>/<crop>/<stem>/final_output/<file>.docx
+    if len(parts) == 6 and parts[0] == "Workdir" and parts[4] == "final_output" and parts[5].lower().endswith(".docx"):
+        state, crop, stem, fname = parts[1], parts[2], parts[3], parts[5]
+        if fname.startswith("audit_"):
+            _update_master_crop(state, crop, stem, audited=False, audit_file=None)
+        else:
+            _update_master_crop(state, crop, stem, processed=False, output_file=None)
+
+
+def _master_sync_deleted_folder(path: str):
+    """Update master.json when a folder is deleted via the generic DELETE /folders/ endpoint."""
+    if not _master_ready.is_set():
+        return
+    parts = path.strip("/").split("/")
+    # Data/<state>/<crop>
+    if len(parts) == 3 and parts[0] == "Data":
+        state, crop = parts[1], parts[2]
+        with _master_lock:
+            if state in _master_data and crop in _master_data[state]:
+                del _master_data[state][crop]
+                if not _master_data[state]:
+                    del _master_data[state]
+                _upload_master_json()
+        return
+    # Data/<state>
+    if len(parts) == 2 and parts[0] == "Data":
+        state = parts[1]
+        with _master_lock:
+            if state in _master_data:
+                del _master_data[state]
+                _upload_master_json()
+        return
+    # Workdir/<state>/<crop>/<stem>  — entire doc workdir removed
+    if len(parts) == 4 and parts[0] == "Workdir":
+        state, crop, stem = parts[1], parts[2], parts[3]
+        with _master_lock:
+            # Only update if the stem is already tracked — don't create phantom entries
+            # for orphaned Workdir folders that have no corresponding Data PDF.
+            if state in _master_data and crop in _master_data[state] and stem in _master_data[state][crop]:
+                _master_data[state][crop][stem].update(
+                    processed=False, output_file=None, audited=False, audit_file=None
+                )
+                _upload_master_json()
+        return
+    # Workdir/<state>/<crop>  — all doc workdirs under a crop removed
+    if len(parts) == 3 and parts[0] == "Workdir":
+        state, crop = parts[1], parts[2]
+        with _master_lock:
+            crop_entries = _master_data.get(state, {}).get(crop)
+            if not crop_entries:
+                return
+            for entry in crop_entries.values():
+                entry.update(processed=False, output_file=None, audited=False, audit_file=None)
+            _upload_master_json()
+
+
+def _rebuild_master():
+    global _master_data
+    try:
+        zwd = _get_zoho()
+        new_data: dict = {}
+
+        data_result = zwd.resolve_path("Data")
+        if data_result:
+            for state_item in zwd.list_folder(data_result[0]):
+                if state_item["type"] != "folder":
+                    continue
+                state = state_item["name"]
+                for crop_item in zwd.list_folder(state_item["id"]):
+                    if crop_item["type"] != "folder":
+                        continue
+                    crop = crop_item["name"]
+                    # Always register the crop (even if empty) so the frontend can show it
+                    new_data.setdefault(state, {}).setdefault(crop, {})
+                    for doc_item in zwd.list_folder(crop_item["id"]):
+                        if not doc_item["name"].lower().endswith(".pdf"):
+                            continue
+                        stem = Path(doc_item["name"]).stem
+                        new_data[state][crop].setdefault(stem, {
+                            "output_file": None,
+                            "audit_file": None,
+                            "downloaded": False,
+                            "audited": False,
+                            "processed": False,
+                        })
+
+        workdir_result = zwd.resolve_path("Workdir")
+        if workdir_result:
+            for state_item in zwd.list_folder(workdir_result[0]):
+                if state_item["type"] != "folder":
+                    continue
+                state = state_item["name"]
+                for crop_item in zwd.list_folder(state_item["id"]):
+                    if crop_item["type"] != "folder":
+                        continue
+                    crop = crop_item["name"]
+                    for doc_item in zwd.list_folder(crop_item["id"]):
+                        if doc_item["type"] != "folder":
+                            continue
+                        stem = doc_item["name"]
+                        final_out = zwd.find_child(doc_item["id"], "final_output")
+                        if not final_out or final_out["type"] != "folder":
+                            continue
+                        docx_items = [
+                            i for i in zwd.list_folder(final_out["id"])
+                            if i["name"].lower().endswith(".docx")
+                        ]
+                        audit_items = sorted(
+                            [i for i in docx_items if i["name"].startswith("audit_")],
+                            key=lambda x: x["name"],
+                        )
+                        non_audit_items = sorted(
+                            [i for i in docx_items if not i["name"].startswith("audit_")],
+                            key=lambda x: x["name"],
+                        )
+                        entry = new_data.setdefault(state, {}).setdefault(crop, {}).setdefault(stem, {
+                            "output_file": None,
+                            "audit_file": None,
+                            "downloaded": False,
+                            "audited": False,
+                            "processed": False,
+                        })
+                        workdir_path = f"Workdir/{state}/{crop}/{stem}/final_output"
+                        if non_audit_items:
+                            entry["output_file"] = f"{workdir_path}/{non_audit_items[-1]['name']}"
+                            entry["processed"] = True
+                        if audit_items:
+                            entry["audit_file"] = f"{workdir_path}/{audit_items[-1]['name']}"
+                            entry["audited"] = True
+
+        with _master_lock:
+            _master_data = new_data
+            _upload_master_json()
+    except Exception as e:
+        print(f"[MASTER] rebuild failed: {e}")
+    finally:
+        _master_ready.set()
+
+
+def _load_or_build_master():
+    global _master_data
+    try:
+        zwd = _get_zoho()
+        # Take the LAST match — Zoho lists in insertion order (oldest first), so the
+        # last entry is the most recently uploaded copy (mirrors the upload_file fallback).
+        matches = [i for i in zwd.list_folder(zwd.root_folder_id) if i["name"] == "master.json"]
+        if matches:
+            found = matches[-1]
+            # Prune any stale duplicates that accumulated before this fix
+            for stale in matches[:-1]:
+                try:
+                    zwd.delete(stale["id"])
+                except Exception:
+                    pass
+            try:
+                payload = json.loads(zwd.download_file(found["id"]))
+                with _master_lock:
+                    _master_data = payload.get("data", {})
+                _master_ready.set()
+                return
+            except Exception as e:
+                print(f"[MASTER] Failed to parse existing master.json, rebuilding: {e}")
+        _rebuild_master()
+    except Exception as e:
+        print(f"[MASTER] load_or_build failed: {e}")
+        _master_ready.set()
+
+
+def _master_to_rows() -> list:
+    with _master_lock:
+        snapshot = {
+            state: {crop: dict(entries) for crop, entries in crops.items()}
+            for state, crops in _master_data.items()
+        }
+
+    rows = []
+    for state in sorted(snapshot):
+        for crop in sorted(snapshot[state]):
+            if not snapshot[state][crop]:
+                rows.append({
+                    "state": state,
+                    "crop": crop,
+                    "doc_name": None,
+                    "doc_path": f"Data/{state}/{crop}",
+                    "is_empty": True,
+                    "processed": False,
+                    "downloaded": False,
+                    "output_path": None,
+                    "output_dir": None,
+                    "audit_file": None,
+                    "audited": False,
+                    "has_docx": False,
+                    "page_count": 0,
+                    "status": "not_started",
+                })
+                continue
+            for stem in sorted(snapshot[state][crop]):
+                entry = snapshot[state][crop][stem]
+                doc_name = stem + ".pdf"
+                output_file = entry.get("output_file")
+                audit_file = entry.get("audit_file")
+                audited = entry.get("audited", False)
+                processed = entry.get("processed", False)
+                downloaded = entry.get("downloaded", False)
+
+                output_dir = None
+                if output_file:
+                    parts = output_file.split("/")
+                    if len(parts) >= 4:
+                        output_dir = "/".join(parts[:4])
+
+                if audited:
+                    status = "audited"
+                elif processed:
+                    status = "done"
+                else:
+                    status = "not_started"
+
+                rows.append({
+                    "state": state,
+                    "crop": crop,
+                    "doc_name": doc_name,
+                    "doc_path": f"Data/{state}/{crop}/{doc_name}",
+                    "is_empty": False,
+                    "processed": processed,
+                    "downloaded": downloaded,
+                    "output_path": output_file,
+                    "output_dir": output_dir,
+                    "audit_file": audit_file,
+                    "audited": audited,
+                    "has_docx": processed,
+                    "page_count": 0,
+                    "status": status,
+                })
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Path validation for Zoho paths (no traversal, no absolute)
 # ---------------------------------------------------------------------------
 
 
-def _resolve_safe(user_str: str) -> Path:
-    p = Path(user_str)
-    if p.is_absolute():
-        raise ValueError(f"absolute paths not allowed: {user_str!r}")
-    for part in p.parts:
+def _validate_zoho_path(path: str) -> str:
+    if not path:
+        raise ValueError("empty path")
+    if path.startswith("/"):
+        raise ValueError(f"absolute paths not allowed: {path!r}")
+    for part in path.split("/"):
         if part == "..":
-            raise ValueError(f"path traversal not allowed: {user_str!r}")
+            raise ValueError(f"path traversal not allowed: {path!r}")
         if "\x00" in part:
-            raise ValueError(f"null bytes not allowed: {user_str!r}")
-    resolved = (POP_DATA / p).resolve()
-    if not resolved.is_relative_to(POP_DATA.resolve()):
-        raise ValueError(f"path escapes sandbox: {user_str!r}")
-    return resolved
+            raise ValueError(f"null bytes not allowed: {path!r}")
+    return path
 
 
 # ---------------------------------------------------------------------------
-# Meta helpers
+# Streaming PDF from Zoho to temp file (for pipeline)
 # ---------------------------------------------------------------------------
 
 
-def _meta_path(state: str, crop: str, stem: str) -> Path:
-    return POP_STORE / state / crop / f"{stem}.meta.json"
+@contextmanager
+def _stream_zoho_pdf(zoho_path: str):
+    """Stream a Zoho file to a local temp PDF and yield its Path. Auto-deletes on exit."""
+    zwd = _get_zoho()
+    result = zwd.resolve_path(zoho_path)
+    if result is None:
+        raise FileNotFoundError(f"{zoho_path!r} not found in Zoho WorkDrive")
+    file_id = result[0]
+    resp = zwd.download_file_stream(file_id)
+    fd, tmp_name = tempfile.mkstemp(suffix=".pdf")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=4 << 20):
+                f.write(chunk)
+    finally:
+        resp.close()
+    try:
+        yield tmp_path
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
-def _read_meta(state: str, crop: str, stem: str) -> dict:
-    p = _meta_path(state, crop, stem)
-    if p.exists():
-        try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {"processed": False, "audited": False, "audit_file": None}
+# ---------------------------------------------------------------------------
+# Zoho tree builder with 60-second TTL cache
+# ---------------------------------------------------------------------------
+
+_tree_cache: dict = {"data": None, "workdir": None, "ts_data": 0.0, "ts_workdir": 0.0}
+_TREE_TTL = 60.0
 
 
-def _write_meta(state: str, crop: str, stem: str, data: dict) -> None:
-    _meta_path(state, crop, stem).write_text(
-        json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+def _build_zoho_tree(zoho_path: str) -> dict:
+    """Recursively build a tree dict from a Zoho folder path."""
+    zwd = _get_zoho()
+
+    def _node(folder_id: str, name: str, path: str) -> dict:
+        children = []
+        for item in sorted(zwd.list_folder(folder_id), key=lambda x: x["name"]):
+            child_path = f"{path}/{item['name']}"
+            if item["type"] == "folder":
+                children.append(_node(item["id"], item["name"], child_path))
+            else:
+                children.append({
+                    "name": item["name"],
+                    "path": child_path,
+                    "type": "file",
+                    "size": item.get("size", 0),
+                })
+        return {"name": name, "path": path, "type": "directory", "children": children}
+
+    result = zwd.resolve_path(zoho_path)
+    root_name = zoho_path.rsplit("/", 1)[-1]
+    if result is None:
+        return {"name": root_name, "path": zoho_path, "type": "directory", "children": []}
+    folder_id, _ = result
+    return _node(folder_id, root_name, zoho_path)
+
+
+def _cached_data_tree() -> dict:
+    now = _time.monotonic()
+    if _tree_cache["data"] is not None and now - _tree_cache["ts_data"] < _TREE_TTL:
+        return _tree_cache["data"]
+    result = _build_zoho_tree("Data")
+    _tree_cache["data"] = result
+    _tree_cache["ts_data"] = now
+    return result
+
+
+def _cached_workdir_tree() -> dict:
+    now = _time.monotonic()
+    if _tree_cache["workdir"] is not None and now - _tree_cache["ts_workdir"] < _TREE_TTL:
+        return _tree_cache["workdir"]
+    result = _build_zoho_tree("Workdir")
+    _tree_cache["workdir"] = result
+    _tree_cache["ts_workdir"] = now
+    return result
+
+
+def _invalidate_data_cache():
+    _tree_cache["data"] = None
+    _tree_cache["ts_data"] = 0.0
+
+
+def _invalidate_workdir_cache():
+    _tree_cache["workdir"] = None
+    _tree_cache["ts_workdir"] = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -140,10 +527,6 @@ class PopRequest(BaseModel):
     max_retries: int = 5
     retry_wait_seconds: int = 15
     disable_google_search: bool = False
-
-
-class FolderBody(BaseModel):
-    path: str
 
 
 class StateBody(BaseModel):
@@ -287,7 +670,7 @@ def _job_view(job: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Pipeline runner
+# Pipeline runner — workdir intermediates stay local; only final DOCX goes to Zoho
 # ---------------------------------------------------------------------------
 
 
@@ -318,9 +701,8 @@ def _run_one_doc(
     # 2. Translate
     if not req.skip_translation:
         if req.concurrency <= 1:
-            # Sequential loop with per-page cancellation checks
-            import time as _time
-            _stage_start = _time.perf_counter()
+            import time as _t
+            _stage_start = _t.perf_counter()
             translation_summary = []
             total_pages_t = len(page_pdf_files)
             pipeline_log(
@@ -343,7 +725,7 @@ def _run_one_doc(
                 )
                 translation_summary.append(result)
                 pipeline_log(f"Translation progress | completed {idx}/{total_pages_t} | page={pdf_path.parent.name}")
-            log_translation_summary(translation_summary, _time.perf_counter() - _stage_start)
+            log_translation_summary(translation_summary, _t.perf_counter() - _stage_start)
         else:
             translation_summary = translate_pages(
                 page_pdf_files=page_pdf_files,
@@ -404,31 +786,40 @@ def _run_one_doc(
     final_docx_path = final_output_dir / f"{safe_name}_translated_pages_001_to_{total_pages:03d}.docx"
     merge_docx_files_in_order(input_docx_files=page_docx_files, output_docx_path=final_docx_path)
 
-    # Mark processed in meta
-    meta = _read_meta(req.state, req.crop, doc_name)
-    meta["processed"] = True
-    meta["processed_at"] = datetime.now(timezone.utc).isoformat()
-    _write_meta(req.state, req.crop, doc_name, meta)
-
 
 def _run_pop_sync(req: PopRequest):
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key and not req.skip_translation:
         raise RuntimeError("GEMINI_API_KEY is not set")
 
-    crop_data_dir = POP_STORE / req.state / req.crop
-    if not crop_data_dir.exists():
-        raise FileNotFoundError(f"Data directory not found: {crop_data_dir}")
+    zwd = _get_zoho()
+    data_folder_path = f"Data/{req.state}/{req.crop}"
+    result = zwd.resolve_path(data_folder_path)
+    if result is None:
+        raise FileNotFoundError(f"Zoho folder not found: {data_folder_path!r}")
+    folder_id = result[0]
+
+    items = zwd.list_folder(folder_id)
+    all_pdf_items = sorted(
+        [i for i in items if i["name"].lower().endswith(".pdf")],
+        key=lambda x: x["name"],
+    )
 
     if req.docs:
-        pdf_files = [crop_data_dir / filename for filename in req.docs]
-        missing = [str(f) for f in pdf_files if not f.exists()]
+        name_to_item = {i["name"]: i for i in all_pdf_items}
+        pdf_items = []
+        missing = []
+        for doc_filename in req.docs:
+            if doc_filename in name_to_item:
+                pdf_items.append(name_to_item[doc_filename])
+            else:
+                missing.append(doc_filename)
         if missing:
-            raise FileNotFoundError(f"PDFs not found: {', '.join(missing)}")
+            raise FileNotFoundError(f"PDFs not found in Zoho: {', '.join(missing)}")
     else:
-        pdf_files = sorted(f for f in crop_data_dir.iterdir() if f.is_file() and f.suffix.lower() == ".pdf")
-        if not pdf_files:
-            raise FileNotFoundError(f"No PDFs found in {crop_data_dir}")
+        pdf_items = all_pdf_items
+        if not pdf_items:
+            raise FileNotFoundError(f"No PDFs found in Zoho: {data_folder_path!r}")
 
     prompt = load_prompt(PROMPT_FILE)
 
@@ -436,47 +827,55 @@ def _run_pop_sync(req: PopRequest):
     if job_id and job_id in _jobs:
         _jobs[job_id]["_pop_docs"] = [
             {
-                "name": f.name,
-                "workdir": str(POP_WORK / "Workdir" / req.state / req.crop / f.stem),
+                "name": item["name"],
+                "workdir": str(POP_WORK / "Workdir" / req.state / req.crop / Path(item["name"]).stem),
                 "status": "pending",
             }
-            for f in pdf_files
+            for item in pdf_items
         ]
 
-    for i, pdf_path in enumerate(pdf_files):
+    for i, pdf_item in enumerate(pdf_items):
         ctl.check_cancel()
         if job_id and job_id in _jobs:
             _jobs[job_id]["_pop_docs"][i]["status"] = "running"
-        doc_name = pdf_path.stem
-        print(f"[batch] processing: {pdf_path.name}")
-        _run_one_doc(
-            source_pdf_path=pdf_path,
-            doc_name=doc_name,
-            req=req,
-            api_key=api_key,
-            prompt=prompt,
+
+        doc_name = Path(pdf_item["name"]).stem
+        print(f"[batch] processing: {pdf_item['name']}")
+
+        # Stream PDF from Zoho to temp file, run pipeline, then clean up temp
+        with _stream_zoho_pdf(f"{data_folder_path}/{pdf_item['name']}") as tmp_pdf:
+            _run_one_doc(
+                source_pdf_path=tmp_pdf,
+                doc_name=doc_name,
+                req=req,
+                api_key=api_key,
+                prompt=prompt,
+            )
+
+        # Upload final DOCX to Zoho
+        workdir_root = POP_WORK / "Workdir" / req.state / req.crop / doc_name
+        final_output_dir = workdir_root / "final_output"
+        docx_files = sorted(
+            f for f in final_output_dir.glob("*.docx")
+            if f.is_file() and not f.name.startswith("audit_")
         )
+        if docx_files:
+            zoho_output_path = f"Workdir/{req.state}/{req.crop}/{doc_name}/final_output"
+            zwd.upload_local_file(docx_files[-1], zoho_output_path)
+            print(f"[batch] uploaded DOCX to Zoho: {zoho_output_path}/{docx_files[-1].name}")
+            _invalidate_workdir_cache()
+            _update_master_crop(
+                req.state, req.crop, doc_name,
+                output_file=f"{zoho_output_path}/{docx_files[-1].name}",
+                processed=True,
+            )
+
+        # Clean up local scratch — all persistent data is now in Zoho
+        shutil.rmtree(workdir_root, ignore_errors=True)
+        print(f"[batch] cleaned local workdir: {workdir_root}")
+
         if job_id and job_id in _jobs:
             _jobs[job_id]["_pop_docs"][i]["status"] = "done"
-
-
-# ---------------------------------------------------------------------------
-# Tree helper
-# ---------------------------------------------------------------------------
-
-
-def _build_tree(root: Path) -> dict:
-    def _node(p: Path) -> dict:
-        rel = str(p.relative_to(POP_DATA))
-        if p.is_file():
-            return {"name": p.name, "path": rel, "type": "file", "size": p.stat().st_size}
-        children = [_node(c) for c in sorted(p.iterdir())]
-        return {"name": p.name, "path": rel, "type": "directory", "children": children}
-
-    if not root.exists():
-        rel = str(root.relative_to(POP_DATA)) if root.is_relative_to(POP_DATA) else root.name
-        return {"name": root.name, "path": rel, "type": "directory", "children": []}
-    return _node(root)
 
 
 # ---------------------------------------------------------------------------
@@ -486,12 +885,17 @@ def _build_tree(root: Path) -> dict:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    POP_STORE.mkdir(parents=True, exist_ok=True)
     (POP_WORK / "Workdir").mkdir(parents=True, exist_ok=True)
+    _CHUNK_TMP.mkdir(parents=True, exist_ok=True)
+    try:
+        _get_zoho()
+    except Exception as e:
+        print(f"[WARN] Zoho WorkDrive init failed at startup: {e}")
+    threading.Thread(target=_load_or_build_master, daemon=True).start()
     yield
 
 
-app = FastAPI(title="POP Translation Server", lifespan=lifespan)
+app = FastAPI(title="POP Translation Server", lifespan=lifespan, docs_url="/api-docs", redoc_url="/api-redoc")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -500,10 +904,71 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(_requests.exceptions.RetryError)
+@app.exception_handler(_requests.exceptions.ConnectionError)
+async def zoho_unavailable(request, exc):
+    return JSONResponse(
+        status_code=503,
+        content={"detail": f"Zoho WorkDrive unavailable: {exc}"},
+    )
+
+
 # Health
 @app.get("/")
 def health():
     return {"status": "ok", "service": "pop-server"}
+
+
+@app.get("/test-zoho")
+def test_zoho():
+    """End-to-end Zoho connectivity test: creates a temp file, verifies it exists, then deletes it."""
+    zwd = _get_zoho()
+    test_path = "Data/_zoho_test_"
+    test_filename = "_pop_connectivity_test_.txt"
+    results: dict = {}
+
+    try:
+        parent_id = zwd.ensure_path(test_path)
+        results["ensure_path"] = "ok"
+    except Exception as e:
+        return {"status": "error", "step": "ensure_path", "error": str(e)}
+
+    try:
+        file_id = zwd.upload_file(test_filename, b"ping", parent_id)
+        results["upload"] = "ok" if file_id else "uploaded_but_no_id"
+    except Exception as e:
+        return {"status": "error", "step": "upload", "error": str(e), "results": results}
+
+    try:
+        found = zwd.find_child(parent_id, test_filename)
+        results["find_after_upload"] = "ok" if found else "not_found"
+    except Exception as e:
+        results["find_after_upload"] = f"error: {e}"
+
+    try:
+        resolve_result = zwd.resolve_path(f"{test_path}/{test_filename}")
+        results["resolve_path"] = "ok" if resolve_result else "not_found"
+        resolved_id = resolve_result[0] if resolve_result else (file_id or "")
+    except Exception as e:
+        results["resolve_path"] = f"error: {e}"
+        resolved_id = file_id or ""
+
+    try:
+        ok = zwd.delete(resolved_id) if resolved_id else False
+        results["delete"] = "ok" if ok else "failed"
+    except Exception as e:
+        results["delete"] = f"error: {e}"
+
+    try:
+        folder_result = zwd.resolve_path(test_path)
+        if folder_result:
+            zwd.delete(folder_result[0])
+        results["cleanup_folder"] = "ok"
+    except Exception as e:
+        results["cleanup_folder"] = f"error: {e}"
+
+    all_ok = all(v in ("ok", "uploaded_but_no_id") for v in results.values())
+    return {"status": "ok" if all_ok else "partial", "results": results}
 
 
 # ---------------------------------------------------------------------------
@@ -524,163 +989,57 @@ async def run_pop(req: PopRequest, background: BackgroundTasks):
 # ---------------------------------------------------------------------------
 
 
-@app.get("/pop/states")
+@app.get("/states")
 def list_states():
-    if not POP_STORE.exists():
+    zwd = _get_zoho()
+    result = zwd.resolve_path("Data")
+    if result is None:
         return []
-    return sorted(d.name for d in POP_STORE.iterdir() if d.is_dir())
+    items = zwd.list_folder(result[0])
+    return sorted(i["name"] for i in items if i["type"] == "folder")
 
 
-@app.get("/pop/crops")
+@app.get("/crops")
 def list_crops(state: str = Query(...)):
-    state_dir = POP_STORE / state
-    if not state_dir.exists():
+    zwd = _get_zoho()
+    result = zwd.resolve_path(f"Data/{state}")
+    if result is None:
         raise HTTPException(404, f"State not found: {state!r}")
-    return sorted(d.name for d in state_dir.iterdir() if d.is_dir())
+    items = zwd.list_folder(result[0])
+    return sorted(i["name"] for i in items if i["type"] == "folder")
 
 
-@app.get("/pop/docs")
+@app.get("/docs")
 def list_docs(state: str = Query(...), crop: str = Query(...)):
-    crop_dir = POP_STORE / state / crop
-    if not crop_dir.exists():
+    zwd = _get_zoho()
+    result = zwd.resolve_path(f"Data/{state}/{crop}")
+    if result is None:
         raise HTTPException(404, f"Crop not found: {state!r}/{crop!r}")
-    return sorted(f.name for f in crop_dir.iterdir() if f.is_file() and f.suffix.lower() == ".pdf")
+    items = zwd.list_folder(result[0])
+    return sorted(i["name"] for i in items if i["name"].lower().endswith(".pdf"))
 
 
-@app.get("/pop/data/tree")
+@app.get("/data/tree")
 def data_tree():
-    return _build_tree(POP_STORE)
+    return _cached_data_tree()
 
 
-@app.get("/pop/output/tree")
+@app.get("/output/tree")
 def output_tree():
-    return _build_tree(POP_WORK / "Workdir")
+    return _cached_workdir_tree()
 
 
-@app.get("/pop/state-table")
-def state_table():
-    workdir = POP_WORK / "Workdir"
-    rows: dict[tuple, dict] = {}
+@app.get("/state-table")
+def state_table(refresh: bool = False):
+    if refresh:
+        _master_ready.clear()
+        threading.Thread(target=_rebuild_master, daemon=True).start()
+        return {"status": "loading", "rows": []}
 
-    if POP_STORE.exists():
-        for state_dir in sorted(POP_STORE.iterdir()):
-            if not state_dir.is_dir():
-                continue
-            crop_dirs = sorted(d for d in state_dir.iterdir() if d.is_dir())
-            if not crop_dirs:
-                rows[(state_dir.name, None, None)] = {
-                    "state": state_dir.name,
-                    "crop": None,
-                    "doc_name": None,
-                    "doc_path": None,
-                    "is_empty": True,
-                    "processed": False,
-                    "downloaded": False,
-                    "output_path": None,
-                    "output_dir": None,
-                    "audit_file": None,
-                    "audited": False,
-                    "has_docx": False,
-                    "page_count": 0,
-                    "status": "empty",
-                }
-                continue
-            for crop_dir in crop_dirs:
-                pdfs = sorted(f for f in crop_dir.iterdir() if f.is_file() and f.suffix.lower() == ".pdf")
-                if pdfs:
-                    for pdf in pdfs:
-                        meta = _read_meta(state_dir.name, crop_dir.name, pdf.stem)
-                        rows[(state_dir.name, crop_dir.name, pdf.stem)] = {
-                            "state": state_dir.name,
-                            "crop": crop_dir.name,
-                            "doc_name": pdf.name,
-                            "doc_path": str(pdf.relative_to(POP_DATA)),
-                            "is_empty": False,
-                            "processed": meta.get("processed", False),
-                            "downloaded": meta.get("downloaded", False),
-                            "output_path": None,
-                            "output_dir": None,
-                            "audit_file": meta.get("audit_file"),
-                            "audited": meta.get("audited", False),
-                            "has_docx": False,
-                            "page_count": 0,
-                            "status": "not_started",
-                        }
-                else:
-                    rows[(state_dir.name, crop_dir.name, "")] = {
-                        "state": state_dir.name,
-                        "crop": crop_dir.name,
-                        "doc_name": None,
-                        "doc_path": None,
-                        "is_empty": True,
-                        "processed": False,
-                        "downloaded": False,
-                        "output_path": None,
-                        "output_dir": None,
-                        "audit_file": None,
-                        "audited": False,
-                        "has_docx": False,
-                        "page_count": 0,
-                        "status": "empty",
-                    }
+    if not _master_ready.is_set():
+        return {"status": "loading", "rows": []}
 
-    if workdir.exists():
-        for state_dir in sorted(workdir.iterdir()):
-            if not state_dir.is_dir():
-                continue
-            for crop_dir in sorted(state_dir.iterdir()):
-                if not crop_dir.is_dir():
-                    continue
-                for doc_dir in sorted(crop_dir.iterdir()):
-                    if not doc_dir.is_dir():
-                        continue
-                    final_output = doc_dir / "final_output"
-                    docx_files = (
-                        sorted(f for f in final_output.glob("*.docx") if f.is_file())
-                        if final_output.exists()
-                        else []
-                    )
-                    has_docx = bool(docx_files)
-                    page_count = len([d for d in doc_dir.iterdir() if d.is_dir() and d.name.startswith("page_")])
-                    status = "done" if has_docx else ("in_progress" if page_count > 0 else "not_started")
-                    output_path = str(docx_files[-1].relative_to(POP_DATA)) if has_docx else None
-                    output_dir_rel = str(doc_dir.relative_to(POP_DATA))
-
-                    key = (state_dir.name, crop_dir.name, doc_dir.name)
-                    if key in rows:
-                        rows[key].update({
-                            "has_docx": has_docx,
-                            "page_count": page_count,
-                            "status": status,
-                            # processed and downloaded are authoritative from meta
-                            "output_path": output_path,
-                            "output_dir": output_dir_rel,
-                        })
-                    else:
-                        pdf_path = POP_STORE / state_dir.name / crop_dir.name / (doc_dir.name + ".pdf")
-                        meta = _read_meta(state_dir.name, crop_dir.name, doc_dir.name)
-                        rows[key] = {
-                            "state": state_dir.name,
-                            "crop": crop_dir.name,
-                            "doc_name": (doc_dir.name + ".pdf") if pdf_path.exists() else doc_dir.name,
-                            "doc_path": str(pdf_path.relative_to(POP_DATA)) if pdf_path.exists() else None,
-                            "is_empty": False,
-                            "processed": meta.get("processed", False),
-                            "downloaded": meta.get("downloaded", False),
-                            "output_path": output_path,
-                            "output_dir": output_dir_rel,
-                            "audit_file": meta.get("audit_file"),
-                            "audited": meta.get("audited", False),
-                            "has_docx": has_docx,
-                            "page_count": page_count,
-                            "status": status,
-                        }
-
-    sorted_rows = sorted(
-        rows.values(),
-        key=lambda r: (r["state"] or "", r["crop"] or "", r["doc_name"] or ""),
-    )
-    return {"rows": sorted_rows}
+    return {"status": "ready", "rows": _master_to_rows()}
 
 
 # ---------------------------------------------------------------------------
@@ -688,115 +1047,149 @@ def state_table():
 # ---------------------------------------------------------------------------
 
 
-@app.post("/pop/state")
+@app.post("/state")
 def create_state(body: StateBody):
     state = body.state.strip()
     if not state:
         raise HTTPException(400, "state is required")
-    (POP_STORE / state).mkdir(parents=True, exist_ok=True)
+    zwd = _get_zoho()
+    zwd.ensure_path(f"Data/{state}")
+    _invalidate_data_cache()
     return {"state": state}
 
 
-@app.post("/pop/crop")
+@app.post("/crop")
 def create_crop(body: CropBody):
     state, crop = body.state.strip(), body.crop.strip()
     if not state or not crop:
         raise HTTPException(400, "state and crop are required")
-    (POP_STORE / state / crop).mkdir(parents=True, exist_ok=True)
+    zwd = _get_zoho()
+    zwd.ensure_path(f"Data/{state}/{crop}")
+    if _master_ready.is_set():
+        with _master_lock:
+            _master_data.setdefault(state, {}).setdefault(crop, {})
+            _upload_master_json()
+    _invalidate_data_cache()
     return {"state": state, "crop": crop}
 
 
-@app.delete("/pop/state")
+@app.delete("/state")
 def delete_state(state: str = Query(...)):
     """Delete a state folder. Returns 409 if any crop folders still exist inside."""
-    state_dir = POP_STORE / state
-    if not state_dir.exists():
+    zwd = _get_zoho()
+    result = zwd.resolve_path(f"Data/{state}")
+    if result is None:
         raise HTTPException(404, f"State not found: {state!r}")
-    crops = [d for d in state_dir.iterdir() if d.is_dir()]
+    folder_id = result[0]
+    crops = [i for i in zwd.list_folder(folder_id) if i["type"] == "folder"]
     if crops:
         raise HTTPException(409, f"State has {len(crops)} crop(s). Delete all crops first.")
-    shutil.rmtree(state_dir)
+    zwd.delete(folder_id)
+    if _master_ready.is_set():
+        with _master_lock:
+            if state in _master_data:
+                del _master_data[state]
+                _upload_master_json()
+    _invalidate_data_cache()
     return {"deleted": state}
 
 
-@app.delete("/pop/crop")
+@app.delete("/crop")
 def delete_crop(state: str = Query(...), crop: str = Query(...)):
     """Delete a crop folder. Returns 409 if PDFs still exist — delete docs first."""
-    crop_dir = POP_STORE / state / crop
-    if not crop_dir.exists():
+    zwd = _get_zoho()
+    result = zwd.resolve_path(f"Data/{state}/{crop}")
+    if result is None:
         raise HTTPException(404, f"Crop not found: {state!r}/{crop!r}")
-    pdfs = [f for f in crop_dir.iterdir() if f.is_file() and f.suffix.lower() == ".pdf"]
+    folder_id = result[0]
+    pdfs = [i for i in zwd.list_folder(folder_id) if i["name"].lower().endswith(".pdf")]
     if pdfs:
         raise HTTPException(409, f"Crop has {len(pdfs)} PDF(s). Delete all documents first.")
-    shutil.rmtree(crop_dir)
+    zwd.delete(folder_id)
+    if _master_ready.is_set():
+        with _master_lock:
+            if state in _master_data and crop in _master_data[state]:
+                del _master_data[state][crop]
+                if not _master_data[state]:
+                    del _master_data[state]
+                _upload_master_json()
+    _invalidate_data_cache()
     return {"deleted": f"{state}/{crop}"}
 
 
-@app.post("/pop/upload-doc")
+@app.post("/upload-doc")
 async def upload_doc(file: UploadFile = File(...), state: str = Form(...), crop: str = Form(...)):
-    """Upload a PDF into POP_Work/Data/<state>/<crop>/."""
+    """Upload a PDF into Zoho at Data/<state>/<crop>/."""
     state, crop = state.strip(), crop.strip()
-    dest_dir = POP_STORE / state / crop
-    dest_dir.mkdir(parents=True, exist_ok=True)
+    zwd = _get_zoho()
+    parent_id = zwd.ensure_path(f"Data/{state}/{crop}")
+
     filename = file.filename or "upload.pdf"
-    dest_path = dest_dir / filename
     content = await file.read()
-    dest_path.write_bytes(content)
+    zwd.upload_file(filename, content, parent_id)
+
     stem = Path(filename).stem
-    _write_meta(state, crop, stem, {
-        "doc_name": filename,
-        "state": state,
-        "crop": crop,
-        "processed": False,
-        "audited": False,
-        "downloaded": False,
-        "audit_file": None,
-        "uploaded_at": datetime.now(timezone.utc).isoformat(),
-        "processed_at": None,
-        "audited_at": None,
-        "downloaded_at": None,
-    })
-    return {"path": str(dest_path.relative_to(POP_DATA)), "size": len(content)}
+    if _master_ready.is_set():
+        _update_master_crop(state, crop, stem,
+            output_file=None, audit_file=None,
+            downloaded=False, audited=False, processed=False,
+        )
+    _invalidate_data_cache()
+    return {"path": f"Data/{state}/{crop}/{filename}", "size": len(content)}
 
 
-@app.delete("/pop/doc")
+@app.delete("/doc")
 def delete_doc(state: str = Query(...), crop: str = Query(...), doc_name: str = Query(...)):
-    """Delete a PDF and its matching audit file and workdir output folder."""
-    pdf_path = POP_STORE / state / crop / doc_name
-    if not pdf_path.exists():
+    """Delete a PDF, its meta.json, and its Zoho Workdir output folder."""
+    zwd = _get_zoho()
+
+    # Delete PDF
+    pdf_result = zwd.resolve_path(f"Data/{state}/{crop}/{doc_name}")
+    if pdf_result is None:
         raise HTTPException(404, f"Document not found: {doc_name!r}")
+    if not zwd.delete(pdf_result[0]):
+        raise HTTPException(500, f"Zoho rejected delete of {doc_name!r} — check server logs for details")
+
     stem = Path(doc_name).stem
-    # Remove meta.json
-    _meta_path(state, crop, stem).unlink(missing_ok=True)
-    # Remove workdir output
-    workdir_doc = POP_WORK / "Workdir" / state / crop / stem
-    if workdir_doc.exists():
-        shutil.rmtree(workdir_doc, ignore_errors=True)
-    pdf_path.unlink()
+
+    # Delete Workdir output folder from Zoho (best-effort)
+    workdir_result = zwd.resolve_path(f"Workdir/{state}/{crop}/{stem}")
+    if workdir_result:
+        if not zwd.delete(workdir_result[0]):
+            print(f"[WARN] Failed to delete Zoho workdir for {doc_name!r}")
+
+    # Also clean up local workdir scratch (if it exists from a prior pipeline run)
+    local_workdir = POP_WORK / "Workdir" / state / crop / stem
+    if local_workdir.exists():
+        shutil.rmtree(local_workdir, ignore_errors=True)
+
+    if _master_ready.is_set():
+        _remove_master_crop(state, crop, stem)
+    _invalidate_data_cache()
+    _invalidate_workdir_cache()
     return {"deleted": doc_name, "state": state, "crop": crop}
 
 
 # ---------------------------------------------------------------------------
-# File operations (legacy — kept for compatibility)
+# File operations
 # ---------------------------------------------------------------------------
 
 
-@app.post("/pop/upload")
-async def upload_file(dest: str = Query(...), file: UploadFile = File(...)):
+@app.post("/upload")
+async def upload_file_endpoint(dest: str = Query(...), file: UploadFile = File(...)):
     try:
-        dest_path = _resolve_safe(dest)
+        _validate_zoho_path(dest)
     except ValueError as e:
         raise HTTPException(400, str(e))
-
-    dest_path.mkdir(parents=True, exist_ok=True)
+    zwd = _get_zoho()
     filename = file.filename or "upload"
-    out_path = dest_path / filename
     content = await file.read()
-    out_path.write_bytes(content)
-    return {"path": str(out_path.relative_to(POP_DATA)), "size": len(content)}
+    parent_id = zwd.ensure_path(dest)
+    zwd.upload_file(filename, content, parent_id)
+    return {"path": f"{dest}/{filename}", "size": len(content)}
 
 
-@app.post("/pop/upload-chunk")
+@app.post("/upload-chunk")
 async def upload_chunk(
     request: Request,
     upload_id: str = Query(...),
@@ -816,22 +1209,27 @@ async def upload_chunk(
         return {"status": "ok", "chunk": chunk_index}
 
     try:
-        dest_path = _resolve_safe(dest)
+        _validate_zoho_path(dest)
     except ValueError as e:
         raise HTTPException(400, str(e))
 
-    dest_path.mkdir(parents=True, exist_ok=True)
-    final_path = dest_path / filename
-
-    with final_path.open("wb") as out:
+    # Assemble locally then stream-upload to Zoho
+    assembled = chunk_dir / filename
+    with assembled.open("wb") as out:
         for i in range(total_chunks):
             out.write((chunk_dir / f"chunk_{i:06d}").read_bytes())
 
-    shutil.rmtree(chunk_dir, ignore_errors=True)
-    return {"status": "complete", "path": str(final_path.relative_to(POP_DATA))}
+    try:
+        zwd = _get_zoho()
+        zwd.upload_local_file(assembled, dest)
+    finally:
+        shutil.rmtree(chunk_dir, ignore_errors=True)
+
+    _invalidate_data_cache()
+    return {"status": "complete", "path": f"{dest}/{filename}"}
 
 
-@app.post("/pop/upload-audited")
+@app.post("/upload-audited")
 async def upload_audited(
     file: UploadFile = File(...),
     state: str = Form(...),
@@ -839,113 +1237,172 @@ async def upload_audited(
     doc_name: str = Form(...),
 ):
     stem = Path(doc_name).stem
-    final_output_dir = POP_WORK / "Workdir" / state / crop / stem / "final_output"
-    if not final_output_dir.exists():
+    zwd = _get_zoho()
+
+    # Ensure the translated output exists before accepting the audit file
+    workdir_path = f"Workdir/{state}/{crop}/{stem}/final_output"
+    workdir_result = zwd.resolve_path(workdir_path)
+    if workdir_result is None:
         raise HTTPException(404, f"No processed output found for {doc_name!r} — run translation first.")
+
+    if workdir_result[1] != "folder":
+        raise HTTPException(404, f"Output path is not a folder for {doc_name!r}")
+
     original_filename = file.filename or (stem + "_audited.docx")
     filename = original_filename if original_filename.startswith("audit_") else ("audit_" + original_filename)
 
-    # Delete previous audit file to avoid accumulation
-    meta = _read_meta(state, crop, stem)
-    old_audit = meta.get("audit_file")
-    if old_audit:
-        old_path = POP_DATA / old_audit
-        old_path.unlink(missing_ok=True)
+    # Get old audit path from master cache to clean up the old file
+    with _master_lock:
+        old_audit = _master_data.get(state, {}).get(crop, {}).get(stem, {}).get("audit_file")
 
-    dest_path = final_output_dir / filename
+    # Upload new file first — then clean up old one so a failed upload doesn't lose data
+    parent_id = workdir_result[0]
     content = await file.read()
-    dest_path.write_bytes(content)
-    meta["audited"] = True
-    meta["audited_at"] = datetime.now(timezone.utc).isoformat()
-    meta["audit_file"] = str(dest_path.relative_to(POP_DATA))
-    _write_meta(state, crop, stem, meta)
-    return {"path": str(dest_path.relative_to(POP_DATA)), "size": len(content)}
+    file_id = zwd.upload_file(filename, content, parent_id)
+    if not file_id:
+        # Zoho returned 200 but gave no ID — verify by listing
+        found = zwd.find_child(parent_id, filename)
+        if not found:
+            raise HTTPException(500, "Audit file upload to Zoho failed — file not found after upload")
+
+    zoho_audit_path = f"{workdir_path}/{filename}"
+
+    # Remove old audit file (best-effort — don't fail the request if this errors)
+    if old_audit and old_audit != zoho_audit_path:
+        try:
+            old_result = zwd.resolve_path(old_audit)
+            if old_result:
+                zwd.delete(old_result[0])
+        except Exception as e:
+            print(f"[WARN] Could not delete old audit file {old_audit!r}: {e}")
+
+    _update_master_crop(state, crop, stem, audited=True, audit_file=zoho_audit_path)
+    _invalidate_workdir_cache()
+    return {"path": zoho_audit_path, "size": len(content)}
 
 
-@app.delete("/pop/audit")
+@app.delete("/audit")
 def delete_audit(state: str = Query(...), crop: str = Query(...), doc_name: str = Query(...)):
     """Delete the audited file and clear audit metadata."""
     stem = Path(doc_name).stem
-    meta = _read_meta(state, crop, stem)
-    audit_file = meta.get("audit_file")
+    zwd = _get_zoho()
+    with _master_lock:
+        audit_file = _master_data.get(state, {}).get(crop, {}).get(stem, {}).get("audit_file")
     if not audit_file:
         raise HTTPException(404, "No audit file found for this document")
-    audit_path = POP_DATA / audit_file
-    audit_path.unlink(missing_ok=True)
-    meta["audited"] = False
-    meta["audit_file"] = None
-    meta["audited_at"] = None
-    _write_meta(state, crop, stem, meta)
+    try:
+        result = zwd.resolve_path(audit_file)
+        if result:
+            zwd.delete(result[0])
+    except Exception as e:
+        print(f"[WARN] Could not delete audit file from Zoho {audit_file!r}: {e}")
+    # Always clear master regardless of whether the Zoho delete succeeded —
+    # _upload_master_json never raises so this is guaranteed to run.
+    _update_master_crop(state, crop, stem, audited=False, audit_file=None)
+    _invalidate_workdir_cache()
     return {"deleted": audit_file, "state": state, "crop": crop, "doc_name": doc_name}
 
 
-@app.post("/pop/folders")
-def create_folder(body: FolderBody):
-    try:
-        path = _resolve_safe(body.path)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    path.mkdir(parents=True, exist_ok=True)
-    return {"path": body.path}
-
-
-@app.delete("/pop/files/{path:path}")
+@app.delete("/files/{path:path}")
 def delete_file(path: str):
     try:
-        p = _resolve_safe(path)
+        _validate_zoho_path(path)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    if not p.exists():
+    zwd = _get_zoho()
+    result = zwd.resolve_path(path)
+    if result is None:
         raise HTTPException(404, "Not found")
-    if not p.is_file():
+    file_id, ftype = result
+    if ftype == "folder":
         raise HTTPException(400, "Path is not a file")
-    p.unlink()
+    zwd.delete(file_id)
+    _master_sync_deleted_file(path)
     return {"deleted": path}
 
 
-@app.delete("/pop/folders/{path:path}")
+@app.delete("/folders/{path:path}")
 def delete_folder(path: str):
     try:
-        p = _resolve_safe(path)
+        _validate_zoho_path(path)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    if not p.exists():
+    zwd = _get_zoho()
+    result = zwd.resolve_path(path)
+    if result is None:
         raise HTTPException(404, "Not found")
-    if not p.is_dir():
+    file_id, ftype = result
+    if ftype != "folder":
         raise HTTPException(400, "Path is not a directory")
-    shutil.rmtree(p)
+    zwd.delete(file_id)
+    _master_sync_deleted_folder(path)
     return {"deleted": path}
 
 
-@app.get("/pop/download/{path:path}")
+@app.get("/download/{path:path}")
 def download_file(path: str):
     try:
-        file_path = _resolve_safe(path)
+        _validate_zoho_path(path)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    if not file_path.exists() or not file_path.is_file():
+    zwd = _get_zoho()
+    result = zwd.resolve_path(path)
+    if result is None:
         raise HTTPException(404, "File not found")
-    return FileResponse(str(file_path), filename=file_path.name)
+    file_id, ftype = result
+    if ftype == "folder":
+        raise HTTPException(400, "Path is a folder, not a file")
+    filename = path.rsplit("/", 1)[-1]
+
+    def _stream():
+        resp = zwd.download_file_stream(file_id)
+        try:
+            for chunk in resp.iter_content(chunk_size=1 << 20):
+                yield chunk
+        finally:
+            resp.close()
+
+    return StreamingResponse(
+        _stream(),
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
-@app.get("/pop/output")
+@app.get("/output")
 def download_output(state: str = Query(...), crop: str = Query(...), doc_name: str = Query(...)):
     stem = Path(doc_name).stem
-    final_output_dir = POP_WORK / "Workdir" / state / crop / stem / "final_output"
-    if not final_output_dir.exists():
-        raise HTTPException(404, "Output directory not found")
-    docx_files = sorted(f for f in final_output_dir.glob("*.docx") if f.is_file())
-    if not docx_files:
+    zwd = _get_zoho()
+    workdir_path = f"Workdir/{state}/{crop}/{stem}/final_output"
+    result = zwd.resolve_path(workdir_path)
+    if result is None:
+        raise HTTPException(404, "Output directory not found in Zoho")
+    folder_id = result[0]
+    docx_items = sorted(
+        [
+            i for i in zwd.list_folder(folder_id)
+            if i["name"].lower().endswith(".docx") and not i["name"].startswith("audit_")
+        ],
+        key=lambda x: x["name"],
+    )
+    if not docx_items:
         raise HTTPException(404, "No DOCX found for this document")
-    docx_path = docx_files[-1]
-    meta = _read_meta(state, crop, stem)
-    meta["downloaded"] = True
-    meta["downloaded_at"] = datetime.now(timezone.utc).isoformat()
-    _write_meta(state, crop, stem, meta)
-    return FileResponse(
-        str(docx_path),
-        filename=docx_path.name,
+    docx_item = docx_items[-1]
+
+    _update_master_crop(state, crop, stem, downloaded=True)
+
+    def _stream():
+        resp = zwd.download_file_stream(docx_item["id"])
+        try:
+            for chunk in resp.iter_content(chunk_size=1 << 20):
+                yield chunk
+        finally:
+            resp.close()
+
+    return StreamingResponse(
+        _stream(),
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{docx_item["name"]}"'},
     )
 
 
@@ -954,12 +1411,12 @@ def download_output(state: str = Query(...), crop: str = Query(...), doc_name: s
 # ---------------------------------------------------------------------------
 
 
-@app.get("/pop/jobs")
+@app.get("/jobs")
 def list_jobs():
     return [_job_view(j) for j in _jobs.values()]
 
 
-@app.get("/pop/jobs/{job_id}")
+@app.get("/jobs/{job_id}")
 def get_job(job_id: str):
     job = _jobs.get(job_id)
     if not job:
@@ -967,7 +1424,7 @@ def get_job(job_id: str):
     return _job_view(job)
 
 
-@app.post("/pop/jobs/{job_id}/stop")
+@app.post("/jobs/{job_id}/stop")
 def stop_job(job_id: str):
     if job_id not in _jobs:
         raise HTTPException(404, "Job not found")
@@ -976,7 +1433,7 @@ def stop_job(job_id: str):
     return {"job_id": job_id, "status": "stopped"}
 
 
-@app.delete("/pop/jobs/{job_id}")
+@app.delete("/jobs/{job_id}")
 def delete_job(job_id: str):
     if job_id not in _jobs:
         raise HTTPException(404, "Job not found")

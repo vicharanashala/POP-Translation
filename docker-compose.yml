@@ -8,6 +8,10 @@ services:
       - pop-data:/app/pop-data
     environment:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - ZOHO_CLIENT_ID=${ZOHO_CLIENT_ID}
+      - ZOHO_CLIENT_SECRET=${ZOHO_CLIENT_SECRET}
+      - ZOHO_REFRESH_TOKEN=${ZOHO_REFRESH_TOKEN}
+      - ZOHO_ROOT_FOLDER_ID=${ZOHO_ROOT_FOLDER_ID}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8032/"]
       interval: 30s

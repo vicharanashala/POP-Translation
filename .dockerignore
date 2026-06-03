@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environment
+venv/
+
+# Runtime data (mounted as Docker volumes in production)
+pop-data/
+POP_Work/
+outputs/
+Data/
+Workdir/
+
+# Dev / notebook artifacts
+.ipynb_checkpoints/
+*.ipynb
+
+# Secrets / local config
+.env
+.env.*
+
+# Logs / temp
+*.log
+*.tmp
+*.bak
+
+# Type checkers & linters
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+
+# Git
+.git/
+.github/
+
+# Claude / planning docs
+.claude/
+CLAUDE.md
+ZOHO_MIGRATION_AGENT_PLAN.txt
+ZOHO_WORKDRIVE_AGENT_PLAN.md
+containerization_audit_prompt.md
+prompt.md
+pop_translation.md
+pop_translation_doc.md
+README.md
