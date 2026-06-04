@@ -162,12 +162,13 @@ def _master_sync_deleted_file(path: str):
     if len(parts) == 4 and parts[0] == "Data" and parts[3].lower().endswith(".pdf"):
         _remove_master_crop(parts[1], parts[2], Path(parts[3]).stem)
         return
-    # Workdir/<state>/<crop>/<stem>/final_output/<file>.docx
-    if len(parts) == 6 and parts[0] == "Workdir" and parts[4] == "final_output" and parts[5].lower().endswith(".docx"):
+    # Workdir/<state>/<crop>/<stem>/final_output/<file>
+    # Audit files can be any extension (.csv, .docx, etc.) — only output files are always .docx.
+    if len(parts) == 6 and parts[0] == "Workdir" and parts[4] == "final_output":
         state, crop, stem, fname = parts[1], parts[2], parts[3], parts[5]
         if fname.startswith("audit_"):
             _update_master_crop(state, crop, stem, audited=False, audit_file=None)
-        else:
+        elif fname.lower().endswith(".docx"):
             _update_master_crop(state, crop, stem, processed=False, output_file=None)
 
 
