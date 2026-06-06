@@ -139,6 +139,8 @@ def _upload_master_json():
 def _update_master_crop(state: str, crop: str, stem: str, **updates):
     with _master_lock:
         entry = _master_data.setdefault(state, {}).setdefault(crop, {}).setdefault(stem, {})
+        if updates.get("processed") and not entry.get("finished_at"):
+            updates["finished_at"] = datetime.now(timezone.utc).isoformat()
         entry.update(updates)
         _upload_master_json()
 
@@ -248,6 +250,7 @@ def _rebuild_master():
                             "downloaded": False,
                             "audited": False,
                             "processed": False,
+                            "finished_at": None,
                         })
 
         workdir_result = zwd.resolve_path("Workdir")
@@ -285,6 +288,7 @@ def _rebuild_master():
                             "downloaded": False,
                             "audited": False,
                             "processed": False,
+                            "finished_at": None,
                         })
                         workdir_path = f"Workdir/{state}/{crop}/{stem}/final_output"
                         if non_audit_items:
@@ -358,6 +362,7 @@ def _master_to_rows() -> list:
                     "has_docx": False,
                     "page_count": 0,
                     "status": "not_started",
+                    "finished_at": None,
                 })
                 continue
             for stem in sorted(snapshot[state][crop]):
@@ -397,6 +402,7 @@ def _master_to_rows() -> list:
                     "has_docx": processed,
                     "page_count": 0,
                     "status": status,
+                    "finished_at": entry.get("finished_at"),
                 })
     return rows
 
