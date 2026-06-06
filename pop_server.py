@@ -56,6 +56,7 @@ sys.stdout = _ThreadLocalStdout()
 
 sys.path.insert(0, str(Path(__file__).parent / "scripts"))
 
+import run_pop_to_docx_updated_pagewise_docx as _pop_script  # noqa: E402
 from run_pop_to_docx_updated_pagewise_docx import (  # noqa: E402
     convert_pages_to_individual_docx,
     inject_images_for_pages,
@@ -599,6 +600,11 @@ def _parse_log_pages(log_path: Path) -> tuple:
         return None, 0
     try:
         text = log_path.read_text(encoding="utf-8", errors="replace")
+        # Only parse the most recent run — previous runs may have stale
+        # "completed X/Y" entries that corrupt progress for the current run.
+        last_idx = text.rfind("Pipeline run started")
+        if last_idx != -1:
+            text = text[last_idx:]
         total = None
         m = re.search(r'\bselected_pages=(\d+)', text)
         if m:
@@ -873,6 +879,7 @@ def _run_pop_sync(req: PopRequest):
 
         # Clean up local scratch — all persistent data is now in Zoho
         shutil.rmtree(workdir_root, ignore_errors=True)
+        _pop_script.LOG_FILE_PATH = None  # prevent stale path from crashing next job's log()
         print(f"[batch] cleaned local workdir: {workdir_root}")
 
         if job_id and job_id in _jobs:
