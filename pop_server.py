@@ -146,13 +146,15 @@ def _update_master_crop(state: str, crop: str, stem: str, **updates):
 
 
 def _remove_master_crop(state: str, crop: str, stem: str):
+    """Drop a single document from master.json.
+
+    Deleting the last document does NOT remove the crop — the crop folder is
+    kept and surfaces as an empty-crop row. The crop folder is only removed by
+    delete_crop, and the state only by delete_state.
+    """
     with _master_lock:
         if state in _master_data and crop in _master_data[state]:
             _master_data[state][crop].pop(stem, None)
-            if not _master_data[state][crop]:
-                del _master_data[state][crop]
-            if not _master_data[state]:
-                del _master_data[state]
             _upload_master_json()
 
 
@@ -180,14 +182,13 @@ def _master_sync_deleted_folder(path: str):
     if not _master_ready.is_set():
         return
     parts = path.strip("/").split("/")
-    # Data/<state>/<crop>
+    # Data/<state>/<crop>  — crop folder removed; keep the state (even if now
+    # empty) so it surfaces as an empty-state row until explicitly deleted.
     if len(parts) == 3 and parts[0] == "Data":
         state, crop = parts[1], parts[2]
         with _master_lock:
             if state in _master_data and crop in _master_data[state]:
                 del _master_data[state][crop]
-                if not _master_data[state]:
-                    del _master_data[state]
                 _upload_master_json()
         return
     # Data/<state>
@@ -234,6 +235,9 @@ def _rebuild_master():
                 if state_item["type"] != "folder":
                     continue
                 state = state_item["name"]
+                # Always register the state (even with no crops) so an empty
+                # state still surfaces as a row.
+                new_data.setdefault(state, {})
                 for crop_item in zwd.list_folder(state_item["id"]):
                     if crop_item["type"] != "folder":
                         continue
@@ -345,6 +349,27 @@ def _master_to_rows() -> list:
 
     rows = []
     for state in sorted(snapshot):
+        # State folder exists but has no crops — show it as an empty-state row.
+        if not snapshot[state]:
+            rows.append({
+                "state": state,
+                "crop": None,
+                "doc_name": None,
+                "doc_path": f"Data/{state}",
+                "is_empty": True,
+                "is_empty_state": True,
+                "processed": False,
+                "downloaded": False,
+                "output_path": None,
+                "output_dir": None,
+                "audit_file": None,
+                "audited": False,
+                "has_docx": False,
+                "page_count": 0,
+                "status": "not_started",
+                "finished_at": None,
+            })
+            continue
         for crop in sorted(snapshot[state]):
             if not snapshot[state][crop]:
                 rows.append({
@@ -353,6 +378,7 @@ def _master_to_rows() -> list:
                     "doc_name": None,
                     "doc_path": f"Data/{state}/{crop}",
                     "is_empty": True,
+                    "is_empty_state": False,
                     "processed": False,
                     "downloaded": False,
                     "output_path": None,
@@ -393,6 +419,7 @@ def _master_to_rows() -> list:
                     "doc_name": doc_name,
                     "doc_path": f"Data/{state}/{crop}/{doc_name}",
                     "is_empty": False,
+                    "is_empty_state": False,
                     "processed": processed,
                     "downloaded": downloaded,
                     "output_path": output_file,
@@ -1024,13 +1051,24 @@ def list_crops(state: str = Query(...)):
 
 
 @app.get("/docs")
-def list_docs(state: str = Query(...), crop: str = Query(...)):
+def list_docs(state: str = Query(...), crop: str = Query(...), unprocessed: bool = False):
+    """List PDFs in Data/<state>/<crop>/.
+
+    Pass unprocessed=true to hide docs already processed (per master.json) — used
+    by the pipeline dropdown so already-translated docs aren't offered again.
+    """
     zwd = _get_zoho()
     result = zwd.resolve_path(f"Data/{state}/{crop}")
     if result is None:
         raise HTTPException(404, f"Crop not found: {state!r}/{crop!r}")
     items = zwd.list_folder(result[0])
-    return sorted(i["name"] for i in items if i["name"].lower().endswith(".pdf"))
+    pdfs = sorted(i["name"] for i in items if i["name"].lower().endswith(".pdf"))
+    if unprocessed:
+        with _master_lock:
+            crop_entries = dict(_master_data.get(state, {}).get(crop, {}))
+        processed_stems = {stem for stem, e in crop_entries.items() if e.get("processed")}
+        pdfs = [p for p in pdfs if Path(p).stem not in processed_stems]
+    return pdfs
 
 
 @app.get("/data/tree")
@@ -1123,33 +1161,65 @@ def delete_crop(state: str = Query(...), crop: str = Query(...)):
     if _master_ready.is_set():
         with _master_lock:
             if state in _master_data and crop in _master_data[state]:
+                # Keep the state entry even if this was its last crop — it
+                # remains as an empty-state row until delete_state removes it.
                 del _master_data[state][crop]
-                if not _master_data[state]:
-                    del _master_data[state]
                 _upload_master_json()
     _invalidate_data_cache()
     return {"deleted": f"{state}/{crop}"}
 
 
 @app.post("/upload-doc")
-async def upload_doc(file: UploadFile = File(...), state: str = Form(...), crop: str = Form(...)):
-    """Upload a PDF into Zoho at Data/<state>/<crop>/."""
+async def upload_doc(
+    state: str = Form(...),
+    crop: str = Form(...),
+    file: Optional[UploadFile] = File(None),
+    files: Optional[List[UploadFile]] = File(None),
+):
+    """Upload one or more PDFs into Zoho at Data/<state>/<crop>/.
+
+    Accepts a single `file` (legacy) or multiple `files`. A document whose name
+    already exists in the crop is rejected — duplicates are never overwritten.
+    """
     state, crop = state.strip(), crop.strip()
+    if not state or not crop:
+        raise HTTPException(400, "state and crop are required")
+
+    uploads = [f for f in ([file] if file else []) + (files or []) if f is not None]
+    if not uploads:
+        raise HTTPException(400, "no file provided")
+
     zwd = _get_zoho()
     parent_id = zwd.ensure_path(f"Data/{state}/{crop}")
+    # Existing names, lower-cased — Zoho is case-insensitive, so this is the
+    # correct duplicate test and matches find_child's matching model.
+    existing = {i["name"].strip().lower() for i in zwd.list_folder(parent_id)}
 
-    filename = file.filename or "upload.pdf"
-    content = await file.read()
-    zwd.upload_file(filename, content, parent_id)
+    uploaded, skipped = [], []
+    for up in uploads:
+        filename = up.filename or "upload.pdf"
+        if filename.strip().lower() in existing:
+            skipped.append(filename)
+            continue
+        content = await up.read()
+        zwd.upload_file(filename, content, parent_id)
+        existing.add(filename.strip().lower())
+        stem = Path(filename).stem
+        if _master_ready.is_set():
+            _update_master_crop(state, crop, stem,
+                output_file=None, audit_file=None,
+                downloaded=False, audited=False, processed=False,
+            )
+        uploaded.append(filename)
 
-    stem = Path(filename).stem
-    if _master_ready.is_set():
-        _update_master_crop(state, crop, stem,
-            output_file=None, audit_file=None,
-            downloaded=False, audited=False, processed=False,
+    if not uploaded and skipped:
+        # Every file was a duplicate — surface the clear "don't upload" error.
+        raise HTTPException(
+            409, f"Document(s) already exist in {state}/{crop}: {', '.join(skipped)}"
         )
+
     _invalidate_data_cache()
-    return {"path": f"Data/{state}/{crop}/{filename}", "size": len(content)}
+    return {"state": state, "crop": crop, "uploaded": uploaded, "skipped": skipped}
 
 
 @app.delete("/doc")

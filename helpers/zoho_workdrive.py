@@ -189,9 +189,18 @@ class ZohoWorkDrive:
                 yield from self.walk_folder(item["id"], item_path)
 
     def find_child(self, parent_id: str, name: str) -> Optional[dict]:
-        """Find a direct child by exact name. Returns item dict or None."""
+        """Find a direct child by name. Returns item dict or None.
+
+        Matching is case-insensitive: Zoho's filesystem treats names
+        case-insensitively, so two children can never legitimately differ only
+        by case. Using the same match model for both lookup and creation keeps
+        reads (resolve_path) and writes (create_folder, uploads) consistent and
+        prevents case-variant duplicates (e.g. asking for "test" when "Test"
+        already exists).
+        """
+        target = name.strip().lower()
         for item in self.list_folder(parent_id):
-            if item["name"] == name:
+            if item["name"].strip().lower() == target:
                 return item
         return None
 
@@ -221,10 +230,23 @@ class ZohoWorkDrive:
     # ── Folder CRUD ───────────────────────────────────────────────────────────
 
     def create_folder(self, name: str, parent_id: str) -> str:
-        """Create a folder. Returns new folder ID.
+        """Create a folder idempotently. Returns the folder ID.
 
-        FIX C: on 422 (already exists), fall back to find_child to handle races.
+        Zoho WorkDrive does not reliably 422 on a duplicate name. For a
+        case-variant collision (e.g. creating "test" when "Test" exists) it
+        silently creates a copy with a " DD-MM-YYYY HH:MM:SS:mmm" suffix
+        appended instead of erroring. So we:
+          1. Look first, case-insensitively, and reuse any match.
+          2. Still handle the 422 path for exact-name races.
+          3. After creating, verify Zoho kept our name. If it appended a
+             suffix, a collision existed — trash the dupe and return the
+             pre-existing folder.
         """
+        name = name.strip()
+        existing = self.find_child(parent_id, name)
+        if existing and existing["type"] == "folder":
+            return existing["id"]
+
         resp = self._post(
             f"{WD_BASE}/files",
             json={
@@ -241,10 +263,20 @@ class ZohoWorkDrive:
             if existing:
                 return existing["id"]
         resp.raise_for_status()
-        return resp.json()["data"]["id"]
+        data = resp.json()["data"]
+        created_id = data["id"]
+        created_name = data.get("attributes", {}).get("name", name)
+
+        # Detect Zoho's silent collision-rename and undo it.
+        if created_name.strip().lower() != name.lower():
+            existing = self.find_child(parent_id, name)
+            if existing and existing["id"] != created_id:
+                self.delete(created_id)
+                return existing["id"]
+        return created_id
 
     def get_or_create_folder(self, name: str, parent_id: str) -> str:
-        """Return existing folder ID or create it."""
+        """Return existing folder ID (case-insensitive) or create it."""
         existing = self.find_child(parent_id, name)
         if existing and existing["type"] == "folder":
             return existing["id"]
@@ -278,7 +310,8 @@ class ZohoWorkDrive:
         # Override response omits id — find the newest copy by name.
         # Zoho sometimes creates a duplicate instead of replacing; take the last
         # entry (most recently added) so callers don't read a stale file.
-        matches = [i for i in self.list_folder(parent_id) if i["name"] == filename]
+        target = filename.strip().lower()
+        matches = [i for i in self.list_folder(parent_id) if i["name"].strip().lower() == target]
         return matches[-1]["id"] if matches else ""
 
     def upload_file_stream(self, filename: str, local_path: Path, parent_id: str) -> str:
