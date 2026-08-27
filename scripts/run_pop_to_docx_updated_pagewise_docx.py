@@ -1,4 +1,5 @@
 import argparse
+import base64
 import json
 import os
 import re
@@ -10,12 +11,42 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
+import anthropic
 import fitz  # PyMuPDF
 from bs4 import BeautifulSoup, NavigableString
 from google import genai
 from google.genai import types
+from openai import OpenAI
 from docx import Document
 from docxcompose.composer import Composer
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
+
+# ---------------------------------------------------------------------
+# LLM provider selection
+#
+# GEMINI_API_KEY / MINIMAX_API_KEY are picked based on LLM_PROVIDER
+# ("gemini" or "minimax", default "gemini"). Architecture and prompts
+# are shared; only the model call differs per provider.
+# ---------------------------------------------------------------------
+
+MINIMAX_BASE_URL = os.environ.get("MINIMAX_BASE_URL", "https://samagama.in/platform/proxy/v1")
+
+DEFAULT_MODELS = {
+    "gemini": "gemini-3.1-pro-preview",
+    "minimax": "MiniMax-M3",
+    "openai": "gpt-4o",
+    "claude": "claude-opus-5",
+}
+
+
+def resolve_provider() -> str:
+    provider = os.environ.get("LLM_PROVIDER", "gemini").strip().lower()
+    if provider not in DEFAULT_MODELS:
+        raise ValueError(f"Unsupported LLM_PROVIDER: {provider!r}. Expected one of {sorted(DEFAULT_MODELS)}.")
+    return provider
 
 
 # ---------------------------------------------------------------------
@@ -71,7 +102,7 @@ def log(message: str):
 # Prefer using prompts/page_to_pdf.txt from your repo.
 # ---------------------------------------------------------------------
 
-DEFAULT_PROMPT = """Translate this PDF page into English and return only clean HTML. Follow these rules strictly: 1. Preserve the original page structure as faithfully as possible. 2. Preserve headings, paragraphs, numbered lists, bullet points, tables, captions, and reading order. 3. Preserve tables strictly in valid HTML table format. 4. Do not convert tables into paragraphs, bullet points, or free text. 5. Preserve the original number of rows and columns as closely as possible. 6. Preserve chemical names, crop names, pest names, formulation codes, units, doses, percentages, and numbers exactly. 7. Do not omit any visible textual content. 8. Do not summarize, paraphrase, simplify, or explain. 9. Do not add content that is not present in the PDF. 10. Return only HTML. Do not return Markdown. 11. Use semantic HTML tags where appropriate, such as h1-h6, p, ul, ol, li, table, thead, tbody, tr, th, td, figure, figcaption, div, and span. 12. Preserve multi-column or visually separated sections as separate HTML blocks in reading order. 13. Do not invent image descriptions. If the page contains an image or figure whose original binary content cannot be reproduced in HTML output, preserve its position using a minimal placeholder block such as: [IMAGE] 14. If the source page already contains a visible caption, preserve that caption near the corresponding image placeholder. 15. Do not use code fences.
+DEFAULT_PROMPT = """Translate this PDF page into English and return only clean HTML. Follow these rules strictly: 1. Preserve the original page structure as faithfully as possible. 2. Preserve headings, paragraphs, numbered lists, bullet points, tables, captions, and reading order. 3. Preserve tables strictly in valid HTML table format. 4. Do not convert tables into paragraphs, bullet points, or free text. 5. Preserve the original number of rows and columns as closely as possible. 6. Preserve chemical names, crop names, pest names, formulation codes, units, doses, percentages, and numbers exactly. 7. Every sentence, phrase, list item, and table cell of body text must be translated into English. Do not leave any sentence or paragraph untranslated in the source language, no matter how dense or technical. The "preserve exactly" instruction in rule 6 applies only to the specific names, codes, units, and numbers it lists — not to the surrounding sentences, which must still be translated. Only untranslatable proper nouns (place names, variety/cultivar names, brand names) may remain in the original script. 8. Do not omit any visible textual content. 9. Do not summarize, paraphrase, simplify, or explain. 10. Do not add content that is not present in the PDF. 11. Return only HTML. Do not return Markdown. 12. Use semantic HTML tags where appropriate, such as h1-h6, p, ul, ol, li, table, thead, tbody, tr, th, td, figure, figcaption, div, and span. 13. Preserve multi-column or visually separated sections as separate HTML blocks in reading order. 14. Do not invent image descriptions. If the page contains an image or figure whose original binary content cannot be reproduced in HTML output, preserve its position using a minimal placeholder block such as: [IMAGE] 15. If the source page already contains a visible caption, preserve that caption near the corresponding image placeholder. 16. Do not use code fences.
 Return a single self-contained HTML fragment for this one PDF page."""
 
 
@@ -100,6 +131,62 @@ def clean_html(text: str) -> str:
     text = re.sub(r"\s*```$", "", text)
 
     return text.strip() + "\n"
+
+
+def strip_minimax_thinking(text: str) -> str:
+    """
+    MiniMax-M3 inlines its chain-of-thought directly into the response as a
+    literal <think>...</think> block ahead of the real answer (there is no
+    separate reasoning channel like Gemini's thinking_config). Drop it.
+
+    If <think> is present without a matching closing tag, generation was cut
+    off mid-reasoning and no real answer was ever produced, so this is treated
+    as a failure to trigger a retry rather than silently emitting raw
+    chain-of-thought as translated content.
+    """
+    if "<think>" not in text:
+        return text
+
+    if "</think>" not in text:
+        raise RuntimeError(
+            "MiniMax response was truncated mid-reasoning (unclosed <think> "
+            "block) before producing an answer."
+        )
+
+    return text.rsplit("</think>", 1)[1].strip()
+
+
+# Common Indic script Unicode blocks (Devanagari, Bengali, Gurmukhi, Gujarati,
+# Oriya, Tamil, Telugu, Kannada, Malayalam) — covers the source languages this
+# pipeline has seen (Malayalam, Bengali, ...).
+INDIC_SCRIPT_RE = re.compile(
+    "[ऀ-ॿঀ-৿਀-੿઀-૿଀-୿"
+    "஀-௿ఀ-౿ಀ-೿ഀ-ൿ]"
+)
+
+
+def check_translation_completeness(html: str, max_source_script_ratio: float = 0.25) -> None:
+    """
+    MiniMax occasionally returns page content copied verbatim in the source
+    script instead of translating it, especially on dense paragraphs or
+    tables, even when it does produce a well-formed answer. Treat a high
+    proportion of untranslated source-script characters as a failure so the
+    existing retry logic gets another attempt instead of silently shipping
+    raw source-language text as "translated" content.
+    """
+    plain_text = re.sub(r"<[^>]+>", " ", html)
+    letters = re.sub(r"\s+", "", plain_text)
+    if not letters:
+        return
+
+    source_script_chars = len(INDIC_SCRIPT_RE.findall(plain_text))
+    ratio = source_script_chars / len(letters)
+
+    if ratio > max_source_script_ratio:
+        raise RuntimeError(
+            f"MiniMax response appears untranslated: {ratio:.0%} of characters "
+            f"are in the source script (threshold {max_source_script_ratio:.0%})."
+        )
 
 
 def page_name(page_num: int) -> str:
@@ -195,7 +282,7 @@ def split_pdf_to_page_folders(
 # - googleSearch enabled
 # ---------------------------------------------------------------------
 
-def make_generate_content_config(enable_google_search: bool = True):
+def make_generate_content_config(enable_google_search: bool = True, thinking_level: str = "HIGH"):
     tools = []
 
     if enable_google_search:
@@ -207,13 +294,13 @@ def make_generate_content_config(enable_google_search: bool = True):
 
     return types.GenerateContentConfig(
         thinking_config=types.ThinkingConfig(
-            thinking_level="HIGH",
+            thinking_level=thinking_level.upper(),
         ),
         tools=tools,
     )
 
 
-def translate_page_pdf_to_html(
+def translate_page_pdf_to_html_gemini(
     pdf_path: Path,
     prompt: str,
     model: str,
@@ -221,27 +308,40 @@ def translate_page_pdf_to_html(
     max_retries: int,
     retry_wait_seconds: int,
     enable_google_search: bool,
-) -> str:
-    pdf_bytes = pdf_path.read_bytes()
+    thinking_level: str = "HIGH",
+) -> tuple[str, dict | None]:
+    """
+    Sends the same 300 DPI rendered page PNG the MiniMax/OpenAI paths get,
+    not the raw single-page PDF bytes. Two reasons: (1) fairness -- Gemini
+    was the only leg of the 4-way comparison receiving a different input
+    modality, so any quality gap could just be Gemini's own undocumented
+    PDF-rasterization choices rather than a real model difference; (2)
+    control -- an explicit render pins the resolution instead of leaving it
+    to however Gemini's PDF ingestion decides to downsample a dense scanned
+    page.
+    """
+    png_bytes = render_pdf_page_to_png_bytes(pdf_path)
     last_error = None
 
     client = genai.Client(api_key=api_key)
     generate_content_config = make_generate_content_config(
-        enable_google_search=enable_google_search
+        enable_google_search=enable_google_search,
+        thinking_level=thinking_level,
     )
 
     pname = pdf_path.parent.name
-    pdf_size_kb = len(pdf_bytes) / 1024
+    image_size_kb = len(png_bytes) / 1024
 
     for attempt in range(1, max_retries + 1):
         attempt_start = time.perf_counter()
 
         try:
             collected = []
+            usage_metadata = None
 
             log(
                 f"{pname} | attempt {attempt}/{max_retries} | "
-                f"request sent to Gemini | pdf_size={pdf_size_kb:.1f} KB"
+                f"request sent to Gemini | image_size={image_size_kb:.1f} KB | thinking_level={thinking_level}"
             )
 
             chunk_count = 0
@@ -256,8 +356,8 @@ def translate_page_pdf_to_html(
                         parts=[
                             types.Part.from_text(text=prompt),
                             types.Part.from_bytes(
-                                data=pdf_bytes,
-                                mime_type="application/pdf",
+                                data=png_bytes,
+                                mime_type="image/png",
                             ),
                         ],
                     ),
@@ -265,6 +365,9 @@ def translate_page_pdf_to_html(
                 config=generate_content_config,
             ):
                 chunk_count += 1
+
+                if getattr(chunk, "usage_metadata", None):
+                    usage_metadata = chunk.usage_metadata
 
                 if text := chunk.text:
                     collected.append(text)
@@ -285,13 +388,33 @@ def translate_page_pdf_to_html(
             if not full_text:
                 raise RuntimeError("Empty response received from Gemini.")
 
+            usage = None
+            usage_str = ""
+            if usage_metadata:
+                in_tok = getattr(usage_metadata, "prompt_token_count", None) or 0
+                # thinking_level="HIGH" is always on (see make_generate_content_config) --
+                # reasoning/"thoughts" tokens are billed as output same as OpenAI's
+                # reasoning tokens, so fold them in rather than undercounting cost.
+                candidates_tok = getattr(usage_metadata, "candidates_token_count", None) or 0
+                thoughts_tok = getattr(usage_metadata, "thoughts_token_count", None) or 0
+                out_tok = candidates_tok + thoughts_tok
+                total_tok = getattr(usage_metadata, "total_token_count", None) or (in_tok + out_tok)
+                usage = {"input_tokens": in_tok, "output_tokens": out_tok, "total_tokens": total_tok}
+                cost_str = ""
+                if GEMINI_INPUT_PRICE_PER_1M is not None and GEMINI_OUTPUT_PRICE_PER_1M is not None:
+                    cost = (in_tok / 1_000_000 * GEMINI_INPUT_PRICE_PER_1M) + (out_tok / 1_000_000 * GEMINI_OUTPUT_PRICE_PER_1M)
+                    usage["est_cost"] = round(cost, 6)
+                    cost_str = f" | est_cost=${cost:.4f}"
+                usage_str = f" | tokens: in={in_tok} out={out_tok} total={total_tok}{cost_str}"
+
             log(
                 f"{pname} | attempt {attempt} | Gemini response completed | "
                 f"duration={format_duration(attempt_elapsed)} | "
                 f"chunks={chunk_count} | text_chunks={text_chunk_count} | chars={len(full_text)}"
+                f"{usage_str}"
             )
 
-            return clean_html(full_text)
+            return clean_html(full_text), usage
 
         except Exception as e:
             attempt_elapsed = time.perf_counter() - attempt_start
@@ -309,6 +432,438 @@ def translate_page_pdf_to_html(
     raise RuntimeError(f"Failed after {max_retries} attempts for {pdf_path}") from last_error
 
 
+def render_pdf_page_to_png_bytes(pdf_path: Path, dpi: int = 200) -> bytes:
+    """
+    MiniMax-M3 has no native PDF input, so each single-page PDF is rasterized
+    to a PNG and sent as an image content part instead (Gemini takes the raw
+    PDF bytes directly).
+    """
+    doc = fitz.open(pdf_path)
+    page = doc[0]
+    pix = page.get_pixmap(dpi=dpi)
+    png_bytes = pix.tobytes("png")
+    doc.close()
+    return png_bytes
+
+
+def translate_page_pdf_to_html_minimax(
+    pdf_path: Path,
+    prompt: str,
+    model: str,
+    api_key: str,
+    max_retries: int,
+    retry_wait_seconds: int,
+) -> tuple[str, dict | None]:
+    last_error = None
+
+    client = OpenAI(api_key=api_key, base_url=MINIMAX_BASE_URL)
+
+    png_bytes = render_pdf_page_to_png_bytes(pdf_path)
+    image_data_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
+
+    pname = pdf_path.parent.name
+    image_size_kb = len(png_bytes) / 1024
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": image_data_url}},
+            ],
+        },
+    ]
+
+    for attempt in range(1, max_retries + 1):
+        attempt_start = time.perf_counter()
+
+        try:
+            collected = []
+
+            log(
+                f"{pname} | attempt {attempt}/{max_retries} | "
+                f"request sent to MiniMax | image_size={image_size_kb:.1f} KB"
+            )
+
+            chunk_count = 0
+            text_chunk_count = 0
+            last_stream_log = time.perf_counter()
+
+            stream = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                stream=True,
+                max_tokens=16000,
+                extra_body={"thinking": {"type": "adaptive"}},
+            )
+
+            for chunk in stream:
+                chunk_count += 1
+
+                delta = chunk.choices[0].delta if chunk.choices else None
+                text = getattr(delta, "content", None) if delta else None
+
+                if text:
+                    collected.append(text)
+                    text_chunk_count += 1
+
+                now = time.perf_counter()
+                if now - last_stream_log >= 30:
+                    log(
+                        f"{pname} | attempt {attempt} | still streaming... "
+                        f"elapsed={format_duration(now - attempt_start)} | "
+                        f"chunks={chunk_count} | text_chunks={text_chunk_count}"
+                    )
+                    last_stream_log = now
+
+            full_text = "".join(collected).strip()
+            attempt_elapsed = time.perf_counter() - attempt_start
+
+            if not full_text:
+                raise RuntimeError("Empty response received from MiniMax.")
+
+            answer_text = strip_minimax_thinking(full_text)
+
+            if not answer_text:
+                raise RuntimeError("MiniMax response contained no content after the <think> block.")
+
+            check_translation_completeness(answer_text)
+
+            log(
+                f"{pname} | attempt {attempt} | MiniMax response completed | "
+                f"duration={format_duration(attempt_elapsed)} | "
+                f"chunks={chunk_count} | text_chunks={text_chunk_count} | "
+                f"chars={len(full_text)} (answer_chars={len(answer_text)})"
+            )
+
+            return clean_html(answer_text), None
+
+        except Exception as e:
+            attempt_elapsed = time.perf_counter() - attempt_start
+            last_error = e
+
+            log(
+                f"{pname} | attempt {attempt}/{max_retries} failed | "
+                f"duration={format_duration(attempt_elapsed)} | error={e}"
+            )
+
+            if attempt < max_retries:
+                log(f"{pname} | waiting {retry_wait_seconds}s before retry")
+                time.sleep(retry_wait_seconds)
+
+    raise RuntimeError(f"Failed after {max_retries} attempts for {pdf_path}") from last_error
+
+
+OPENAI_INPUT_PRICE_PER_1M = float(os.environ.get("OPENAI_INPUT_PRICE_PER_1M", "5.00"))
+OPENAI_OUTPUT_PRICE_PER_1M = float(os.environ.get("OPENAI_OUTPUT_PRICE_PER_1M", "30.00"))
+
+# No hardcoded default here (unlike OpenAI's above): gemini-3.1-pro-preview's
+# per-token price wasn't confirmed against a current pricing page, so
+# guessing one would risk silently printing a wrong cost. Token counts are
+# always logged/stored regardless; set these two env vars to also get a
+# computed est_cost.
+GEMINI_INPUT_PRICE_PER_1M = (
+    float(os.environ["GEMINI_INPUT_PRICE_PER_1M"]) if "GEMINI_INPUT_PRICE_PER_1M" in os.environ else None
+)
+GEMINI_OUTPUT_PRICE_PER_1M = (
+    float(os.environ["GEMINI_OUTPUT_PRICE_PER_1M"]) if "GEMINI_OUTPUT_PRICE_PER_1M" in os.environ else None
+)
+
+
+def translate_page_pdf_to_html_openai(
+    pdf_path: Path,
+    prompt: str,
+    model: str,
+    api_key: str,
+    max_retries: int,
+    retry_wait_seconds: int,
+    reasoning_effort: str | None = None,
+) -> tuple[str, dict | None]:
+    """
+    One-shot vision translate against the real OpenAI API (not the MiniMax
+    proxy) -- same page-image-in, translated-HTML-out contract as the
+    MiniMax path, so it drops into the same comparison harness.
+
+    Reasoning-tier models (gpt-5.x and similar) reject the legacy
+    max_tokens param in favor of max_completion_tokens, and bill hidden
+    reasoning tokens as output tokens -- expensive for a task that's really
+    just careful reading + translation, not deep reasoning. reasoning_effort
+    lets the caller dial that down; left None, the API's own default
+    applies. stream_options include_usage + the per-page cost log below let
+    you watch actual spend in real time rather than guessing.
+    """
+    last_error = None
+
+    client = OpenAI(api_key=api_key)
+
+    png_bytes = render_pdf_page_to_png_bytes(pdf_path)
+    image_data_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
+
+    pname = pdf_path.parent.name
+    image_size_kb = len(png_bytes) / 1024
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": image_data_url}},
+            ],
+        },
+    ]
+
+    create_kwargs = dict(
+        model=model,
+        messages=messages,
+        stream=True,
+        max_completion_tokens=16000,
+        stream_options={"include_usage": True},
+    )
+    if reasoning_effort:
+        create_kwargs["reasoning_effort"] = reasoning_effort
+
+    for attempt in range(1, max_retries + 1):
+        attempt_start = time.perf_counter()
+
+        try:
+            collected = []
+            usage = None
+
+            log(
+                f"{pname} | attempt {attempt}/{max_retries} | "
+                f"request sent to OpenAI | image_size={image_size_kb:.1f} KB"
+                + (f" | reasoning_effort={reasoning_effort}" if reasoning_effort else "")
+            )
+
+            chunk_count = 0
+            text_chunk_count = 0
+            last_stream_log = time.perf_counter()
+
+            stream = client.chat.completions.create(**create_kwargs)
+
+            for chunk in stream:
+                chunk_count += 1
+
+                if getattr(chunk, "usage", None):
+                    usage = chunk.usage
+
+                delta = chunk.choices[0].delta if chunk.choices else None
+                text = getattr(delta, "content", None) if delta else None
+
+                if text:
+                    collected.append(text)
+                    text_chunk_count += 1
+
+                now = time.perf_counter()
+                if now - last_stream_log >= 30:
+                    log(
+                        f"{pname} | attempt {attempt} | still streaming... "
+                        f"elapsed={format_duration(now - attempt_start)} | "
+                        f"chunks={chunk_count} | text_chunks={text_chunk_count}"
+                    )
+                    last_stream_log = now
+
+            full_text = "".join(collected).strip()
+            attempt_elapsed = time.perf_counter() - attempt_start
+
+            if not full_text:
+                raise RuntimeError("Empty response received from OpenAI.")
+
+            check_translation_completeness(full_text)
+
+            cost_str = ""
+            usage_dict = None
+            if usage:
+                in_tok = getattr(usage, "prompt_tokens", 0) or 0
+                out_tok = getattr(usage, "completion_tokens", 0) or 0
+                cost = (in_tok / 1_000_000 * OPENAI_INPUT_PRICE_PER_1M) + (out_tok / 1_000_000 * OPENAI_OUTPUT_PRICE_PER_1M)
+                usage_dict = {"input_tokens": in_tok, "output_tokens": out_tok, "total_tokens": in_tok + out_tok, "est_cost": round(cost, 6)}
+                cost_str = f" | tokens: in={in_tok} out={out_tok} | est_cost=${cost:.4f}"
+
+            log(
+                f"{pname} | attempt {attempt} | OpenAI response completed | "
+                f"duration={format_duration(attempt_elapsed)} | "
+                f"chunks={chunk_count} | text_chunks={text_chunk_count} | chars={len(full_text)}"
+                f"{cost_str}"
+            )
+
+            return clean_html(full_text), usage_dict
+
+        except Exception as e:
+            attempt_elapsed = time.perf_counter() - attempt_start
+            last_error = e
+
+            log(
+                f"{pname} | attempt {attempt}/{max_retries} failed | "
+                f"duration={format_duration(attempt_elapsed)} | error={e}"
+            )
+
+            if attempt < max_retries:
+                log(f"{pname} | waiting {retry_wait_seconds}s before retry")
+                time.sleep(retry_wait_seconds)
+
+    raise RuntimeError(f"Failed after {max_retries} attempts for {pdf_path}") from last_error
+
+
+CLAUDE_INPUT_PRICE_PER_1M = float(os.environ.get("CLAUDE_INPUT_PRICE_PER_1M", "5.00"))
+CLAUDE_OUTPUT_PRICE_PER_1M = float(os.environ.get("CLAUDE_OUTPUT_PRICE_PER_1M", "25.00"))
+
+
+def translate_page_pdf_to_html_claude(
+    pdf_path: Path,
+    prompt: str,
+    model: str,
+    api_key: str,
+    max_retries: int,
+    retry_wait_seconds: int,
+) -> tuple[str, dict | None]:
+    """
+    One-shot vision translate against the real Anthropic (Claude) API --
+    same page-image-in, translated-HTML-out contract as the OpenAI/MiniMax
+    paths, so it drops into the same comparison harness. Streams the
+    response (get_final_message() for the accumulated text + usage) so a
+    dense page can't hit an HTTP timeout on a large max_tokens.
+    """
+    last_error = None
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    png_bytes = render_pdf_page_to_png_bytes(pdf_path)
+    image_b64 = base64.b64encode(png_bytes).decode("ascii")
+
+    pname = pdf_path.parent.name
+    image_size_kb = len(png_bytes) / 1024
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": image_b64},
+                },
+                {"type": "text", "text": prompt},
+            ],
+        },
+    ]
+
+    for attempt in range(1, max_retries + 1):
+        attempt_start = time.perf_counter()
+
+        try:
+            log(
+                f"{pname} | attempt {attempt}/{max_retries} | "
+                f"request sent to Claude | image_size={image_size_kb:.1f} KB"
+            )
+
+            with client.messages.stream(
+                model=model,
+                max_tokens=8000,
+                messages=messages,
+            ) as stream:
+                for _ in stream.text_stream:
+                    pass
+                final_message = stream.get_final_message()
+
+            full_text = "".join(
+                block.text for block in final_message.content if block.type == "text"
+            ).strip()
+            attempt_elapsed = time.perf_counter() - attempt_start
+
+            if not full_text:
+                raise RuntimeError("Empty response received from Claude.")
+
+            check_translation_completeness(full_text)
+
+            usage_dict = None
+            cost_str = ""
+            usage = getattr(final_message, "usage", None)
+            if usage:
+                in_tok = usage.input_tokens or 0
+                out_tok = usage.output_tokens or 0
+                cost = (in_tok / 1_000_000 * CLAUDE_INPUT_PRICE_PER_1M) + (out_tok / 1_000_000 * CLAUDE_OUTPUT_PRICE_PER_1M)
+                usage_dict = {"input_tokens": in_tok, "output_tokens": out_tok, "total_tokens": in_tok + out_tok, "est_cost": round(cost, 6)}
+                cost_str = f" | tokens: in={in_tok} out={out_tok} | est_cost=${cost:.4f}"
+
+            log(
+                f"{pname} | attempt {attempt} | Claude response completed | "
+                f"duration={format_duration(attempt_elapsed)} | chars={len(full_text)}"
+                f"{cost_str}"
+            )
+
+            return clean_html(full_text), usage_dict
+
+        except Exception as e:
+            attempt_elapsed = time.perf_counter() - attempt_start
+            last_error = e
+
+            log(
+                f"{pname} | attempt {attempt}/{max_retries} failed | "
+                f"duration={format_duration(attempt_elapsed)} | error={e}"
+            )
+
+            if attempt < max_retries:
+                log(f"{pname} | waiting {retry_wait_seconds}s before retry")
+                time.sleep(retry_wait_seconds)
+
+    raise RuntimeError(f"Failed after {max_retries} attempts for {pdf_path}") from last_error
+
+
+def translate_page_pdf_to_html(
+    pdf_path: Path,
+    prompt: str,
+    model: str,
+    api_key: str,
+    max_retries: int,
+    retry_wait_seconds: int,
+    enable_google_search: bool,
+    provider: str = "gemini",
+    openai_reasoning_effort: str | None = None,
+    gemini_thinking_level: str = "HIGH",
+) -> tuple[str, dict | None]:
+    if provider == "claude":
+        return translate_page_pdf_to_html_claude(
+            pdf_path=pdf_path,
+            prompt=prompt,
+            model=model,
+            api_key=api_key,
+            max_retries=max_retries,
+            retry_wait_seconds=retry_wait_seconds,
+        )
+
+    if provider == "minimax":
+        return translate_page_pdf_to_html_minimax(
+            pdf_path=pdf_path,
+            prompt=prompt,
+            model=model,
+            api_key=api_key,
+            max_retries=max_retries,
+            retry_wait_seconds=retry_wait_seconds,
+        )
+
+    if provider == "openai":
+        return translate_page_pdf_to_html_openai(
+            pdf_path=pdf_path,
+            prompt=prompt,
+            model=model,
+            api_key=api_key,
+            max_retries=max_retries,
+            retry_wait_seconds=retry_wait_seconds,
+            reasoning_effort=openai_reasoning_effort,
+        )
+
+    return translate_page_pdf_to_html_gemini(
+        pdf_path=pdf_path,
+        prompt=prompt,
+        model=model,
+        api_key=api_key,
+        max_retries=max_retries,
+        retry_wait_seconds=retry_wait_seconds,
+        enable_google_search=enable_google_search,
+        thinking_level=gemini_thinking_level,
+    )
+
+
 def process_translation_for_page(
     page_pdf_path: Path,
     prompt: str,
@@ -318,6 +873,9 @@ def process_translation_for_page(
     max_retries: int,
     retry_wait_seconds: int,
     enable_google_search: bool,
+    provider: str = "gemini",
+    openai_reasoning_effort: str | None = None,
+    gemini_thinking_level: str = "HIGH",
 ):
     page_start = time.perf_counter()
 
@@ -341,7 +899,7 @@ def process_translation_for_page(
     log(f"{pname} | translation started")
 
     try:
-        translated_html = translate_page_pdf_to_html(
+        translated_html, usage = translate_page_pdf_to_html(
             pdf_path=page_pdf_path,
             prompt=prompt,
             model=model,
@@ -349,6 +907,9 @@ def process_translation_for_page(
             max_retries=max_retries,
             retry_wait_seconds=retry_wait_seconds,
             enable_google_search=enable_google_search,
+            provider=provider,
+            openai_reasoning_effort=openai_reasoning_effort,
+            gemini_thinking_level=gemini_thinking_level,
         )
 
         html_path.write_text(translated_html, encoding="utf-8")
@@ -367,6 +928,7 @@ def process_translation_for_page(
             "duration_seconds": round(page_elapsed, 2),
             "started_at": None,
             "finished_at": now_str(),
+            "usage": usage,
         }
 
     except Exception as e:
@@ -401,6 +963,9 @@ def translate_pages(
     retry_wait_seconds: int,
     enable_google_search: bool,
     concurrency: int,
+    provider: str = "gemini",
+    openai_reasoning_effort: str | None = None,
+    gemini_thinking_level: str = "HIGH",
 ):
     """
     concurrency=1 gives notebook-equivalent sequential behavior.
@@ -412,7 +977,7 @@ def translate_pages(
     total_pages = len(page_pdf_files)
     log(
         f"Translation stage started | pages={total_pages} | "
-        f"concurrency={concurrency} | model={model} | "
+        f"concurrency={concurrency} | provider={provider} | model={model} | "
         f"google_search={enable_google_search}"
     )
 
@@ -428,6 +993,9 @@ def translate_pages(
                 max_retries=max_retries,
                 retry_wait_seconds=retry_wait_seconds,
                 enable_google_search=enable_google_search,
+                provider=provider,
+                openai_reasoning_effort=openai_reasoning_effort,
+                gemini_thinking_level=gemini_thinking_level,
             )
             summary.append(result)
             log(f"Translation progress | completed {idx}/{total_pages} | page={pdf_path.parent.name}")
@@ -448,6 +1016,9 @@ def translate_pages(
                 max_retries,
                 retry_wait_seconds,
                 enable_google_search,
+                provider,
+                openai_reasoning_effort,
+                gemini_thinking_level,
             ): pdf_path
             for pdf_path in page_pdf_files
         }
@@ -1325,7 +1896,34 @@ def main():
     parser.add_argument("--workdir-root", required=True, help="Working/output directory for this document")
     parser.add_argument("--doc-name", default=None, help="Document name for final output")
     parser.add_argument("--prompt-file", default="prompts/page_to_pdf.txt", help="Prompt file path")
-    parser.add_argument("--model", default="gemini-3.1-pro-preview", help="Gemini model name")
+    parser.add_argument(
+        "--provider",
+        default=None,
+        choices=["gemini", "minimax", "openai", "claude"],
+        help="LLM provider. Defaults to LLM_PROVIDER env var, or 'gemini' if unset.",
+    )
+    parser.add_argument("--model", default=None, help="Model name. Defaults per-provider.")
+    parser.add_argument(
+        "--api-key-env", default=None,
+        help="Env var name to read the API key from, overriding the provider's default "
+             "(GEMINI_API_KEY / MINIMAX_API_KEY / OPENAI_API_KEY). E.g. --api-key-env GEMINI_API_KEY_2 "
+             "to use an alternate key without touching .env.",
+    )
+    parser.add_argument(
+        "--openai-reasoning-effort", default=None,
+        choices=["none", "low", "medium", "high", "xhigh", "max"],
+        help="Only used with --provider openai on reasoning-tier models (e.g. gpt-5.x). "
+             "Reasoning tokens are billed as output tokens, so lower effort keeps cost down "
+             "for a task that's mostly careful reading + translation. Omit to use the API's own default.",
+    )
+    parser.add_argument(
+        "--gemini-thinking-level", default="low",
+        choices=["minimal", "low", "medium", "high"],
+        help="Only used with --provider gemini. Same idea as --openai-reasoning-effort: "
+             "thinking tokens are billed as output, and this pipeline previously hardcoded "
+             "HIGH for every call. Defaults to low here to keep cost down; raise it per-doc "
+             "if quality looks worse than the other providers.",
+    )
 
     parser.add_argument("--start-page", type=int, default=1, help="Start page, 1-indexed")
     parser.add_argument("--end-page", type=int, default=None, help="End page, 1-indexed. Default: last page")
@@ -1355,9 +1953,21 @@ def main():
     workdir_root.mkdir(parents=True, exist_ok=True)
     set_log_file(workdir_root / "pipeline_runtime.log")
 
-    api_key = os.environ.get("GEMINI_API_KEY")
+    provider = args.provider.strip().lower() if args.provider else resolve_provider()
+    if provider not in DEFAULT_MODELS:
+        raise ValueError(f"Unsupported provider: {provider!r}. Expected one of {sorted(DEFAULT_MODELS)}.")
+
+    model = args.model or DEFAULT_MODELS[provider]
+
+    env_key_name = args.api_key_env or {
+        "minimax": "MINIMAX_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "gemini": "GEMINI_API_KEY",
+        "claude": "CLAUDE_API_KEY",
+    }[provider]
+    api_key = os.environ.get(env_key_name)
     if not api_key and not args.skip_translation:
-        raise RuntimeError("GEMINI_API_KEY is not set.")
+        raise RuntimeError(f"{env_key_name} is not set.")
 
     print("=" * 90)
     print("POP Translation Pipeline")
@@ -1366,9 +1976,10 @@ def main():
     print("Workdir root      :", workdir_root)
     print("Doc name          :", doc_name)
     print("Prompt file       :", prompt_path)
-    print("Model             :", args.model)
-    print("Thinking level    : HIGH")
-    print("Google Search     :", not args.disable_google_search)
+    print("Provider          :", provider)
+    print("Model             :", model)
+    print("Thinking level    :", {"gemini": "HIGH", "minimax": "adaptive", "openai": "n/a", "claude": "adaptive"}[provider])
+    print("Google Search     :", (not args.disable_google_search) if provider == "gemini" else "n/a")
     print("Start page        :", args.start_page)
     print("End page          :", args.end_page if args.end_page else "LAST PAGE")
     print("Concurrency       :", args.concurrency)
@@ -1380,9 +1991,8 @@ def main():
     log(f"Source PDF: {source_pdf_path}")
     log(f"Workdir root: {workdir_root}")
     log(f"Doc name: {doc_name}")
-    log(f"Model: {args.model}")
-    log("Thinking level: HIGH")
-    log(f"Google Search: {not args.disable_google_search}")
+    log(f"Provider: {provider}")
+    log(f"Model: {model}")
     log(f"Start page: {args.start_page}")
     log(f"End page: {args.end_page if args.end_page else 'LAST PAGE'}")
     log(f"Concurrency: {args.concurrency}")
@@ -1416,19 +2026,22 @@ def main():
     if args.skip_translation:
         log("[2/5] Skipping translation. Reusing existing translated.html files.")
     else:
-        log("[2/5] Translating pages to HTML using notebook-equivalent Gemini config...")
+        log(f"[2/5] Translating pages to HTML using {provider}...")
         prompt = load_prompt(prompt_path)
 
         translation_summary = translate_pages(
             page_pdf_files=page_pdf_files,
             prompt=prompt,
-            model=args.model,
+            model=model,
             api_key=api_key,
             overwrite_existing=args.overwrite,
             max_retries=args.max_retries,
             retry_wait_seconds=args.retry_wait_seconds,
             enable_google_search=not args.disable_google_search,
             concurrency=args.concurrency,
+            provider=provider,
+            openai_reasoning_effort=args.openai_reasoning_effort,
+            gemini_thinking_level=args.gemini_thinking_level,
         )
 
         translation_summary_path = workdir_root / "translation_summary.json"
@@ -1437,6 +2050,33 @@ def main():
             encoding="utf-8",
         )
         log(f"Translation summary saved: {translation_summary_path}")
+
+        pages_with_usage = [x["usage"] for x in translation_summary if x.get("usage")]
+        if pages_with_usage:
+            total_usage = {
+                "pages_counted": len(pages_with_usage),
+                "input_tokens": sum(u["input_tokens"] for u in pages_with_usage),
+                "output_tokens": sum(u["output_tokens"] for u in pages_with_usage),
+                "total_tokens": sum(u["total_tokens"] for u in pages_with_usage),
+            }
+            if all("est_cost" in u for u in pages_with_usage):
+                total_usage["est_cost"] = round(sum(u["est_cost"] for u in pages_with_usage), 6)
+            token_usage_path = workdir_root / "token_usage.json"
+            token_usage_path.write_text(
+                json.dumps({"total": total_usage, "per_page": pages_with_usage}, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            cost_note = f" | est_cost=${total_usage['est_cost']:.4f}" if "est_cost" in total_usage else " | (set *_PRICE_PER_1M env vars for est_cost)"
+            log(
+                f"Token usage saved: {token_usage_path} | "
+                f"{total_usage['pages_counted']} page(s) | "
+                f"in={total_usage['input_tokens']} out={total_usage['output_tokens']} total={total_usage['total_tokens']}"
+                f"{cost_note}"
+            )
+            print(
+                f"Total tokens ({doc_name}): in={total_usage['input_tokens']} out={total_usage['output_tokens']} "
+                f"total={total_usage['total_tokens']}{cost_note}"
+            )
 
         failed = [x for x in translation_summary if x["status"] == "failed"]
         if failed:

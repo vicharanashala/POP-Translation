@@ -63,3 +63,22 @@ prompt.md
 pop_translation.md
 pop_translation_doc.md
 README.md
+
+
+# local dev
+claude_api_compare/
+claude_compare/
+cropped_files/
+cropped_files_2/
+cropped_files_3/
+gemini_compare/
+gpt_compare/
+results/
+tmp/
+tmp_2/
+
+# scripts/ and tessdata_best/ are NOT ignored -- dashboard/dedup.py imports
+# scripts/hash_and_embed_report_true.py at module load, and that module reads
+# tessdata_best/*.traineddata directly off disk at REPO_ROOT/tessdata_best.
+# Both must ship in the image for the dashboard's upload/dedup flow to work.
+

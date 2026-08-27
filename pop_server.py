@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import requests as _requests
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
@@ -72,6 +72,16 @@ from run_pop_to_docx_updated_pagewise_docx import (  # noqa: E402
 )
 
 import _job_ctl as ctl  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# LLM provider — chosen once at startup from LLM_PROVIDER ("gemini" or
+# "minimax", default "gemini"). Architecture/prompts are shared; only the
+# model call inside the pipeline script differs per provider.
+# ---------------------------------------------------------------------------
+
+LLM_PROVIDER = _pop_script.resolve_provider()
+DEFAULT_MODEL = _pop_script.DEFAULT_MODELS[LLM_PROVIDER]
+LLM_API_KEY_ENV = "MINIMAX_API_KEY" if LLM_PROVIDER == "minimax" else "GEMINI_API_KEY"
 
 # ---------------------------------------------------------------------------
 # Paths — POP_WORK / Workdir is local scratch; all persistent data lives in Zoho
@@ -558,7 +568,7 @@ class PopRequest(BaseModel):
     overwrite: bool = False
     skip_translation: bool = False
     skip_image_injection: bool = False
-    model: str = "gemini-3.1-pro-preview"
+    model: str = DEFAULT_MODEL
     max_retries: int = 5
     retry_wait_seconds: int = 15
     disable_google_search: bool = False
@@ -720,6 +730,7 @@ def _run_one_doc(
     req: PopRequest,
     api_key: str,
     prompt: str,
+    on_progress: Callable[[int, int], None] | None = None,
 ):
     workdir_root = POP_WORK / "Workdir" / req.state / req.crop / doc_name
     workdir_root.mkdir(parents=True, exist_ok=True)
@@ -747,7 +758,7 @@ def _run_one_doc(
             total_pages_t = len(page_pdf_files)
             pipeline_log(
                 f"Translation stage started | pages={total_pages_t} | "
-                f"concurrency=1 | model={req.model} | "
+                f"concurrency=1 | provider={LLM_PROVIDER} | model={req.model} | "
                 f"google_search={not req.disable_google_search}"
             )
             for idx, pdf_path in enumerate(page_pdf_files, start=1):
@@ -762,9 +773,12 @@ def _run_one_doc(
                     max_retries=req.max_retries,
                     retry_wait_seconds=req.retry_wait_seconds,
                     enable_google_search=not req.disable_google_search,
+                    provider=LLM_PROVIDER,
                 )
                 translation_summary.append(result)
                 pipeline_log(f"Translation progress | completed {idx}/{total_pages_t} | page={pdf_path.parent.name}")
+                if on_progress:
+                    on_progress(idx, total_pages_t)
             log_translation_summary(translation_summary, _t.perf_counter() - _stage_start)
         else:
             translation_summary = translate_pages(
@@ -777,6 +791,7 @@ def _run_one_doc(
                 retry_wait_seconds=req.retry_wait_seconds,
                 enable_google_search=not req.disable_google_search,
                 concurrency=req.concurrency,
+                provider=LLM_PROVIDER,
             )
         (workdir_root / "translation_summary.json").write_text(
             json.dumps(translation_summary, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -828,9 +843,9 @@ def _run_one_doc(
 
 
 def _run_pop_sync(req: PopRequest):
-    api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = os.environ.get(LLM_API_KEY_ENV)
     if not api_key and not req.skip_translation:
-        raise RuntimeError("GEMINI_API_KEY is not set")
+        raise RuntimeError(f"{LLM_API_KEY_ENV} is not set")
 
     zwd = _get_zoho()
     data_folder_path = f"Data/{req.state}/{req.crop}"
@@ -933,6 +948,11 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[WARN] Zoho WorkDrive init failed at startup: {e}")
     threading.Thread(target=_load_or_build_master, daemon=True).start()
+    try:
+        from dashboard.db import init_db
+        init_db()
+    except Exception as e:
+        print(f"[WARN] dashboard DB init failed at startup: {e}")
     yield
 
 
@@ -943,6 +963,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------------
+# Dashboard — document management + CRUD, new/separate from the translation
+# pipeline above. Lives entirely in dashboard/*, wired in here with a single
+# include_router call per router. See docs/dashboard_backend_plan.md.
+# ---------------------------------------------------------------------------
+from dashboard.routes_documents import router as _dashboard_documents_router
+from dashboard.routes_uploads import router as _dashboard_uploads_router
+from dashboard.routes_translation import router as _dashboard_translation_router
+from dashboard.routes_files import router as _dashboard_files_router
+
+app.include_router(_dashboard_documents_router, prefix="/dashboard", tags=["dashboard"])
+app.include_router(_dashboard_uploads_router, prefix="/dashboard", tags=["dashboard"])
+app.include_router(_dashboard_translation_router, prefix="/dashboard", tags=["dashboard"])
+app.include_router(_dashboard_files_router, prefix="/dashboard", tags=["dashboard"])
 
 
 @app.exception_handler(_requests.exceptions.RetryError)

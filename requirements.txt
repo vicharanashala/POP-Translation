@@ -1,5 +1,12 @@
 google-genai
+openai
+anthropic
 pymupdf
+pdfplumber
+numpy
+pytesseract
+tesserocr
+bijoy2unicode
 beautifulsoup4
 python-docx
 docxcompose
@@ -7,3 +14,8 @@ fastapi
 uvicorn[standard]
 python-multipart
 pandoc
+sqlalchemy
+psycopg[binary]
+pgvector
+sentence-transformers
+torch

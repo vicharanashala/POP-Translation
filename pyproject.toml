@@ -12,8 +12,27 @@ dependencies = [
     # Gemini API
     "google-genai>=1.0.0",
 
+    # MiniMax API (OpenAI-compatible)
+    "openai>=1.0.0",
+
+    # Claude API
+    "anthropic>=0.60.0",
+
     # PDF processing
     "pymupdf>=1.23.0",
+    "pdfplumber>=0.11.0",
+
+    # Local OCR-based language detection (tessdata_best/)
+    "pytesseract>=0.3.10",
+    "tesserocr>=2.6.0",
+
+    # Dashboard: dedup embedding (intfloat/multilingual-e5-base, CPU-only --
+    # see [tool.uv.sources] below for the matching CPU wheel index)
+    "sentence-transformers>=3.0.0",
+    "torch>=2.0.0",
+
+    # Legacy Indic font converters
+    "bijoy2unicode>=0.1.1",
 
     # HTML processing
     "beautifulsoup4>=4.12.0",
@@ -21,8 +40,23 @@ dependencies = [
     # DOCX
     "python-docx>=1.1.0",
     "docxcompose>=1.4.0",
+
+    # Dashboard: Postgres + pgvector-backed document catalogue/dedup
+    "sqlalchemy>=2.0.0",
+    "psycopg[binary]>=3.1.0",
+    "pgvector>=0.2.5",
 ]
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+[tool.uv.sources]
+# CPU-only build -- matches dashboard/queue_worker.py's SentenceTransformer(device="cpu")
+# call and keeps the image from pulling in ~2GB of unused CUDA/cuDNN wheels.
+torch = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

@@ -7,11 +7,17 @@ services:
     volumes:
       - pop-data:/app/pop-data
     environment:
+      - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - MINIMAX_API_KEY=${MINIMAX_API_KEY}
       - ZOHO_CLIENT_ID=${ZOHO_CLIENT_ID}
       - ZOHO_CLIENT_SECRET=${ZOHO_CLIENT_SECRET}
       - ZOHO_REFRESH_TOKEN=${ZOHO_REFRESH_TOKEN}
       - ZOHO_ROOT_FOLDER_ID=${ZOHO_ROOT_FOLDER_ID}
+      - DATABASE_URL=${DATABASE_URL}
+      - ZOHO_DASHBOARD_ROOT_FOLDER_ID=${ZOHO_DASHBOARD_ROOT_FOLDER_ID}
+      - DUPLICATE_EMBEDDING_THRESHOLD=${DUPLICATE_EMBEDDING_THRESHOLD:-0.95}
+      - TRANS=${TRANS:-on}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8032/"]
       interval: 30s
@@ -20,5 +26,25 @@ services:
       start_period: 15s
     restart: unless-stopped
 
+  db:
+    image: pgvector/pgvector:pg16   # ships the pgvector extension preinstalled -- no manual CREATE EXTENSION setup
+    network_mode: host              # matches `pipeline` -- both share the host network namespace, so this
+                                     # binds directly to the host's port 5432; `pipeline` reaches it via
+                                     # localhost:5432, not a compose service name (host networking means
+                                     # there's no compose-internal DNS between them either way)
+    environment:
+      - POSTGRES_DB=pop_dashboard
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
 volumes:
   pop-data:
+  pgdata:

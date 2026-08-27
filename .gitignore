@@ -1,4 +1,5 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
 *.pyo
@@ -38,3 +39,34 @@ Thumbs.db
 # IDE
 .idea/
 .vscode/
+
+
+/tmp
+/tmp2
+files/
+
+# local dev
+claude_api_compare/
+claude_compare/
+cropped_files/
+cropped_files_2/
+cropped_files_3/
+gemini_compare/
+gpt_compare/
+results/
+tmp/
+tmp_2/
+
+# scripts/ is ignored by default (mostly one-off analysis scripts), but these
+# are real application dependencies -- dashboard/dedup.py imports them, and
+# the production Docker image needs them (see .dockerignore).
+!scripts/
+scripts/*
+!scripts/hash_and_embed_report_true.py
+!scripts/ocr_layout_common.py
+!scripts/__init__.py
+
+# tessdata_best/: Tesseract's high-accuracy OCR models, a real runtime
+# dependency of dashboard/dedup.py (and scripts/hash_and_embed_report_true.py)
+# -- not a dev-scratch directory despite living next to ones that are.
+!tessdata_best/

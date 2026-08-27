@@ -10,7 +10,9 @@ refresh token on startup and stored only in memory. When it expires (401),
 it is refreshed automatically in-place.
 """
 
+import concurrent.futures
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -22,6 +24,8 @@ from urllib3.util.retry import Retry
 
 WD_BASE = "https://workdrive.zoho.in/api/v1"
 _CHUNK_SIZE = 10 * 1024 * 1024  # 10 MB per resumable chunk
+_MIN_REQUEST_INTERVAL = 0.15  # self-throttle to ~6-7 req/s to avoid tripping Zoho's burst rate limit
+_HARD_TIMEOUT = 45  # seconds -- wall-clock backstop around every send() (see _send)
 
 
 class ZohoWorkDrive:
@@ -34,18 +38,139 @@ class ZohoWorkDrive:
         self._access_token = ""
         self._token_obtained_at = 0.0
         self._lock = threading.Lock()
+        self._throttle_lock = threading.Lock()
+        self._last_request_at = 0.0
         self._refresh_access_token()
         self._session = self._make_session()
         self._start_proactive_refresh()
+        # Persistent (not per-call) so we're not paying thread-pool setup cost
+        # on every request. Every _send() call -- regardless of which caller
+        # thread it came from -- is submitted here, and future.result(timeout=
+        # hard_timeout) starts counting from submission, not from when the
+        # task actually starts running. This used to be sized at 2 workers,
+        # which was fine when callers were effectively serialized by
+        # _throttle(); it became a bottleneck once a caller (the report_true
+        # OCR pipeline) started driving this class from 8 concurrent worker
+        # threads doing full-body PDF downloads (hard_timeout=180 each) --
+        # 6 of the 8 would sit queued behind the 2 running ones, and a task
+        # still queued near the 180s mark would get killed and retried as a
+        # false "timeout" even though nothing was actually stuck (confirmed:
+        # the same file downloaded instantly via a direct browser request).
+        # Sized to comfortably exceed the largest known concurrent caller
+        # (8 workers) with headroom for a couple of abandoned/retrying tasks.
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=16, thread_name_prefix="zoho-send")
 
     # ── Token management ──────────────────────────────────────────────────────
 
     def _make_session(self) -> requests.Session:
         s = requests.Session()
         s.headers.update({"Authorization": f"Zoho-oauthtoken {self._access_token}"})
-        retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 502, 503])
+        # Every retry -- bad status codes AND connection-level failures
+        # (timeouts, resets, DNS hiccups) -- is handled explicitly, with
+        # visible logging, in _send/_wait_for_retryable_error. urllib3's own
+        # Retry is disabled (total=0) so it can't also retry underneath us
+        # silently; that used to let a connection error burn ~2 minutes
+        # (3 attempts x up to 40s each) with zero output before finally
+        # surfacing as an exception.
+        retry = Retry(total=0)
         s.mount("https://", HTTPAdapter(max_retries=retry))
         return s
+
+    def _throttle(self) -> None:
+        """Self-imposed minimum gap between requests, since a burst of hundreds of
+        sequential calls in a few seconds (e.g. a state with 100+ topic folders)
+        can trip Zoho's rate limiter."""
+        with self._throttle_lock:
+            now = time.monotonic()
+            wait = self._last_request_at + _MIN_REQUEST_INTERVAL - now
+            if wait > 0:
+                time.sleep(wait)
+            self._last_request_at = time.monotonic()
+
+    _MAX_RATE_LIMIT_RETRIES = 8
+    _RETRYABLE_STATUSES = {429, 502, 503}
+
+    def _wait_for_retryable_error(self, resp: requests.Response, url: str, attempt: int) -> bool:
+        """If resp is 429/502/503, sleep (honoring Retry-After if present) and
+        return True so the caller retries. `attempt` is the 1-based retry count
+        so far, tracked by the caller's loop. Prints so a rate-limit or
+        gateway-error stretch is visible instead of looking like a silent hang
+        -- 502/503 used to retry invisibly inside urllib3's own Retry (which
+        also honors a server-sent Retry-After), so a slow/degraded gateway
+        looked identical to a dead process. Capped so a persistent error still
+        surfaces as a real error rather than looping forever."""
+        if resp.status_code not in self._RETRYABLE_STATUSES:
+            return False
+        if attempt > self._MAX_RATE_LIMIT_RETRIES:
+            print(f"[ZOHO] Still {resp.status_code} on {url} after {self._MAX_RATE_LIMIT_RETRIES} retries -- giving up.", flush=True)
+            return False
+        try:
+            retry_after = float(resp.headers.get("Retry-After", 5))
+        except ValueError:
+            retry_after = 5.0
+        retry_after = max(retry_after, 1.0)
+        print(
+            f"[ZOHO] HTTP {resp.status_code} on {url} -- waiting {retry_after:.1f}s and retrying "
+            f"(attempt {attempt}/{self._MAX_RATE_LIMIT_RETRIES})",
+            flush=True,
+        )
+        time.sleep(retry_after)
+        return True
+
+    def _send(self, verb: str, url: str, *, hard_timeout: float = _HARD_TIMEOUT, **kwargs) -> requests.Response:
+        """Every actual socket send goes through here, wrapped in a hard
+        wall-clock timeout (`hard_timeout`, default _HARD_TIMEOUT) run on a
+        background thread.
+
+        requests' own timeout=(connect, read) kwarg does NOT bound DNS
+        resolution -- socket.getaddrinfo() is called before any connection
+        exists and ignores it entirely, so a stalled resolver (flaky DNS, VPN
+        hiccup) can hang forever with no exception ever raised -- neither
+        _wait_for_retryable_error nor a RequestException catch below would
+        ever see it (confirmed: a real run sat for 3+ minutes with zero
+        output on exactly this). It also does NOT bound reading a streamed
+        response body via iter_content() -- that happens after this call
+        already returned, entirely outside this wrapper (see download_file,
+        which deliberately avoids stream=True for this reason: the whole
+        request, body included, needs to happen inside one _send call to be
+        covered). `hard_timeout` is overridable per-call so a large-file
+        download can get a realistic budget instead of the short one meant
+        for small metadata/listing calls.
+
+        Running the call on a thread and bounding it with
+        future.result(timeout=...) catches all of the above: if the thread
+        doesn't finish in time we just abandon it (it may still be stuck in
+        the background and dies on its own later or at process exit --
+        harmless, just a leaked thread) and retry fresh, with the same
+        visible logging used for bad-status and connection-exception
+        retries. urllib3's own Retry is disabled (total=0) so nothing
+        retries silently underneath this."""
+        method = getattr(self._session, verb)
+        attempt = 1
+        while True:
+            future = self._executor.submit(method, url, **kwargs)
+            try:
+                return future.result(timeout=hard_timeout)
+            except (requests.exceptions.RequestException, concurrent.futures.TimeoutError) as e:
+                if isinstance(e, concurrent.futures.TimeoutError):
+                    label = f"no response within {hard_timeout}s (hard timeout -- likely DNS stall or stuck body read, requests' own timeout= doesn't cover either)"
+                else:
+                    label = f"{e.__class__.__name__}: {e}"
+                if attempt > self._MAX_RATE_LIMIT_RETRIES:
+                    print(
+                        f"[ZOHO] Still failing on {url} after {self._MAX_RATE_LIMIT_RETRIES} retries "
+                        f"({label}) -- giving up.",
+                        flush=True,
+                    )
+                    raise
+                wait = min(2 ** attempt, 30)
+                print(
+                    f"[ZOHO] {label} on {url} -- waiting {wait}s and retrying "
+                    f"(attempt {attempt}/{self._MAX_RATE_LIMIT_RETRIES})",
+                    flush=True,
+                )
+                time.sleep(wait)
+                attempt += 1
 
     def _refresh_access_token(self) -> bool:
         try:
@@ -102,48 +227,76 @@ class ZohoWorkDrive:
             body = resp.text[:500]
         print(f"[ZOHO] HTTP {resp.status_code} {resp.request.method} {resp.url}: {body}")
 
-    def _get(self, url: str, **kwargs) -> requests.Response:
+    def _get(self, url: str, *, hard_timeout: float = _HARD_TIMEOUT, **kwargs) -> requests.Response:
         self._ensure_token_fresh()
-        resp = self._session.get(url, **kwargs)
+        self._throttle()
+        resp = self._send("get", url, hard_timeout=hard_timeout, **kwargs)
+        attempt = 1
+        while self._wait_for_retryable_error(resp, url, attempt):
+            self._throttle()
+            resp = self._send("get", url, hard_timeout=hard_timeout, **kwargs)
+            attempt += 1
         if resp.status_code == 401:
             self._log_error(resp)
             if self._refresh_access_token():
-                resp = self._session.get(url, **kwargs)
+                self._throttle()
+                resp = self._send("get", url, hard_timeout=hard_timeout, **kwargs)
         return resp
 
-    def _post(self, url: str, **kwargs) -> requests.Response:
+    def _post(self, url: str, *, hard_timeout: float = _HARD_TIMEOUT, **kwargs) -> requests.Response:
         self._ensure_token_fresh()
-        resp = self._session.post(url, **kwargs)
+        self._throttle()
+        resp = self._send("post", url, hard_timeout=hard_timeout, **kwargs)
+        attempt = 1
+        while self._wait_for_retryable_error(resp, url, attempt):
+            self._throttle()
+            resp = self._send("post", url, hard_timeout=hard_timeout, **kwargs)
+            attempt += 1
         if resp.status_code == 401:
             self._log_error(resp)
             if self._refresh_access_token():
-                resp = self._session.post(url, **kwargs)
+                self._throttle()
+                resp = self._send("post", url, hard_timeout=hard_timeout, **kwargs)
                 if resp.status_code not in (200, 201, 204, 422):
                     self._log_error(resp)
         elif resp.status_code not in (200, 201, 204, 422):
             self._log_error(resp)
         return resp
 
-    def _patch(self, url: str, **kwargs) -> requests.Response:
+    def _patch(self, url: str, *, hard_timeout: float = _HARD_TIMEOUT, **kwargs) -> requests.Response:
         self._ensure_token_fresh()
-        resp = self._session.patch(url, **kwargs)
+        self._throttle()
+        resp = self._send("patch", url, hard_timeout=hard_timeout, **kwargs)
+        attempt = 1
+        while self._wait_for_retryable_error(resp, url, attempt):
+            self._throttle()
+            resp = self._send("patch", url, hard_timeout=hard_timeout, **kwargs)
+            attempt += 1
         if resp.status_code == 401:
             self._log_error(resp)
             if self._refresh_access_token():
-                resp = self._session.patch(url, **kwargs)
+                self._throttle()
+                resp = self._send("patch", url, hard_timeout=hard_timeout, **kwargs)
                 if resp.status_code not in (200, 204):
                     self._log_error(resp)
         elif resp.status_code not in (200, 204):
             self._log_error(resp)
         return resp
 
-    def _delete_req(self, url: str, **kwargs) -> requests.Response:
+    def _delete_req(self, url: str, *, hard_timeout: float = _HARD_TIMEOUT, **kwargs) -> requests.Response:
         self._ensure_token_fresh()
-        resp = self._session.delete(url, **kwargs)
+        self._throttle()
+        resp = self._send("delete", url, hard_timeout=hard_timeout, **kwargs)
+        attempt = 1
+        while self._wait_for_retryable_error(resp, url, attempt):
+            self._throttle()
+            resp = self._send("delete", url, hard_timeout=hard_timeout, **kwargs)
+            attempt += 1
         if resp.status_code == 401:
             self._log_error(resp)
             if self._refresh_access_token():
-                resp = self._session.delete(url, **kwargs)
+                self._throttle()
+                resp = self._send("delete", url, hard_timeout=hard_timeout, **kwargs)
         return resp
 
     # ── Folder listing ────────────────────────────────────────────────────────
@@ -394,18 +547,84 @@ class ZohoWorkDrive:
 
     # ── File download ─────────────────────────────────────────────────────────
 
+    _PARALLEL_CHUNK_THRESHOLD = 20 * 1024 * 1024  # below this, a plain single request is plenty
+    _PARALLEL_CHUNK_WORKERS = 8
+
+    def _probe_content_length(self, url: str) -> int | None:
+        """Tiny bytes=0-0 Range request, just to learn the file's total size
+        (and confirm the server honors Range at all) without pulling any
+        real body. Cheap: ~1 byte of response."""
+        resp = self._get(url, timeout=(10, 30), hard_timeout=30, headers={"Range": "bytes=0-0"})
+        if resp.status_code != 206:
+            return None
+        m = re.search(r"/(\d+)$", resp.headers.get("Content-Range", ""))
+        return int(m.group(1)) if m else None
+
+    def _download_parallel(self, url: str, size: int) -> bytes:
+        """Fetch `url` as N concurrent Range-chunked requests and reassemble.
+
+        Confirmed live on a ~300MB outlier file in the report_true dataset:
+        Zoho's download endpoint appears to cap throughput PER TCP
+        CONNECTION (~2.2-2.5MB/s observed, highly consistent across many
+        single-connection trials -- not per account/token, since a fresh
+        session/adapter/token each time made no difference). Splitting one
+        file's download into 8 concurrent Range requests measured ~4.3x
+        higher aggregate throughput (300MB: ~140s on one connection -> ~30s
+        with 8 parallel chunks, reproduced twice, consistent both times).
+        """
+        n = self._PARALLEL_CHUNK_WORKERS
+        chunk_size = -(-size // n)  # ceil div
+
+        def fetch(i: int) -> bytes:
+            start = i * chunk_size
+            end = min(start + chunk_size, size) - 1
+            resp = self._get(url, timeout=(10, 400), hard_timeout=400, headers={"Range": f"bytes={start}-{end}"})
+            if resp.status_code != 206:
+                raise RuntimeError(f"range chunk {i} got HTTP {resp.status_code}, expected 206")
+            return resp.content
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n, thread_name_prefix="zoho-chunk") as ex:
+            parts = list(ex.map(fetch, range(n)))
+        return b"".join(parts)
+
     def download_file(self, file_id: str) -> bytes:
-        """Download a file by ID and return its bytes."""
+        """Download a file by ID and return its bytes.
+
+        Files above _PARALLEL_CHUNK_THRESHOLD are fetched via
+        _download_parallel (see its docstring for why: per-connection
+        throughput capping on Zoho's side makes N parallel connections to
+        the SAME file substantially faster in aggregate). Below the
+        threshold a plain single request is used -- for a normal multi-MB
+        PDF the probe-then-maybe-fallback overhead isn't worth it, and it
+        finishes in a second or two either way.
+
+        Deliberately NOT stream=True for the plain-request path: with
+        streaming, _get()/_send() only cover getting the response headers --
+        the actual body then gets read afterward via iter_content(), on the
+        calling thread, completely outside _send's hard-timeout/retry
+        protection (governed only by the raw per-chunk requests timeout,
+        which can silently sit for minutes on a stalled transfer with
+        nothing to catch it -- confirmed by a real run). Without
+        stream=True, the whole request -- headers AND body -- happens
+        inside the one _send call, so a stalled download is bounded and
+        retried just like everything else. hard_timeout is bumped up from
+        the default (meant for small metadata/listing calls) to give a
+        multi-MB PDF a realistic transfer budget.
+        """
         for url in [
             f"{WD_BASE}/download/{file_id}",
             f"{WD_BASE}/files/{file_id}/content",
         ]:
-            resp = self._get(url, timeout=(10, 300), stream=True)
+            size = self._probe_content_length(url)
+            if size is not None and size > self._PARALLEL_CHUNK_THRESHOLD:
+                return self._download_parallel(url, size)
+
+            resp = self._get(url, timeout=(10, 400), hard_timeout=400)
             if resp.status_code == 200:
                 ct = resp.headers.get("Content-Type", "")
                 if "json" in ct or "html" in ct:
                     continue
-                return b"".join(resp.iter_content(chunk_size=1 << 20))
+                return resp.content
         raise FileNotFoundError(f"Cannot download file {file_id}")
 
     def download_file_stream(self, file_id: str) -> requests.Response:
@@ -455,15 +674,36 @@ class ZohoWorkDrive:
         return resp.status_code in (200, 204)
 
     def get_file_metadata(self, file_id: str) -> Optional[dict]:
-        """Get metadata for a single file/folder by ID."""
+        """Get metadata for a single file/folder by ID.
+
+        For PDFs, Zoho precomputes page count (and other pdf_metadata) but
+        only exposes it on this single-file detail endpoint -- the bulk
+        `files/{folder_id}/files` listing used by list_folder() always
+        returns an empty meta_info, even for the same file. So getting a
+        PDF's page count without downloading it costs one of these calls per
+        file, not zero.
+        """
         resp = self._get(f"{WD_BASE}/files/{file_id}", timeout=(10, 30))
         if resp.status_code != 200:
             return None
         data = resp.json().get("data", {})
         attrs = data.get("attributes", {})
+        pdf_metadata = attrs.get("meta_info", {}).get("metadata", {}).get("pdf_metadata", {})
         return {
             "id": data.get("id"),
             "name": attrs.get("name", ""),
             "type": attrs.get("type", ""),
             "size": attrs.get("size", 0),
+            "pdf_pages": pdf_metadata.get("pages"),  # str, e.g. "6" -- None if not a PDF or not yet computed
+            # This is the PDF's own embedded /Lang catalog attribute (set by
+            # whatever tool produced the PDF -- e.g. Chrome's print-to-PDF
+            # copies it from the source page's <html lang="...">), NOT
+            # anything Zoho computes itself. Present roughly half the time in
+            # practice; None the rest (tools like Ghostscript/PDF24 don't set
+            # it). When present it's a free, ~instant, fully trustworthy
+            # signal -- no download needed. When absent, it's just unknown,
+            # not "not English"; callers must fall back to another method.
+            "pdf_language": pdf_metadata.get("language"),
+            "created_time_ms": attrs.get("created_time_in_millisecond"),
+            "extn": attrs.get("extn", ""),
         }

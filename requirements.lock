@@ -1,46 +1,100 @@
 annotated-doc==0.0.4
 annotated-types==0.7.0
-anyio==4.13.0
+anthropic==1.1.0
+anyio==4.14.2
 babel==2.18.0
-beautifulsoup4==4.14.3
-certifi==2026.5.20
-cffi==2.0.0
-charset-normalizer==3.4.7
-click==8.4.1
-cryptography==48.0.0
+beautifulsoup4==4.15.0
+bijoy2unicode==0.1.1
+certifi==2026.6.17
+cffi==2.1.0 ; platform_python_implementation != 'PyPy'
+charset-normalizer==3.4.9
+click==8.4.2
+colorama==0.4.6 ; sys_platform == 'win32'
+cryptography==49.0.0
+cysignals==1.12.5 ; python_full_version < '3.12'
+cysignals==1.12.6 ; python_full_version >= '3.12'
 distro==1.9.0
-docxcompose==2.1.0
-fastapi==0.136.1
-google-auth==2.53.0
-google-genai==2.6.0
+docstring-parser==0.18.0
+docxcompose==2.2.0
+fastapi==0.139.2
+filelock==3.32.4
+fsspec==2026.7.0
+google-auth==2.55.2
+google-genai==2.12.1
+greenlet==3.5.5 ; platform_machine == 'AMD64' or platform_machine == 'WIN32' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'ppc64le' or platform_machine == 'win32' or platform_machine == 'x86_64'
 h11==0.16.0
+hf-xet==1.6.0 ; platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'
 httpcore==1.0.9
-httptools==0.7.1
+httpcore2==2.12.0 ; sys_platform != 'emscripten'
+httptools==0.8.0
 httpx==0.28.1
-idna==3.16
+httpx2==2.12.0
+httpx2-jsfetch==1.0 ; python_full_version >= '3.12' and sys_platform == 'emscripten'
+huggingface-hub==1.28.0
+idna==3.18
+jinja2==3.1.6
+jiter==0.16.0
+joblib==1.5.3
 lxml==6.1.1
-pandoc==2.4
-plumbum==1.10.0
-ply==3.11
-pyasn1==0.6.3
-pyasn1_modules==0.4.2
-pycparser==3.0
+markdown-it-py==4.2.0
+markupsafe==3.0.3
+mdurl==0.1.2
+mpmath==1.3.0
+narwhals==2.25.0
+networkx==3.6.1
+numpy==2.4.6 ; python_full_version < '3.12'
+numpy==2.5.2 ; python_full_version >= '3.12'
+openai==2.46.0
+packaging==26.3
+pdfminer-six==20260107
+pdfplumber==0.11.10
+pgvector==0.5.0
+pillow==12.3.0
+psycopg==3.3.4
+psycopg-binary==3.3.4 ; implementation_name != 'pypy'
+pyasn1==0.6.4
+pyasn1-modules==0.4.2
+pycparser==3.0 ; implementation_name != 'PyPy' and platform_python_implementation != 'PyPy'
 pydantic==2.13.4
-pydantic_core==2.46.4
-PyMuPDF==1.27.2.3
+pydantic-core==2.46.4
+pygments==2.21.0
+pymupdf==1.28.0
+pypdfium2==5.13.0
+pytesseract==0.3.13
 python-docx==1.2.0
 python-dotenv==1.2.2
-python-multipart==0.0.29
-PyYAML==6.0.3
+python-multipart==0.0.32
+pyyaml==6.0.3
+regex==2026.7.19
 requests==2.34.2
+rich==15.0.0
+safetensors==0.8.0
+scikit-learn==1.9.0
+scipy==1.17.1 ; python_full_version < '3.12'
+scipy==1.18.1 ; python_full_version >= '3.12'
+sentence-transformers==6.0.0
+setuptools==84.0.0
+shellingham==1.5.4
 sniffio==1.3.1
-soupsieve==2.8.3
-starlette==1.0.1
+soupsieve==2.9
+sqlalchemy==2.0.52
+starlette==1.3.1
+sympy==1.14.0
 tenacity==9.1.4
+tesserocr==2.11.0
+threadpoolctl==3.6.0
+tokenizers==0.23.1
+torch==2.13.0+cpu ; sys_platform != 'darwin'
+torch==2.13.0 ; sys_platform == 'darwin'
+tqdm==4.69.0
+transformers==5.16.1
+truststore==0.10.4 ; sys_platform != 'emscripten'
+typer==0.27.1
+typing-extensions==4.16.0
 typing-inspection==0.4.2
-typing_extensions==4.15.0
+tzdata==2026.3 ; sys_platform == 'win32'
 urllib3==2.7.0
-uvicorn==0.47.0
-uvloop==0.22.1
+uvicorn==0.51.0
+uvloop==0.22.1 ; platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'
 watchfiles==1.2.0
-websockets==16.0
+websockets==16.1.1

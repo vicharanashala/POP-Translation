@@ -216,7 +216,8 @@ python scripts/run_pop_to_docx_updated_pagewise_docx.py \
 | `--workdir-root` | (required) | Working/output directory |
 | `--doc-name` | PDF stem | Base name for output files |
 | `--prompt-file` | `prompts/page_to_pdf.txt` | Translation prompt |
-| `--model` | `gemini-3.1-pro-preview` | Gemini model |
+| `--provider` | `LLM_PROVIDER` env var, else `gemini` | `gemini` or `minimax` |
+| `--model` | `gemini-3.1-pro-preview` / `MiniMax-M3` per provider | Model name |
 | `--start-page` | `1` | First page (1-indexed) |
 | `--end-page` | last page | Last page (1-indexed) |
 | `--concurrency` | `1` | Parallel translation workers |

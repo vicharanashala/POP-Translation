@@ -8,13 +8,20 @@ All secrets are read from environment or a `.env` file (loaded via `python-doten
 
 | Variable | Required | Description |
 |---|---|---|
-| `GEMINI_API_KEY` | Yes (unless `skip_translation=true`) | Google Gemini API key |
+| `LLM_PROVIDER` | No | Translation backend: `gemini` (default) or `minimax` |
+| `GEMINI_API_KEY` | Yes, if `LLM_PROVIDER=gemini` (unless `skip_translation=true`) | Google Gemini API key |
+| `MINIMAX_API_KEY` | Yes, if `LLM_PROVIDER=minimax` (unless `skip_translation=true`) | MiniMax API key |
 | `ZOHO_CLIENT_ID` | Yes | Zoho OAuth app client ID |
 | `ZOHO_CLIENT_SECRET` | Yes | Zoho OAuth app client secret |
 | `ZOHO_REFRESH_TOKEN` | Yes | Zoho long-lived refresh token |
 | `ZOHO_ROOT_FOLDER_ID` | Yes | ID of the root WorkDrive folder (parent of `Data/` and `Workdir/`) |
+| `DATABASE_URL` | Yes, for the dashboard (`/dashboard/*` routes) | Postgres connection string, e.g. `postgresql+psycopg://pop_dashboard:<password>@localhost:5432/pop_dashboard` |
+| `ZOHO_DASHBOARD_ROOT_FOLDER_ID` | Yes, for the dashboard | Root WorkDrive folder for the dashboard's own `originals/`/`translations/`/`reviews/` layout — separate from `ZOHO_ROOT_FOLDER_ID` |
+| `DUPLICATE_EMBEDDING_THRESHOLD` | No | Cosine similarity cutoff for flagging a duplicate upload (default `0.95`) |
+| `TRANS` | No | `on` (default) or `off` — kill switch for the dashboard's per-document translate button, independent of whether an LLM key is set. Current production deploy uses `off`: document management only, translate button reads "out of order" (see `docs/dashboard_backend_plan.md` §7) |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` | Yes, for the `db` compose service | Credentials for the containerized Postgres instance |
 
-The server fails to connect to Zoho on startup if these are missing, but it does not crash — a warning is logged and the Zoho singleton is retried on first request.
+The server fails to connect to Zoho on startup if these are missing, but it does not crash — a warning is logged and the Zoho singleton is retried on first request. The same applies to the dashboard's Postgres connection: `dashboard/db.py` only connects lazily, on first actual use, so a missing `DATABASE_URL` doesn't prevent the rest of the server from starting — only `/dashboard/*` routes fail until it's set. See `docs/dashboard_backend_plan.md` for the full dashboard design.
 
 ---
 
@@ -60,11 +67,17 @@ services:
     volumes:
       - pop-data:/app/pop-data
     environment:
+      - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - MINIMAX_API_KEY=${MINIMAX_API_KEY}
       - ZOHO_CLIENT_ID=${ZOHO_CLIENT_ID}
       - ZOHO_CLIENT_SECRET=${ZOHO_CLIENT_SECRET}
       - ZOHO_REFRESH_TOKEN=${ZOHO_REFRESH_TOKEN}
       - ZOHO_ROOT_FOLDER_ID=${ZOHO_ROOT_FOLDER_ID}
+      - DATABASE_URL=${DATABASE_URL}
+      - ZOHO_DASHBOARD_ROOT_FOLDER_ID=${ZOHO_DASHBOARD_ROOT_FOLDER_ID}
+      - DUPLICATE_EMBEDDING_THRESHOLD=${DUPLICATE_EMBEDDING_THRESHOLD:-0.95}
+      - TRANS=${TRANS:-on}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8032/"]
       interval: 30s
@@ -73,11 +86,28 @@ services:
       start_period: 15s
     restart: unless-stopped
 
+  db:
+    image: pgvector/pgvector:pg16
+    network_mode: host
+    environment:
+      - POSTGRES_DB=pop_dashboard
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
 volumes:
   pop-data:
+  pgdata:
 ```
 
-`network_mode: host` is used so the container shares the host network stack (common for internal deployments without a reverse proxy).
+`network_mode: host` is used so both containers share the host network stack (common for internal deployments without a reverse proxy) — `pipeline` reaches Postgres via `localhost:5432`, not the compose service name `db`, since host networking means there's no compose-internal DNS between them.
 
 ### Starting with docker-compose
 
@@ -107,11 +137,17 @@ brew install pandoc
 
 # 4. Create .env
 cat > .env <<EOF
+LLM_PROVIDER=gemini
 GEMINI_API_KEY=your_key
+MINIMAX_API_KEY=your_key
 ZOHO_CLIENT_ID=your_id
 ZOHO_CLIENT_SECRET=your_secret
 ZOHO_REFRESH_TOKEN=your_token
 ZOHO_ROOT_FOLDER_ID=your_folder_id
+DATABASE_URL=postgresql+psycopg://pop_dashboard:your_password@localhost:5432/pop_dashboard
+ZOHO_DASHBOARD_ROOT_FOLDER_ID=your_dashboard_folder_id
+POSTGRES_USER=pop_dashboard
+POSTGRES_PASSWORD=your_password
 EOF
 
 # 5. Start server
