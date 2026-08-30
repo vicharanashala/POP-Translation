@@ -224,6 +224,8 @@ def delete_document(association_id: uuid.UUID, db: Session = Depends(get_db)):
 # -- Unique documents ----------------------------------------------------------
 
 _UNIQUE_FILTERS = {
+    "state": lambda v: State.name.ilike(f"%{v}%"),
+    "crop": lambda v: Crop.name.ilike(f"%{v}%"),
     "document_id": _display_id_filter(UniqueDocument.display_id),
     "advisory_type": lambda v: UniqueDocument.advisory_type.ilike(f"%{v}%"),
     "advisory_scope": lambda v: UniqueDocument.advisory_scope.ilike(f"%{v}%"),
@@ -259,6 +261,17 @@ _UNIQUE_FILTERS = {
 def list_unique_documents(request: Request, db: Session = Depends(get_db)):
     page, page_size = _pagination(request)
     q = db.query(UniqueDocument)
+    # state/crop live on document_associations, not unique_documents itself --
+    # only join through it (and .distinct(), since one doc can have multiple
+    # placements) when one of those two filters is actually being used, so
+    # every other request skips the join entirely.
+    if request.query_params.get("filter[state]") or request.query_params.get("filter[crop]"):
+        q = (
+            q.join(DocumentAssociation, DocumentAssociation.unique_document_id == UniqueDocument.id)
+            .join(State, DocumentAssociation.state_id == State.id)
+            .join(Crop, DocumentAssociation.crop_id == Crop.id)
+            .distinct()
+        )
     for clause in _parse_filters(request, _UNIQUE_FILTERS):
         q = q.filter(clause)
     total = q.count()

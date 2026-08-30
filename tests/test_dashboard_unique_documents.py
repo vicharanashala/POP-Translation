@@ -93,6 +93,41 @@ def test_filter_unique_documents_by_num_pages(client):
         assert row["num_pages"] == 4
 
 
+def test_filter_unique_documents_by_state(client):
+    resp = client.get("/dashboard/unique-documents", params={"filter[state]": "Karnataka", "page_size": 200})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] > 0
+    for row in body["items"]:
+        assert any("Karnataka" in s for s in row["states"])
+
+
+def test_filter_unique_documents_by_crop(client):
+    resp = client.get("/dashboard/unique-documents", params={"filter[crop]": "Onion", "page_size": 200})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] > 0
+    for row in body["items"]:
+        assert any("Onion" in c for c in row["crops"])
+
+
+def test_filter_unique_documents_by_state_and_crop(client):
+    # Both filters apply to the same document_associations row (not
+    # independently across a document's different placements) -- a document
+    # placed under State X / Crop A and, separately, State Y / Crop B must
+    # NOT match filter[state]=Y&filter[crop]=A.
+    resp = client.get(
+        "/dashboard/unique-documents",
+        params={"filter[state]": "Karnataka", "filter[crop]": "Onion", "page_size": 200},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] > 0
+    for row in body["items"]:
+        assert any("Karnataka" in s for s in row["states"])
+        assert any("Onion" in c for c in row["crops"])
+
+
 def test_filter_unique_documents_bad_values_dont_500(client):
     for params in (
         {"filter[num_pages]": "not-a-number"},
