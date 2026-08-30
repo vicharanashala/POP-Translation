@@ -6,15 +6,12 @@ on:
       - main
       - "feature/**"
       - "fix/**"
-    paths:
-      - "pop_server.py"
-      - "_job_ctl.py"
-      - "scripts/**"
-      - "prompts/**"
-      - "Dockerfile"
-      - "requirements.lock"
-      - "requirements.txt"
-      - "pyproject.toml"
+    # No paths: filter (removed 2026-08-30) -- the Dockerfile's `COPY . .`
+    # means almost the whole repo feeds into the image now (dashboard/,
+    # tests/, tessdata_best/, etc., none of which were ever added here as
+    # the app grew), so a path allowlist silently misses new directories --
+    # exactly what happened when a dashboard/-only push never triggered a
+    # rebuild. Building on every push is cheap next to that risk.
 
 jobs:
   build-and-push:
