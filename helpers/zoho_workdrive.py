@@ -641,6 +641,72 @@ class ZohoWorkDrive:
                 return resp
         raise FileNotFoundError(f"Cannot stream file {file_id}")
 
+    _STREAM_CHUNK = 8 * 1024 * 1024
+
+    def resolve_download_url(self, file_id: str) -> tuple[str, int | None]:
+        """Pick the download URL that actually serves `file_id`, and its size.
+
+        Zoho exposes two, and which one works varies by file, so both are
+        tried in the same order download_file() uses. The size comes from a
+        1-byte Range probe, which doubles as the check that this URL honours
+        Range at all -- a None size means it does not, and the caller must
+        fall back to a plain single-connection stream.
+        """
+        for url in [
+            f"{WD_BASE}/download/{file_id}",
+            f"{WD_BASE}/files/{file_id}/content",
+        ]:
+            size = self._probe_content_length(url)
+            if size is not None:
+                return url, size
+        return f"{WD_BASE}/download/{file_id}", None
+
+    def iter_range(self, url: str, start: int, end: int, *, workers: int | None = None):
+        """Yield bytes [start, end] in order, several Range requests in flight.
+
+        Same finding as _download_parallel: Zoho caps throughput PER TCP
+        CONNECTION at ~2.2-2.5 MB/s, so a single streamed connection makes a
+        few hundred MB take minutes and time out somewhere in the middle. This
+        keeps `workers` chunk requests running ahead of the consumer and hands
+        them back in order, so the response starts immediately (unlike
+        download_file(), which buffers the whole file) while still getting the
+        aggregate throughput of N connections.
+
+        Each chunk is a bounded, retryable _get -- the failure mode called out
+        in download_file()'s docstring (a stalled stream=True body read sitting
+        outside the hard timeout) cannot happen here.
+        """
+        n = workers or self._PARALLEL_CHUNK_WORKERS
+        windows = []
+        pos = start
+        while pos <= end:
+            stop = min(pos + self._STREAM_CHUNK - 1, end)
+            windows.append((pos, stop))
+            pos = stop + 1
+
+        def fetch(window: tuple[int, int]) -> bytes:
+            lo, hi = window
+            resp = self._get(url, timeout=(10, 400), hard_timeout=400,
+                             headers={"Range": f"bytes={lo}-{hi}"})
+            if resp.status_code not in (200, 206):
+                raise RuntimeError(f"range {lo}-{hi} got HTTP {resp.status_code}")
+            return resp.content
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=n, thread_name_prefix="zoho-stream"
+        ) as ex:
+            inflight: list = []
+            nxt = 0
+            # Keep the pool full: submit up to n ahead, yield the oldest.
+            while nxt < len(windows) and len(inflight) < n:
+                inflight.append(ex.submit(fetch, windows[nxt]))
+                nxt += 1
+            while inflight:
+                yield inflight.pop(0).result()
+                if nxt < len(windows):
+                    inflight.append(ex.submit(fetch, windows[nxt]))
+                    nxt += 1
+
     # ── Delete / rename / move ────────────────────────────────────────────────
 
     def delete(self, file_id: str) -> bool:

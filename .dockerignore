@@ -10,6 +10,12 @@ build/
 
 # Virtual environment
 venv/
+# .venv/ is THE one that matters here: this repo's virtualenv is 2.8 GB, and
+# without this line `COPY . .` carried all of it -- a 2.94 GB layer rewritten on
+# every rebuild, for files the image cannot use anyway (it installs its own
+# dependencies from requirements.lock into system site-packages, and the host
+# venv's binaries and absolute paths are wrong inside the container).
+.venv/
 
 # Runtime data (mounted as Docker volumes in production)
 pop-data/
@@ -64,6 +70,12 @@ pop_translation.md
 pop_translation_doc.md
 README.md
 
+
+# Dedup artefacts: fix/*.py MUST ship (dashboard/chunk_store.py imports
+# fix/chunkmatch.py), but fix/out/ is 248 MB of vectors and fix/backup/ is a
+# database dump -- both are mounted at runtime, not baked in.
+fix/out/
+fix/backup/
 
 # local dev
 claude_api_compare/

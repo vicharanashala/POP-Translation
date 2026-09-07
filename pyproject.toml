@@ -41,10 +41,10 @@ dependencies = [
     "python-docx>=1.1.0",
     "docxcompose>=1.4.0",
 
-    # Dashboard: Postgres + pgvector-backed document catalogue/dedup
-    "sqlalchemy>=2.0.0",
-    "psycopg[binary]>=3.1.0",
-    "pgvector>=0.2.5",
+    # Dashboard: MongoDB Atlas-backed document catalogue, with duplicate
+    # detection on Atlas Vector Search (replaces the previous Postgres +
+    # pgvector setup).
+    "pymongo>=4.6.0",
 ]
 
 [build-system]

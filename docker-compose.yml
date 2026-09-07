@@ -1,52 +1,93 @@
+# The database is hosted MongoDB Atlas, not a container -- there is no
+# `db` service and no volume for one.
+#
+# WHICH DATABASE: POP_ENV (staging | prod) selects between STAGING_DB_URL/NAME
+# and PROD_DB_URL/NAME in .env. Staging is agriai-test-riya, which is SHARED
+# with a different application (it has its own users/questions/notifications,
+# and its own `states` and `crops`), so every collection of this dashboard's
+# is prefixed `pop_` --
+# pop_documents, pop_unique_documents, pop_states, pop_crops, pop_languages,
+# pop_upload_queue_items, pop_translation_jobs. See dashboard/models.py.
 services:
   pipeline:
-    image: vicharanashala/pop-translation:latest
+    # Which published image to run. `latest` is main's, and CI moves it only on
+    # a push to main; every other branch publishes under its own name, so
+    # POP_IMAGE_TAG=first_render in .env runs that branch's build instead --
+    # then `docker compose pull && docker compose up -d`.
+    image: vicharanashala/pop-translation:${POP_IMAGE_TAG:-latest}
+    # Build from this checkout so `docker compose up -d --build` runs THIS code.
+    # Without it, `up` silently pulls the last published image instead.
+    build: .
     network_mode: host
     expose:
       - "8032"
     volumes:
       - pop-data:/app/pop-data
+      # Corpus artefacts the loader and the (future) duplicate algorithm read
+      # straight off disk: the crawl, the per-chunk vectors (142 MB), the
+      # backfill records. Far too large for a 512 MB Atlas tier and too large to
+      # bake into the image, so they are mounted. Read-only: nothing at runtime
+      # writes here, and the migration is run by hand, not by the server.
+      - ./fix/out:/app/fix/out:ro
+      # report_true.csv / pops.csv, used only by dashboard.migrate_from_corpus.
+      # .dockerignore keeps results/ out of the image, so mount it for the load.
+      - ./results:/app/results:ro
     environment:
-      - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
+      # -- translation pipeline --
+      # LLM_PROVIDER picks which key is required: minimax -> MINIMAX_API_KEY,
+      # gemini -> GEMINI_API_KEY. GET /dashboard/config reports whether the
+      # chosen one is actually set.
+      - LLM_PROVIDER=${LLM_PROVIDER:-minimax}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - MINIMAX_API_KEY=${MINIMAX_API_KEY}
+      # TRANS=off disables translation without removing the key.
+      - TRANS=${TRANS:-on}
+
+      # -- MongoDB Atlas --
+      # POP_ENV picks the deployment: staging (default) or prod. dashboard/
+      # config.py reads <PREFIX>_DB_URL / <PREFIX>_DB_NAME accordingly. DB_URL /
+      # DB_NAME still override both when set, for an older .env.
+      - POP_ENV=${POP_ENV:-staging}
+      - STAGING_DB_URL=${STAGING_DB_URL}
+      - STAGING_DB_NAME=${STAGING_DB_NAME}
+      - PROD_DB_URL=${PROD_DB_URL}
+      - PROD_DB_NAME=${PROD_DB_NAME}
+      - DB_URL=${DB_URL:-}
+      - DB_NAME=${DB_NAME:-}
+
+      # -- Zoho WorkDrive --
       - ZOHO_CLIENT_ID=${ZOHO_CLIENT_ID}
       - ZOHO_CLIENT_SECRET=${ZOHO_CLIENT_SECRET}
       - ZOHO_REFRESH_TOKEN=${ZOHO_REFRESH_TOKEN}
+      # The translation pipeline's small working area.
       - ZOHO_ROOT_FOLDER_ID=${ZOHO_ROOT_FOLDER_ID}
-      - DATABASE_URL=${DATABASE_URL}
+      # No ZOHO_CORPUS_FOLDER_ID here: the corpus root is only read by
+      # scripts/crawl_zoho_root.py, which is run on the host and takes --root.
+      # Passing it in made compose warn about an unset variable for a value
+      # nothing in the container reads.
+      # Where dashboard uploads land. Three fixed, pre-created folders -- see
+      # dashboard/zoho_layout.py. Originals are what an upload writes;
+      # translations and reviews are what the pipeline writes back.
       - ZOHO_DASHBOARD_ORIGINALS_FOLDER_ID=${ZOHO_DASHBOARD_ORIGINALS_FOLDER_ID}
       - ZOHO_DASHBOARD_TRANSLATIONS_FOLDER_ID=${ZOHO_DASHBOARD_TRANSLATIONS_FOLDER_ID}
       - ZOHO_DASHBOARD_REVIEWS_FOLDER_ID=${ZOHO_DASHBOARD_REVIEWS_FOLDER_ID}
-      - DUPLICATE_EMBEDDING_THRESHOLD=${DUPLICATE_EMBEDDING_THRESHOLD:-0.95}
-      - TRANS=${TRANS:-on}
+
+      # An upload's bytes wait here between the duplicate check and the person's
+      # decision. On the mounted volume rather than the container's /tmp, so an
+      # item sitting at awaiting_review survives a restart -- otherwise its file
+      # is gone and the upload has to be redone.
+      - UPLOAD_STAGING_DIR=/app/pop-data/uploads
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8032/"]
+      # Python, not curl: the python:3.11-slim base image has no curl, so a
+      # curl-based check reports unhealthy no matter what the server is doing.
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8032/dashboard/config', timeout=5).status==200 else 1)"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 15s
-    restart: unless-stopped
-
-  db:
-    image: pgvector/pgvector:pg16   # ships the pgvector extension preinstalled -- no manual CREATE EXTENSION setup
-    network_mode: host              # matches `pipeline` -- both share the host network namespace, so this
-                                     # binds directly to the host's port 5432; `pipeline` reaches it via
-                                     # localhost:5432, not a compose service name (host networking means
-                                     # there's no compose-internal DNS between them either way)
-    environment:
-      - POSTGRES_DB=pop_dashboard
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      # First start pulls no models but does connect to Atlas and build indexes.
+      start_period: 30s
     restart: unless-stopped
 
 volumes:
   pop-data:
-  pgdata:

@@ -1,28 +1,76 @@
-"""ORM models for the document management dashboard.
+"""Collection names, enums and factories for the document management dashboard.
 
-Two core tables (unique_documents, document_associations) plus two lookup
-tables (states, crops) and two queue/status tables (upload_queue_items,
-translation_jobs). See docs/dashboard_backend_plan.md for the full schema
-rationale -- most notably which metadata columns live on which table. This
-was confirmed with the user rather than guessed: Season and Date/Month/Year
-of Collection are DOCUMENT-level (unique_documents), not per state/crop
-placement, even though today's report_true.csv has one collection date per
-state row (see migrate_from_report_true.py for how that's collapsed).
+TWO core collections plus three lookups.
+
+  documents          the MAIN TABLE. One row per (file x state x crop) placement
+                     exactly as it appears under the Zoho WorkDrive corpus root.
+                     It is a pure ASSOCIATION: state, crop, and a pointer to the
+                     unique document. It carries no metadata and no links of its
+                     own -- the API joins those in for display.
+  unique_documents   one row per distinct document, keyed by sha256. Everything
+                     about the CONTENT lives here: the ANNAM id, the 18 manual
+                     metadata fields, page count, language, translation/review
+                     state, and the (empty) per-chunk embeddings.
+
+Why the split. Metadata on the placement meant editing "the document" was
+editing up to 66 rows, and translating it cost 66x. Now a document is one row
+and its placements point at it.
+
+WHERE THE LINKS LIVE. WorkDrive stores a SEPARATE PHYSICAL COPY of a file in
+every folder -- 9,811 placements are 9,811 distinct Zoho files over ~7,950
+distinct sha256. Grouping by sha256 therefore has to keep every copy's link, so
+a unique document carries `duplicate_links`: one entry per physical copy, with
+its Zoho file id, link, name and the placement it belongs to. Nothing is lost;
+the main table simply does not surface them.
+
+  main_row_ids     every `documents` row that points at this document
+  duplicate_links  every physical copy behind those rows
+
+Both are maintained together by `link_placement()` / `unlink_placement()` below,
+so the load, the upload and the merge cannot drift apart.
+
+MERGING is manual and team-approved. `unique_documents` starts grouped only by
+sha256, because byte-identical is a fact rather than a judgement. Near-duplicates
+(a re-scan, a re-export) stay separate until the algorithm proposes them and a
+person accepts -- see dashboard/routes_merge.py. A merge repoints placements and
+deletes the absorbed DOCUMENT; it never deletes a `documents` row, because each
+one is a real file sitting in a real folder.
+
+Lookups (`states`, `crops`, `languages`) are controlled vocabularies for the
+dashboard's dropdowns, NOT foreign keys -- rows still store the name as a plain
+string. That is deliberate: the previous schema's integer lookup ids were not
+stable (pruned crops came back with a different id), so anything persistent had
+to store the name anyway.
+
+Field names stay snake_case, matching the API contract in dashboard/schemas.py.
 """
 from __future__ import annotations
 
 import enum
-import uuid
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 
-from pgvector.sqlalchemy import Vector
-from sqlalchemy import Enum, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
-from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+# -- Collection names ---------------------------------------------------------
 
-from dashboard.db import Base
+# EVERY collection is prefixed `pop_`. This schema shares a database with a
+# different application (DB_NAME in .env), which already has its own `states`,
+# `crops` and `users` -- the prefix is what keeps the two sets of collections
+# from colliding, and what makes it obvious at a glance which are ours.
+COLL_DOCUMENTS = "pop_documents"
+COLL_UNIQUE_DOCUMENTS = "pop_unique_documents"
+# Controlled vocabularies for the dashboard's dropdowns. See the module
+# docstring: these are not foreign keys.
+COLL_STATES = "pop_states"
+COLL_CROPS = "pop_crops"
+COLL_LANGUAGES = "pop_languages"
+COLL_UPLOAD_QUEUE_ITEMS = "pop_upload_queue_items"
+COLL_TRANSLATION_JOBS = "pop_translation_jobs"
+COLL_CONFIG = "pop_config"
 
-EMBEDDING_DIM = 768  # intfloat/multilingual-e5-base, matches scripts/hash_and_embed_report_true.py
+
+# -- Enums --------------------------------------------------------------------
+# Values are the wire format the frontend reads -- changing one is a breaking
+# API change, not a rename.
 
 
 class TranslationStatus(str, enum.Enum):
@@ -38,14 +86,22 @@ class ReviewStatus(str, enum.Enum):
 
 
 class UploadQueueStatus(str, enum.Enum):
+    """queued -> hashing -> checking_duplicate -> awaiting_review -> uploading
+    -> done, or -> failed from anywhere.
+
+    EVERY upload stops at `awaiting_review` and waits for a person, whether or
+    not a candidate duplicate was found -- the check is a placeholder (see
+    dashboard/queue_worker.py) and the human is the real check for now. From
+    there the only two moves are POST .../add (go ahead and create the row) and
+    POST .../cancel (drop it). Nothing is ever auto-created or auto-discarded.
+
+    The pause happens BEFORE the Zoho upload, so cancelling leaves nothing
+    behind in WorkDrive.
+    """
+
     queued = "queued"
     hashing = "hashing"
-    embedding = "embedding"
     checking_duplicate = "checking_duplicate"
-    # Renamed from duplicate_found (2026-08-26): reached by EVERY upload now,
-    # not just confident duplicates -- see dashboard/queue_worker.py. Nothing
-    # is ever auto-created or auto-removed from the queue; add/new/cancel are
-    # the only way an item leaves this status.
     awaiting_review = "awaiting_review"
     uploading = "uploading"
     done = "done"
@@ -65,177 +121,458 @@ class TranslationJobStatus(str, enum.Enum):
     cancelled = "cancelled"
 
 
-def _uuid_pk():
-    return mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+# -- Name normalisation -------------------------------------------------------
+# Applied on every write path so the catalogue cannot drift out of shape.
+#
+# CAUTION: the OCR language for a document is keyed off the ORIGINAL state name
+# as it appears in the source corpus ("State Karnataka"), not the normalised
+# one. Rows keep `state_raw` alongside the normalised `state` for exactly that
+# reason -- normalising in place would silently break non-English OCR.
+
+# Words stripped from state names: the source data prefixed every state with
+# "State" and used "Central Advisories" for the non-state, all-India category.
+_STATE_NOISE_WORDS = {"state", "advisories"}
 
 
-class State(Base):
-    __tablename__ = "states"
+def normalize_state_name(name: str) -> str:
+    """'State Karnataka' -> 'Karnataka', 'State  Jammu and Kashmir' ->
+    'Jammu and Kashmir', 'Central Advisories' -> 'Central'.
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    name: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    Note the double space in the Jammu and Kashmir source value -- whitespace
+    is collapsed rather than assumed to be single.
+    """
+    if not name:
+        return name
+    words = [w for w in name.split() if w.lower() not in _STATE_NOISE_WORDS]
+    return " ".join(words).strip()
 
 
-class Crop(Base):
-    __tablename__ = "crops"
+def normalize_crop_name(name: str) -> str:
+    """Title Case, preserving genuine acronyms.
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    name: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    An all-caps token inside an otherwise mixed-case name is an acronym and is
+    left alone ('... Institute (ATARI), Hyderabad'). A name that is ENTIRELY
+    upper case is shouting rather than an acronym, so it is title-cased in full
+    ('ALL INDIA NETWORK PROJECT ON ...' -> 'All India Network Project On ...') --
+    without that distinction, short words like 'ALL' and 'ON' would be mistaken
+    for acronyms and preserved.
+    """
+    if not name:
+        return name
+    name = " ".join(name.split())  # collapse whitespace
+    shouting = name.isupper()
+
+    def fix(token: str) -> str:
+        core = token.strip("()[]{}.,;:'\"")
+        if not shouting and core.isupper() and core.isalpha() and 2 <= len(core) <= 6:
+            return token  # acronym -- leave exactly as written
+        # Title-case each alphabetic run so hyphenated and parenthesised words
+        # ("bengal gram (chickpea)", "kharif-rabi") capitalise correctly.
+        return re.sub(r"[A-Za-z]+", lambda m: m.group(0).capitalize(), token)
+
+    return " ".join(fix(t) for t in name.split())
 
 
-class UniqueDocument(Base):
-    __tablename__ = "unique_documents"
+def utcnow() -> datetime:
+    """Timestamp for created_at/updated_at.
 
-    id: Mapped[uuid.UUID] = _uuid_pk()
-    sha256: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
-    # Human-readable sequential id (ANNAM_00000..ANNAM_50000) shown to users
-    # instead of `id` above -- see dashboard/display_id.py for allocation.
-    display_id: Mapped[int] = mapped_column(Integer, unique=True, nullable=False, index=True)
+    Stored as a real BSON date (not a string) so range queries and sorts work.
+    tzinfo is stripped: BSON dates are UTC by definition, and the driver
+    returns them naive, so storing naive keeps round-trips symmetric.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
-    # -- manual metadata --
-    advisory_type: Mapped[str | None] = mapped_column(Text)
-    advisory_scope: Mapped[str | None] = mapped_column(Text)
-    season: Mapped[str | None] = mapped_column(Text)
-    edition_revision_volume: Mapped[str | None] = mapped_column(Text)
-    date_of_release: Mapped[str | None] = mapped_column(Text)
-    month_of_release: Mapped[int | None] = mapped_column(Integer)
-    year_of_release: Mapped[int | None] = mapped_column(Integer)
-    date_of_collection: Mapped[str | None] = mapped_column(Text)
-    month_of_collection: Mapped[int | None] = mapped_column(Integer)
-    year_of_collection: Mapped[int | None] = mapped_column(Integer)
-    advisory_name: Mapped[str | None] = mapped_column(Text)
-    advisory_released_org: Mapped[str | None] = mapped_column(Text)
-    advisory_org_address: Mapped[str | None] = mapped_column(Text)
-    live_source_link: Mapped[str | None] = mapped_column(Text)
-    domain: Mapped[str | None] = mapped_column(Text)
-    verification_status: Mapped[str | None] = mapped_column(Text)
-    verified_by: Mapped[str | None] = mapped_column(Text)
-    document_status: Mapped[str | None] = mapped_column(Text)
 
-    # -- programmatic metadata --
-    shareable_name: Mapped[str | None] = mapped_column(Text)
-    shareable_link: Mapped[str | None] = mapped_column(Text)
-    language: Mapped[str | None] = mapped_column(Text)
-    format_original: Mapped[str | None] = mapped_column(Text, default="pdf")
-    num_pages: Mapped[int | None] = mapped_column(Integer)
+# Every manually-entered metadata field on a document row. Kept as one list so
+# the upload payload, the migration and the document factory can't drift apart.
+# Mirrors DocumentMetadata in dashboard/schemas.py.
+MANUAL_METADATA_FIELDS = (
+    "advisory_type",
+    "advisory_scope",
+    "season",
+    "edition_revision_volume",
+    "date_of_release",
+    "month_of_release",
+    "year_of_release",
+    "date_of_collection",
+    "month_of_collection",
+    "year_of_collection",
+    "advisory_name",
+    "advisory_released_org",
+    "advisory_org_address",
+    "live_source_link",
+    "domain",
+    "verification_status",
+    "verified_by",
+    "document_status",
+)
 
-    # -- storage + dedup --
-    zoho_file_id: Mapped[str | None] = mapped_column(Text)
-    embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIM))
 
-    # -- translation / review --
-    translation_zoho_file_id: Mapped[str | None] = mapped_column(Text)
-    translation_shareable_link: Mapped[str | None] = mapped_column(Text)
-    translation_status: Mapped[TranslationStatus] = mapped_column(
-        Enum(TranslationStatus, name="translation_status"),
-        default=TranslationStatus.not_started,
-        nullable=False,
+def new_document(*, row_id: int, unique_document_id, state: str, crop: str, **fields) -> dict:
+    """One row of the main table: this document, filed under this state and crop.
+
+    An ASSOCIATION and nothing more. No sha256, no link, no metadata -- those
+    belong to the unique document this row points at, and the API joins them in.
+
+    `state`/`crop` are stored normalised; `state_raw`/`crop_raw` keep the
+    original folder names from Zoho, because the OCR language lookup keys off
+    the raw state name and because a folder has to stay findable by the name it
+    actually has in WorkDrive.
+    """
+    now = utcnow()
+    doc = {
+        # Human-readable sequential id for the PLACEMENT (POP_00000..). The
+        # ANNAM id names the document and lives on unique_documents; this names
+        # the row. A merge repoints the row and never renumbers it.
+        "row_id": row_id,
+        "unique_document_id": unique_document_id,
+        # -- placement (plain strings; the lookups are vocabularies, not keys) --
+        "state": normalize_state_name(state),
+        "state_raw": state,
+        "crop": normalize_crop_name(crop),
+        "crop_raw": crop,
+        # Anything nested deeper than <state>/<crop>/<file> in WorkDrive. Empty
+        # for the corpus as it stands; recorded rather than flattened so an
+        # unexpected extra folder level is visible instead of silently changing
+        # which crop a file appears to belong to.
+        "subpath": "",
+        "created_at": now,
+        "updated_at": now,
+    }
+    doc.update(fields)
+    return doc
+
+
+def new_unique_document(*, display_id: int, sha256: str | None = None, **fields) -> dict:
+    """One distinct document: everything true of the CONTENT.
+
+    date_of_release / date_of_collection are deliberately strings, not dates:
+    they hold free-form values from the source corpus (partial dates, ranges,
+    prose). Coercing them would lose data.
+    """
+    now = utcnow()
+    doc = {
+        # The ANNAM number (ANNAM_00000..ANNAM_50000) -- see
+        # dashboard/display_id.py. It names the DOCUMENT.
+        "display_id": display_id,
+        # The grouping key, and unique here: two rows with the same sha256 are
+        # the same document by definition. Also the join key to the on-disk
+        # chunk fingerprints in fix/out/.
+        "sha256": sha256,
+        "num_pages": None,
+        "format_original": "pdf",
+        # The document's own name and link: those of its ANCHOR copy (see
+        # representative_file_id below). Individual copies keep their own in
+        # duplicate_links, because two copies of one document can be named
+        # differently and each has its own file in WorkDrive.
+        "shareable_name": None,
+        "shareable_link": None,
+        # A code from the `languages` collection (the 14 tessdata_best
+        # languages). Filled by the rule in dashboard/languages.resolve_language:
+        # a document the OCR pass read as English is English, and everything
+        # else takes the language of the state it is filed in.
+        "language": None,
+        # WHERE `language` CAME FROM. Exactly two values, because there is only
+        # one distinction anyone acts on -- which rows are guesses:
+        #   "detected"   known: the OCR pass read it as English, or a person set
+        #                it through the dashboard. Never overwritten by
+        #                scripts/fill_language_from_state.py.
+        #   "state"      inferred from the state's language. Plausible, not
+        #                measured, and 3,566 of 8,748 documents are like this.
+        "language_source": None,
+        # -- manual metadata: what a human fills in through the dashboard --
+        **{name: None for name in MANUAL_METADATA_FIELDS},
+        # -- translation / review: ONCE per document --
+        # This is the point of the split. Previously the corpus's most-placed
+        # file would have been translated 66 times.
+        "translation_zoho_file_id": None,
+        "translation_shareable_link": None,
+        "translation_status": TranslationStatus.not_started.value,
+        "review_zoho_file_id": None,
+        "review_shareable_link": None,
+        "review_status": ReviewStatus.not_started.value,
+        # One vector per text chunk, in chunk order. ALWAYS EMPTY for now, by
+        # design -- nothing writes it. The vectors are already computed and live
+        # on local disk (fix/out/fingerprint_v3_chunks.f32, keyed by sha256);
+        # the Atlas cluster is a 512 MB free tier and cannot hold them. The
+        # column exists so filling it in later needs no schema change, and there
+        # is no vector index on it (see dashboard/db.py).
+        "chunk_embeddings": [],
+        # -- placements and physical copies, kept in step by link_placement() --
+        "main_row_ids": [],
+        "duplicate_links": [],
+        # THE ANCHOR. Which entry of duplicate_links is *this document*, as
+        # opposed to another copy of it. Everything that has to act on the
+        # bytes -- translation above all -- uses this one file and no other.
+        #
+        # It matters more later than it does now. Everything grouped so far is
+        # byte-identical, so any copy would do; once the algorithm merges
+        # NEAR-duplicates (a re-scan, a re-export), the other entries are no
+        # longer the same bytes and picking one at random would translate the
+        # wrong artefact. Anchoring now means that day changes nothing.
+        #
+        # Stable across merges: absorbing documents adds copies but never moves
+        # the anchor. A person can re-anchor through
+        # PATCH /unique-documents/{id} if the chosen file turns out to be a bad
+        # scan, and it is validated to be one of this document's own copies.
+        "representative_file_id": None,
+        "representative_row_id": None,
+        # ANNAM ids absorbed into this document by a team-approved merge. An
+        # audit trail, so a merge can be explained (and reversed by hand).
+        "merged_from": [],
+        "created_at": now,
+        "updated_at": now,
+    }
+    doc.update(fields)
+    return doc
+
+
+def new_copy_link(*, zoho_file_id: str | None, shareable_link: str | None,
+                  shareable_name: str | None, state: str, crop: str,
+                  row_id: int | None = None) -> dict:
+    """One entry of a unique document's `duplicate_links`.
+
+    A physical copy in WorkDrive. There is one of these per `documents` row,
+    because WorkDrive keeps a separate file in every folder rather than linking
+    one file into many.
+    """
+    return {
+        "zoho_file_id": zoho_file_id,
+        "shareable_link": shareable_link,
+        "shareable_name": shareable_name,
+        "state": state,
+        "crop": crop,
+        "row_id": row_id,
+    }
+
+
+def new_upload_queue_item(*, filename: str, placements: list[dict], metadata: dict) -> dict:
+    """Status tracking for an in-flight upload -- drives the Add Document box.
+
+    `placements` is the (state, crop) list the form asked for, already flattened
+    from the per-state crop groups the API accepts. `metadata` is the rest of the
+    submitted form. Both are held here because the document does not exist yet:
+    the item waits at `awaiting_review` for a person, and the form has to survive
+    until they decide. On a decision they are unpacked into real fields and this
+    row is only history.
+
+    `candidates` is what the duplicate check found -- up to three existing
+    documents, best first, each carrying which of THIS upload's placements it
+    does not already have. That is what makes the three-way choice meaningful:
+    "add" is only offered when there is something to add.
+    """
+    now = utcnow()
+    return {
+        "filename": filename,
+        "status": UploadQueueStatus.queued.value,
+        "progress_pct": 0,
+        "error_message": None,
+        # Informational (non-error) message -- e.g. what a decision would do.
+        "note": None,
+        # Filled in once known, so the queue row can show them before the
+        # document exists for real.
+        "num_pages": None,
+        "sha256": None,
+        # The (state, crop) pairs this upload is asking to create.
+        "placements": placements,
+        # Up to three existing documents this might be, best score first. Empty
+        # means nothing matched -- NOT that nothing is similar; see
+        # queue_worker.find_candidates.
+        "candidates": [],
+        # The rest of the submitted form (language + the 18 metadata fields).
+        "metadata": metadata,
+        # What the decision produced.
+        "created_document_id": None,   # ANNAM id used or created
+        "created_row_ids": [],         # POP ids of the placements created
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+def new_upload_candidate(*, document, score: float, match_type: str,
+                         new_placements: list[dict]) -> dict:
+    """One row of the duplicate-review list shown before a person decides.
+
+    `new_placements` is the part that drives the UI: the pairs this upload asks
+    for that the candidate does not already have. Empty means adding to this
+    document would create nothing, so only "new" and "discard" make sense.
+
+    `can_create_new` is False for an exact sha256 match, because sha256 is
+    unique on `unique_documents` -- a second document for byte-identical content
+    is not merely undesirable, it cannot be stored. For a near-duplicate (a
+    re-scan, a different hash) it is True and creating a separate document is a
+    legitimate answer.
+    """
+    return {
+        "document_id": str(document["_id"]),
+        "document_code": None,  # filled by the caller, which owns the id format
+        "shareable_name": document.get("shareable_name"),
+        "score": score,
+        "match_type": match_type,
+        "placement_count": len(document.get("main_row_ids") or []),
+        "new_placements": new_placements,
+        "can_add": bool(new_placements),
+        "can_create_new": match_type != "sha",
+    }
+
+
+def new_translation_job(*, document_id, kind: TranslationJobKind) -> dict:
+    """DB-backed version of pop_server.py's in-memory `_jobs` dict pattern --
+    same shape, but survives a server restart.
+
+    Scoped to ONE row. Rows that happen to share a sha256 are independent here:
+    translating one does not mark the others translated, because nothing in
+    this schema knows they are the same file yet.
+    """
+    now = utcnow()
+    return {
+        "document_id": document_id,
+        "kind": kind.value if isinstance(kind, TranslationJobKind) else kind,
+        "status": TranslationJobStatus.queued.value,
+        "progress_pct": 0,
+        # Page-level progress -- set once the source PDF is split (see
+        # dashboard/routes_translation.py's on_progress callback into
+        # pop_server._run_one_doc). Both None while still queued/splitting.
+        "pages_done": None,
+        "total_pages": None,
+        "error_message": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+# -- Keeping placements and copies in step ------------------------------------
+# `main_row_ids` and `duplicate_links` are two views of the same relationship,
+# so they are only ever changed together, here. The load, the upload worker and
+# the merge endpoint all go through these two functions rather than each
+# writing their own $push -- that is what stops the two lists drifting apart.
+
+
+def link_placement(db, unique_document_id, *, row_obj_id, row_id: int, copy_link: dict) -> None:
+    """Record that a `documents` row uses this unique document.
+
+    $addToSet on main_row_ids rather than $push: re-running the corpus load, or
+    retrying an upload, must not add the same placement twice.
+
+    duplicate_links counts PHYSICAL FILES, not placements. In the corpus the two
+    are the same number, because WorkDrive keeps a separate copy of a file in
+    every folder -- 9,811 placements over 9,811 distinct Zoho file ids. A
+    dashboard upload is the other case: it writes ONE file into one flat folder
+    and then files it in several places, so N placements share a single file id.
+    Listing that file once per placement would show a document as having several
+    identical "copies" that are all the same object, and would offer a choice of
+    anchor where there is only one file to anchor on.
+
+    So an entry is keyed by `zoho_file_id`: a file already listed is not listed
+    again. `row_id` on the entry names the placement it was first filed under --
+    for the corpus that is its only placement, for an upload it is one of
+    several, which is why unlink_placement cannot simply remove it.
+    """
+    copy_link = {**copy_link, "row_id": row_id}
+    file_id = copy_link.get("zoho_file_id")
+    # Re-running the same placement replaces its entry; a placement whose file
+    # is already listed adds nothing.
+    db[COLL_UNIQUE_DOCUMENTS].update_one(
+        {"_id": unique_document_id},
+        {"$pull": {"duplicate_links": {"row_id": row_id}}},
     )
-    review_zoho_file_id: Mapped[str | None] = mapped_column(Text)
-    review_shareable_link: Mapped[str | None] = mapped_column(Text)
-    review_status: Mapped[ReviewStatus] = mapped_column(
-        Enum(ReviewStatus, name="review_status"),
-        default=ReviewStatus.not_started,
-        nullable=False,
+    db[COLL_UNIQUE_DOCUMENTS].update_one(
+        {"_id": unique_document_id},
+        {"$addToSet": {"main_row_ids": row_obj_id}, "$set": {"updated_at": utcnow()}},
+    )
+    db[COLL_UNIQUE_DOCUMENTS].update_one(
+        {"_id": unique_document_id, "duplicate_links.zoho_file_id": {"$ne": file_id}},
+        {"$push": {"duplicate_links": copy_link}},
+    )
+    # If this copy IS the document's anchor, record which placement it is. The
+    # file id is known when the document is created but the row id only exists
+    # once the placement is inserted, so it can only be filled in here.
+    #
+    # Only when it is not set yet: where several placements share one file, the
+    # anchor is that single copy, and its row_id must stay the one the copy
+    # entry carries. Overwriting it with each later placement would leave
+    # representative_row_id naming a placement that is not in duplicate_links,
+    # and anything matching the two up would find no anchor at all.
+    db[COLL_UNIQUE_DOCUMENTS].update_one(
+        {"_id": unique_document_id,
+         "representative_file_id": file_id,
+         "$or": [{"representative_row_id": None},
+                 {"representative_row_id": {"$exists": False}}]},
+        {"$set": {"representative_row_id": row_id}},
     )
 
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now(), nullable=False)
 
-    associations: Mapped[list["DocumentAssociation"]] = relationship(
-        back_populates="unique_document", cascade="all, delete-orphan", passive_deletes=True
+def remember_vocabulary(db, *, state: str | None = None, crop: str | None = None) -> None:
+    """Add a state or crop to its dropdown if it is not there yet.
+
+    Called on every write path that can introduce a name -- an upload naming a
+    crop nobody has used before, a placement moved to a new one. Without this
+    the vocabularies would only ever describe the corpus as it was loaded, and
+    the team could add a crop that then vanished from their own dropdown.
+
+    Upsert, never delete: a name that stops being used stays available, and the
+    counts are refreshed by the corpus load rather than incremented here (an
+    increment would drift the moment anything is deleted).
+    """
+    for collection, raw, normalize in (
+        (COLL_STATES, state, normalize_state_name),
+        (COLL_CROPS, crop, normalize_crop_name),
+    ):
+        if not raw or not raw.strip():
+            continue
+        name = normalize(raw)
+        if not name:
+            continue
+        db[collection].update_one(
+            {"name": name},
+            {"$addToSet": {"raw_names": raw},
+             "$set": {"updated_at": utcnow()},
+             "$setOnInsert": {"created_at": utcnow(), "document_count": 0}},
+            upsert=True,
+        )
+
+
+def unlink_placement(db, unique_document_id, *, row_obj_id, row_id: int) -> None:
+    """Drop a placement, and its copy link if no other placement still uses it.
+
+    The document itself survives, even with no placements left, so its metadata
+    and translation are not lost with the last folder entry.
+
+    The copy link is the careful part. When each placement has its own physical
+    file (the corpus), removing the placement removes its file from the list.
+    When several placements share one file (a dashboard upload), the file is
+    still there after one of them goes -- deleting its entry would strand the
+    document with no link at all, and with it the download and the anchor. The
+    two cases are told apart by counting: fewer distinct files than placements
+    means they are shared.
+    """
+    doc = db[COLL_UNIQUE_DOCUMENTS].find_one(
+        {"_id": unique_document_id}, {"main_row_ids": 1, "duplicate_links": 1}
+    ) or {}
+    links = doc.get("duplicate_links") or []
+    placements = len(doc.get("main_row_ids") or [])
+    shared = len({c.get("zoho_file_id") for c in links}) < placements
+
+    pull: dict = {"main_row_ids": row_obj_id}
+    if not shared:
+        pull["duplicate_links"] = {"row_id": row_id}
+    db[COLL_UNIQUE_DOCUMENTS].update_one(
+        {"_id": unique_document_id},
+        {"$pull": pull, "$set": {"updated_at": utcnow()}},
     )
-
-
-class DocumentAssociation(Base):
-    """One row per (unique document x state x crop) placement -- the "main
-    table" with the state/folder columns. Equivalent to one row of today's
-    report_true.csv, minus all the unique-doc-only metadata."""
-
-    __tablename__ = "document_associations"
-    __table_args__ = (UniqueConstraint("unique_document_id", "state_id", "crop_id", name="uq_doc_state_crop"),)
-
-    id: Mapped[uuid.UUID] = _uuid_pk()
-    unique_document_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("unique_documents.id", ondelete="CASCADE"), nullable=False
+    if not shared:
+        return
+    # The surviving entry still names the placement that just went. Point it at
+    # one that is left, so the row_id on a copy is always a real placement.
+    remaining = [r["row_id"] for r in db[COLL_DOCUMENTS].find(
+        {"unique_document_id": unique_document_id}, {"row_id": 1})]
+    if not remaining:
+        return
+    db[COLL_UNIQUE_DOCUMENTS].update_one(
+        {"_id": unique_document_id, "duplicate_links.row_id": row_id},
+        {"$set": {"duplicate_links.$.row_id": remaining[0]}},
     )
-    state_id: Mapped[int] = mapped_column(ForeignKey("states.id"), nullable=False)
-    crop_id: Mapped[int] = mapped_column(ForeignKey("crops.id"), nullable=False)
-
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now(), nullable=False)
-
-    unique_document: Mapped["UniqueDocument"] = relationship(back_populates="associations")
-    state: Mapped["State"] = relationship()
-    crop: Mapped["Crop"] = relationship()
-
-
-class UploadQueueItem(Base):
-    """Status tracking for a queued upload -- drives the "checking status"
-    box in the Add Document mode of the frontend. metadata_payload holds the
-    full upload form (manual metadata fields + selected state/crop names)
-    until the item resolves to awaiting_review/failed. Nothing is ever
-    auto-created or auto-removed -- every successful hash/embed run lands on
-    awaiting_review and waits for an explicit add/new/cancel, even when no
-    candidate match exists at all (see dashboard/queue_worker.py)."""
-
-    __tablename__ = "upload_queue_items"
-
-    id: Mapped[uuid.UUID] = _uuid_pk()
-    filename: Mapped[str] = mapped_column(Text, nullable=False)
-    status: Mapped[UploadQueueStatus] = mapped_column(
-        Enum(UploadQueueStatus, name="upload_queue_status"), default=UploadQueueStatus.queued, nullable=False
+    db[COLL_UNIQUE_DOCUMENTS].update_one(
+        {"_id": unique_document_id, "representative_row_id": row_id},
+        {"$set": {"representative_row_id": remaining[0]}},
     )
-    progress_pct: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    duplicate_of_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("unique_documents.id", ondelete="SET NULL")
-    )
-    similarity_score: Mapped[float | None] = mapped_column(Float)
-    # "sha" (byte-for-byte identical, similarity_score always 1.0), "embedding"
-    # (closest existing document by embedding cosine similarity, whatever
-    # that similarity happens to be -- shown even below the duplicate
-    # threshold, purely for the human to judge), or None (unique_documents
-    # was empty -- no candidate exists to compare against at all).
-    match_type: Mapped[str | None] = mapped_column(Text)
-    error_message: Mapped[str | None] = mapped_column(Text)
-    # Informational (non-error) message -- e.g. what a pending duplicate
-    # would link once approved. Distinct from error_message (implies
-    # failure).
-    note: Mapped[str | None] = mapped_column(Text)
-    # Filled in once known (after hashing/OCR), same as the eventual
-    # unique_documents columns -- lets the queue row show them before the
-    # document exists for real.
-    num_pages: Mapped[int | None] = mapped_column(Integer)
-    language: Mapped[str | None] = mapped_column(Text)
-    metadata_payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now(), nullable=False)
-
-
-class TranslationJob(Base):
-    """DB-backed version of pop_server.py's existing in-memory `_jobs` dict
-    pattern -- same shape, but survives a server restart."""
-
-    __tablename__ = "translation_jobs"
-
-    id: Mapped[uuid.UUID] = _uuid_pk()
-    unique_document_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("unique_documents.id", ondelete="CASCADE"), nullable=False
-    )
-    kind: Mapped[TranslationJobKind] = mapped_column(Enum(TranslationJobKind, name="translation_job_kind"), nullable=False)
-    status: Mapped[TranslationJobStatus] = mapped_column(
-        Enum(TranslationJobStatus, name="translation_job_status"), default=TranslationJobStatus.queued, nullable=False
-    )
-    progress_pct: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    # Page-level progress -- set once the source PDF is split (see
-    # dashboard/routes_translation.py's on_progress callback into
-    # pop_server._run_one_doc). Both null while still queued/splitting.
-    pages_done: Mapped[int | None] = mapped_column(Integer)
-    total_pages: Mapped[int | None] = mapped_column(Integer)
-    error_message: Mapped[str | None] = mapped_column(Text)
-
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now(), nullable=False)
-
-    unique_document: Mapped["UniqueDocument"] = relationship()

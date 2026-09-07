@@ -969,15 +969,20 @@ app.add_middleware(
 # pipeline above. Lives entirely in dashboard/*, wired in here with a single
 # include_router call per router. See docs/dashboard_backend_plan.md.
 # ---------------------------------------------------------------------------
+from helpers.http_headers import content_disposition  # noqa: E402
 from dashboard.routes_documents import router as _dashboard_documents_router
 from dashboard.routes_uploads import router as _dashboard_uploads_router
 from dashboard.routes_translation import router as _dashboard_translation_router
+from dashboard.routes_merge import router as _dashboard_merge_router
 from dashboard.routes_files import router as _dashboard_files_router
 
 app.include_router(_dashboard_documents_router, prefix="/dashboard", tags=["dashboard"])
 app.include_router(_dashboard_uploads_router, prefix="/dashboard", tags=["dashboard"])
 app.include_router(_dashboard_translation_router, prefix="/dashboard", tags=["dashboard"])
+app.include_router(_dashboard_merge_router, prefix="/dashboard", tags=["dashboard"])
 app.include_router(_dashboard_files_router, prefix="/dashboard", tags=["dashboard"])
+# No dedup router: this schema has no embeddings and no duplicate-review flow.
+# Duplicates are expected in the main table and grouping them is a later job.
 
 
 @app.exception_handler(_requests.exceptions.RetryError)
@@ -1484,7 +1489,7 @@ def download_file(path: str):
     return StreamingResponse(
         _stream(),
         media_type="application/octet-stream",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": content_disposition(filename)},
     )
 
 
@@ -1521,7 +1526,7 @@ def download_output(state: str = Query(...), crop: str = Query(...), doc_name: s
     return StreamingResponse(
         _stream(),
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={"Content-Disposition": f'attachment; filename="{docx_item["name"]}"'},
+        headers={"Content-Disposition": content_disposition(docx_item["name"])},
     )
 
 
