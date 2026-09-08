@@ -46,13 +46,41 @@ load_dotenv(REPO_ROOT / ".env")
 # 768-float vector per document is another ~27 MB plus an Atlas Vector Search
 # index, and per-CHUNK vectors are many times that. Fingerprints live on local
 # disk instead (see fix/out/), keyed back to a document by sha256.
-POP_ENV = os.environ.get("POP_ENV", "staging").strip().lower()
+
+
+def _env(name: str) -> str:
+    """Read an env var, stripped of whitespace AND of surrounding quotes.
+
+    The quotes matter in production. `.env` here writes the values quoted
+    (PROD_DB_URL="mongodb+srv://..."), and `docker compose` strips those
+    during ${VAR} interpolation -- which is why a local `docker compose up`
+    has never hit this. `docker run --env-file .env` does NOT strip them: the
+    value arrives beginning with a literal `"`, and MongoClient then raises
+    `InvalidURI: URI must begin with 'mongodb://' or 'mongodb+srv://'`.
+    """
+    value = (os.environ.get(name) or "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1].strip()
+    return value
+
+
+POP_ENV = _env("POP_ENV").lower() or "staging"
 _PREFIX = "PROD" if POP_ENV in ("prod", "production") else "STAGING"
 
-DB_URL = os.environ.get("DB_URL") or os.environ.get(f"{_PREFIX}_DB_URL")
+# The plain DB_URL override is only honoured when it really is a MongoDB URI.
+# It is read before the prefixed vars purely for backwards compatibility with
+# an older .env; anything else there (a bare database name, a leftover from
+# another service) is ignored rather than handed to MongoClient. DB_NAME
+# follows DB_URL rather than being read on its own -- a plain DB_NAME belongs
+# to whatever set that plain DB_URL, not to us.
+_plain_url = _env("DB_URL")
+if not _plain_url.startswith(("mongodb://", "mongodb+srv://")):
+    _plain_url = ""
+
+DB_URL = _plain_url or _env(f"{_PREFIX}_DB_URL")
 DB_NAME = (
-    os.environ.get("DB_NAME")
-    or os.environ.get(f"{_PREFIX}_DB_NAME")
+    (_env("DB_NAME") if _plain_url else "")
+    or _env(f"{_PREFIX}_DB_NAME")
     or "agriai-test-riya"
 )
 

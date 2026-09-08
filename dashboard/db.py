@@ -18,13 +18,14 @@ and joined back by sha256, because the cluster is a 512 MB free tier.
 """
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 
 from pymongo import ASCENDING, DESCENDING, MongoClient
 from pymongo.collation import Collation
 from pymongo.database import Database
 
-from dashboard.config import DB_NAME, DB_URL
+from dashboard.config import _PREFIX, DB_NAME, DB_URL, POP_ENV
 from dashboard.models import (
     COLL_CONFIG,
     COLL_CROPS,
@@ -55,6 +56,17 @@ def _get_client() -> MongoClient:
             raise RuntimeError(
                 "DB_URL is not set -- the dashboard database is unavailable. "
                 "Set it in .env (see docs/deployment.md) and restart."
+            )
+        if not DB_URL.startswith(("mongodb://", "mongodb+srv://")):
+            # Say WHICH value is wrong and show only its scheme, never the
+            # credentials. pymongo's own InvalidURI names neither, which made
+            # this hard to place when it first appeared in production.
+            raise RuntimeError(
+                "The configured MongoDB URL is not a MongoDB URI (it starts "
+                f"{DB_URL[:12]!r}...). POP_ENV={POP_ENV!r}, so the dashboard "
+                f"reads {'DB_URL' if os.environ.get('DB_URL') else _PREFIX + '_DB_URL'}"
+                " from .env. Note that `docker run --env-file` keeps the "
+                "surrounding quotes that `docker compose` strips."
             )
         _client = MongoClient(DB_URL, appname="pop-render")
     return _client
