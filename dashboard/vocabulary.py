@@ -335,6 +335,22 @@ def folder(db, raw, *, create: bool = True) -> tuple[str, dict] | None:
     return ("organization", org) if org is not None else None
 
 
+# Which folders an advisory type may be filed under, for the Folder dropdown.
+# Matched on letters only, so "Crop Advisory", "crop-advisory" and "CROP
+# ADVISORY" are one value. Blank or unrecognised shows everything, like General.
+_ADVISORY_FOLDER_KINDS = {
+    "comprehensive": ("crop",),
+    "cropadvisory": ("crop",),
+    "noncropadvisory": ("organization",),
+    "general": ("crop", "organization"),
+}
+
+
+def folder_kinds_for_advisory(advisory_type: str | None) -> tuple[str, ...]:
+    key = re.sub(r"[^a-z]", "", (advisory_type or "").lower())
+    return _ADVISORY_FOLDER_KINDS.get(key, ("crop", "organization"))
+
+
 def _path(kind: str) -> str:
     return {"state": "states", "crop": "crops", "organization": "organizations"}[kind]
 

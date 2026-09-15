@@ -51,6 +51,7 @@ from dashboard.schemas import (
     CropOut,
     DocumentOut,
     DocumentUpdate,
+    FolderOut,
     LanguageOut,
     OrganizationOut,
     UserOut,
@@ -940,6 +941,31 @@ def list_organizations(request: Request, db=Depends(get_db)):
     counts = vocabulary.usage_counts(db, "organization")
     return sorted((_entry_out(OrganizationOut, row, counts) for row in db[COLL_ORGANIZATIONS].find(query)),
                   key=lambda o: o.name.lower())
+
+
+@router.get("/folders", response_model=list[FolderOut])
+def list_folders(request: Request, db=Depends(get_db)):
+    """The Folder dropdown -- for the Add Document form and the table's Folder
+    column filter -- driven by the advisory type:
+
+        Comprehensive, Crop Advisory   crops (crop master)
+        Non-Crop Advisory              organisations
+        General, blank or other        both
+
+    `?advisory_type=` picks the rule; `?state=` / `?state_id=` narrows to
+    folders actually used under that state, as for /crops.
+    """
+    out: list[FolderOut] = []
+    for kind in vocabulary.folder_kinds_for_advisory(request.query_params.get("advisory_type")):
+        query = _narrowed_by_state(db, request, kind)
+        if query is None:
+            return []
+        counts = vocabulary.usage_counts(db, kind)
+        spellings = vocabulary.crop_spellings(db) if kind == "crop" else None
+        for row in vocabulary.entries(db, kind, query):
+            e = _entry_out(CropOut if kind == "crop" else OrganizationOut, row, counts, spellings)
+            out.append(FolderOut(kind=kind, **e.model_dump()))
+    return sorted(out, key=lambda f: (f.name.lower(), f.kind))
 
 
 def _create_entry(db, kind: str, body: dict, model):

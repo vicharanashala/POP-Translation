@@ -1088,6 +1088,24 @@ def test_lookup_lists_carry_ids_and_live_counts(client, scratch):
     assert client.get("/dashboard/crops?state=Karnataka").json()
 
 
+def test_folder_options_follow_the_advisory_type(client):
+    """Comprehensive / Crop Advisory offer crops, Non-Crop Advisory offers
+    organisations, General (and blank) offers both -- for the Add Document form
+    and the table's Folder filter alike."""
+    def kinds(advisory):
+        q = f"?advisory_type={advisory}" if advisory is not None else ""
+        return {f["kind"] for f in client.get(f"/dashboard/folders{q}").json()}
+
+    assert kinds("Comprehensive") == {"crop"}
+    assert kinds("Crop Advisory") == kinds("crop-advisory") == {"crop"}
+    assert kinds("Non-Crop Advisory") == {"organization"}
+    assert kinds("General") == kinds(None) == {"crop", "organization"}
+    everything = client.get("/dashboard/folders?advisory_type=General").json()
+    assert len(everything) == len(client.get("/dashboard/crops").json()) + len(client.get("/dashboard/organizations").json())
+    narrowed = client.get("/dashboard/folders?advisory_type=General&state=Karnataka").json()
+    assert 0 < len(narrowed) < len(everything)
+
+
 def test_languages_include_the_verdicts_and_the_tessdata_pack(client):
     langs = client.get("/dashboard/languages").json()
     codes = {x["code"] for x in langs}

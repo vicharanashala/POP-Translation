@@ -265,7 +265,9 @@ placements_json = [ {"state": "State Karnataka",
                     {"state": "State Kerala", "crops": ["Coconut"]} ]
 ```
 
-Each group needs at least one entry across the four lists. A name under
+Take the options from `GET /folders?advisory_type=<form's Advisory Type>&state=<group's state>`
+(see *The Folder dropdown follows the advisory type*). Each group needs at least
+one entry across the four lists. A name under
 `"crops"` must be a crop master crop (an existing organisation's name is also
 accepted there) — anything else is a **400** telling the user to pick from
 `/crops` or send it as an organisation. `"organizations"` may introduce a new
@@ -379,6 +381,7 @@ anchor does not move. `merged_from` is the audit trail.
 GET    /states                            [{id, name, raw_names, document_count}]
 GET    /crops[?state=X|?state_id=]        same shape — crop master crops, read-only
 GET    /organizations[?state=X|?state_id=] same shape
+GET    /folders?advisory_type=X[&state=|&state_id=]  [{id, name, kind, raw_names, document_count}]
 GET    /languages                         [{code, label, tessdata_best}] — 24
 
 POST   /states          {"name": "..."}   idempotent → the entry (201)
@@ -396,10 +399,48 @@ stores `state_id` plus exactly one of `crop_id` (an entry in the **crop master**
 or `organization_id` (an organisation, department or grouping — `"ICAR - Indian
 Council Of Agriculture Research"`, `"General"`, `"Pulses"`).
 
-The row still has one **`crop`** column holding whichever name applies, plus
+The row still has one **`crop`** field holding whichever name applies, plus
 `crop_kind: "crop" | "organization"`, `crop_id` and `organization_id` (one of
-the two is null). Show them in the one Crop column; `crop_kind` is there if you
-want to badge or filter organisations.
+the two is null).
+
+**Label that column "Folder", not "Crop"** — the table reads *State / Folder*,
+because the value is a crop or an organisation. Only the UI label changes: the
+API field is still `crop`, and its filters are still `filter[crop]`,
+`filter[crop_id]`, `filter[organization_id]`, `filter[crop_kind]`. `crop_kind`
+is there if you want to badge organisations.
+
+### The Folder dropdown follows the advisory type
+
+Wherever a Folder is picked — the **Add Document** form and the table's
+**Folder column filter** — the options depend on the Advisory Type:
+
+| Advisory Type | Folder options |
+|---|---|
+| Comprehensive | crops (crop master) |
+| Crop Advisory | crops (crop master) |
+| Non-Crop Advisory | organisations |
+| General | everything — crops and organisations |
+| blank | everything |
+
+Don't reimplement the rule: **`GET /folders?advisory_type=<the selected type>`**
+returns exactly those options, each with its `kind`. Send an option's `id` as
+`crop_ids`/`organization_ids` (upload) or `crop_id`/`organization_id` (PATCH,
+filters) according to `kind`. Add `&state=`/`&state_id=` to narrow to folders
+used under a state, as in the upload form. The type is matched on letters only,
+so `"Crop Advisory"` and `"crop-advisory"` are the same; anything unrecognised
+behaves like General. When the Advisory Type changes in the form, re-fetch and
+clear a selected folder that is no longer offered. In the table, filter the
+Folder options by the Advisory Type column filter when one is set, otherwise use
+General.
+
+**Every existing document has Advisory Type `General`** (all 8,748, set
+2026-09-15), so by default every folder is offered.
+
+One option has an empty `name`: the organisation for the 10 files sitting
+directly in a state folder with no crop folder. Render it as "(no folder)".
+
+The backend does not refuse a folder that does not match the advisory type —
+the rule lives in the dropdown.
 
 **Crops are read-only.** They come from the crop master, which another
 application edits. There is no add/rename/merge/delete for crops here — hide

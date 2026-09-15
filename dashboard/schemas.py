@@ -94,6 +94,16 @@ class OrganizationOut(BaseModel):
     document_count: int = 0
 
 
+class FolderOut(BaseModel):
+    """One option of the Folder dropdown: a crop or an organisation."""
+
+    id: str
+    name: str
+    kind: str  # "crop" | "organization" -- send the id as crop_id / organization_id accordingly
+    raw_names: list[str] = []
+    document_count: int = 0
+
+
 class VocabularyCreate(BaseModel):
     name: str
 
