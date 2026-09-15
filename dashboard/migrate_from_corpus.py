@@ -374,57 +374,39 @@ def build_collections(rows: list[dict]) -> tuple[dict, list[dict]]:
                 "state": m["state"],
                 "crop": m["crop"],
                 "source_key": m["fields"]["source_key"],
-                "copy": {k: m["fields"].get(k) for k in _COPY_FIELDS} | {
-                    "state": m["state"], "crop": m["crop"],
-                },
+                # No state/crop on the copy: it names its placement by row_id.
+                "copy": {k: m["fields"].get(k) for k in _COPY_FIELDS},
             })
     return docs, placements
 
 
 def seed_lookups(db, rows: list[dict]) -> None:
-    """Fill the states / crops / languages vocabularies.
+    """Fill the languages vocabulary.
 
-    Upserted by name, never deleted: a state the team added by hand survives a
-    reload, and a name that has stopped appearing in the corpus still resolves
-    for any row that references it. `raw_names` records every source spelling
-    that normalised to this entry, which is how a lookup stays reversible.
+    States and crops are not seeded here any more: the placement loop resolves
+    each folder name to its entry (creating it if new) as it goes, because a
+    placement stores the entry's id and so needs it before it can be written.
+    Upserted by code, never deleted.
     """
-    from dashboard.models import COLL_CROPS, COLL_LANGUAGES, COLL_STATES, utcnow
-    from dashboard.languages import LANGUAGES
+    from dashboard.models import COLL_LANGUAGES, utcnow
+    from dashboard.languages import LANGUAGES, TESSDATA_BEST
 
-    for collection, key in ((COLL_STATES, "state"), (COLL_CROPS, "crop")):
-        seen: dict[str, dict] = {}
-        for r in rows:
-            from dashboard.models import normalize_crop_name, normalize_state_name
-
-            raw = r[key]
-            name = normalize_state_name(raw) if key == "state" else normalize_crop_name(raw)
-            entry = seen.setdefault(name, {"raw_names": set(), "count": 0})
-            entry["raw_names"].add(raw)
-            entry["count"] += 1
-        for name, entry in seen.items():
-            db[collection].update_one(
-                {"name": name},
-                {"$set": {"document_count": entry["count"], "updated_at": utcnow()},
-                 "$addToSet": {"raw_names": {"$each": sorted(entry["raw_names"])}},
-                 "$setOnInsert": {"created_at": utcnow()}},
-                upsert=True,
-            )
-        print(f"[migrate] {collection}: {len(seen)} entries")
-
-    # English, Non-English, and the 14 tessdata_best languages. "Non-English" is
-    # not a language, but it IS what the OCR pass concluded for 1,265 documents,
-    # so the team needs it in the list to refine those rows from.
-    vocabulary = [{"code": code, "label": label} for code, label in sorted(LANGUAGES.items())]
-    vocabulary.append({"code": "non_english", "label": "Non-English"})
-    for entry in vocabulary:
+    # English, the 22 Eighth Schedule languages, and Non-English. "Non-English"
+    # is not a language, but it IS what the OCR pass concluded for 1,265
+    # documents, so the team needs it in the list to refine those rows from.
+    # Its tessdata_best is None: the question does not apply to a verdict.
+    languages = [{"code": code, "label": label, "tessdata_best": code in TESSDATA_BEST}
+                 for code, label in sorted(LANGUAGES.items())]
+    languages.append({"code": "non_english", "label": "Non-English", "tessdata_best": None})
+    for entry in languages:
         db[COLL_LANGUAGES].update_one(
             {"code": entry["code"]},
-            {"$set": {"label": entry["label"], "updated_at": utcnow()},
+            {"$set": {"label": entry["label"], "tessdata_best": entry["tessdata_best"],
+                      "updated_at": utcnow()},
              "$setOnInsert": {"created_at": utcnow()}},
             upsert=True,
         )
-    print(f"[migrate] {COLL_LANGUAGES}: {len(vocabulary)} entries")
+    print(f"[migrate] {COLL_LANGUAGES}: {len(languages)} entries")
 
 
 def main() -> None:
@@ -536,6 +518,28 @@ def main() -> None:
             print(f"[migrate] [{i}/{len(docs)}] unique documents inserted...")
 
     # -- placements -----------------------------------------------------------
+    # Folder names -> vocabulary ids. Resolved through the vocabulary, so a
+    # reload lands on entries the team has already renamed or merged (their old
+    # spellings are in raw_names) instead of re-creating the old names.
+    from dashboard import vocabulary
+
+    state_ids: dict[str, object] = {}
+    folders: dict[str, dict] = {}
+
+    def state_id(raw: str):
+        if raw not in state_ids:
+            entry = vocabulary.resolve(db, "state", raw)
+            state_ids[raw] = entry["_id"] if entry else None
+        return state_ids[raw]
+
+    def folder(raw: str) -> dict:
+        """{crop_id: ...} for a crop master crop, else {organization_id: ...}
+        -- a folder the master does not know becomes an organisation."""
+        if raw not in folders:
+            kind, entry = vocabulary.folder(db, raw) or ("organization", {"_id": None})
+            folders[raw] = {vocabulary.field(kind): entry["_id"]}
+        return folders[raw]
+
     row_ids = free_row_ids(db, len(placements))
     batch, inserted_rows = [], 0
     # row_id -> the copy that placement points at, so duplicate_links can be
@@ -545,8 +549,10 @@ def main() -> None:
         batch.append(new_document(
             row_id=row_id,
             unique_document_id=doc_ids[placement["group_key"]],
-            state=placement["state"],
-            crop=placement["crop"],
+            state_id=state_id(placement["state"]),
+            **folder(placement["crop"]),
+            state_raw=placement["state"],
+            crop_raw=placement["crop"],
             source_key=placement["source_key"],
         ))
         copies_by_row[row_id] = (placement["group_key"], placement["copy"])

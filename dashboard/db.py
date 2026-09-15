@@ -25,12 +25,25 @@ from pymongo import ASCENDING, DESCENDING, MongoClient
 from pymongo.collation import Collation
 from pymongo.database import Database
 
-from dashboard.config import _PREFIX, DB_NAME, DB_URL, POP_ENV
+from dashboard.config import (
+    CROP_MASTER_COLLECTION,
+    CROP_MASTER_DB_NAME,
+    CROP_MASTER_HOST_DB,
+    _PREFIX,
+    DB_NAME,
+    DB_URL,
+    POP_ENV,
+    USERS_COLLECTION,
+    USERS_DB_NAME,
+    USERS_DB_URL,
+)
 from dashboard.models import (
     COLL_CONFIG,
+    COLL_CROP_ALIASES,
     COLL_CROPS,
     COLL_DOCUMENTS,
     COLL_LANGUAGES,
+    COLL_ORGANIZATIONS,
     COLL_STATES,
     COLL_TRANSLATION_JOBS,
     COLL_UNIQUE_DOCUMENTS,
@@ -43,9 +56,9 @@ from dashboard.models import (
 # already-working pipeline server before a single request is served.
 _client: MongoClient | None = None
 
-# Case-insensitive comparison, passed per query for the state/crop name
-# filters. Those are now free-text fields rather than rows in a lookup table,
-# so a filter has to match regardless of how the caller cased it.
+# Case-insensitive comparison, for state/crop names: the vocabulary's unique
+# index uses it, and so does every lookup of a typed name, so "beet root" finds
+# "Beet root".
 CI_COLLATION = Collation(locale="en", strength=2)
 
 
@@ -76,6 +89,41 @@ def get_database() -> Database:
     return _get_client()[DB_NAME]
 
 
+def crops_collection(db: Database):
+    """Where `db`'s crops live: the crop master for the production dashboard
+    database, the local `pop_crops` copy for any other (staging, tests).
+
+    Same client either way -- the master is on the production cluster, in a
+    database the production user can read but not write.
+    """
+    if db.name == CROP_MASTER_HOST_DB:
+        return db.client[CROP_MASTER_DB_NAME][CROP_MASTER_COLLECTION]
+    return db[COLL_CROPS]
+
+
+# The other application's user list. A client of its own: under POP_ENV=prod
+# the dashboard's database is on a different cluster, and this is not.
+_users_client: MongoClient | None = None
+
+
+def get_users_collection():
+    """The other application's `users` collection, for reading names only.
+
+    Short timeouts: this is somebody else's database on a free tier, and a
+    dropdown that cannot load should fail fast (the caller turns it into a 503
+    and the frontend falls back to free text) rather than hang a request.
+    """
+    global _users_client
+    if _users_client is None:
+        if not USERS_DB_URL.startswith(("mongodb://", "mongodb+srv://")):
+            raise RuntimeError("STAGING_DB_URL is not set -- the user list is unavailable.")
+        _users_client = MongoClient(
+            USERS_DB_URL, appname="pop-render-users",
+            serverSelectionTimeoutMS=5000, connectTimeoutMS=5000, socketTimeoutMS=10000,
+        )
+    return _users_client[USERS_DB_NAME][USERS_COLLECTION]
+
+
 # Index specs, applied by init_db(). Kept here rather than scattered through
 # the code so there is one place to see every constraint.
 #
@@ -92,11 +140,16 @@ _INDEXES: dict[str, list[dict]] = {
         # Every join and every merge walks this. NOT unique: many placements
         # point at one document -- that is the whole point.
         {"keys": [("unique_document_id", ASCENDING)], "name": "unique_document_id"},
-        # The main table's two filter columns. Compound so "everything in
-        # Karnataka" and "Karnataka + Amaranthus" are both served by one index;
-        # `crop` alone gets its own.
-        {"keys": [("state", ASCENDING), ("crop", ASCENDING)], "name": "state_crop"},
-        {"keys": [("crop", ASCENDING)], "name": "crop"},
+        # The main table's two filter columns, by reference. Compound so
+        # "everything in Karnataka" and "Karnataka + Amaranthus" are both served
+        # by one index; `crop_id` alone gets its own, and is also what a crop
+        # delete checks before refusing.
+        {"keys": [("state_id", ASCENDING), ("crop_id", ASCENDING)], "name": "state_id_crop_id"},
+        {"keys": [("crop_id", ASCENDING)], "name": "crop_id"},
+        # The other kind of folder: an organisation or grouping instead of a crop.
+        {"keys": [("state_id", ASCENDING), ("organization_id", ASCENDING)],
+         "name": "state_id_organization_id"},
+        {"keys": [("organization_id", ASCENDING)], "name": "organization_id"},
         {"keys": [("created_at", DESCENDING), ("_id", ASCENDING)], "name": "created_at_id"},
     ],
     # -- one row per distinct document -----------------------------------------
@@ -119,12 +172,21 @@ _INDEXES: dict[str, list[dict]] = {
         {"keys": [("duplicate_links.zoho_file_id", ASCENDING)], "name": "copy_file_id"},
         {"keys": [("created_at", DESCENDING), ("_id", ASCENDING)], "name": "created_at_id"},
     ],
-    # -- controlled vocabularies for the dashboard's dropdowns -----------------
-    # Names are the key. These are not foreign keys (rows store the name as a
-    # plain string); they exist so the agri team picks from a list instead of
-    # typing a new spelling of an existing state.
-    COLL_STATES: [{"keys": [("name", ASCENDING)], "unique": True, "name": "uq_name"}],
-    COLL_CROPS: [{"keys": [("name", ASCENDING)], "unique": True, "name": "uq_name"}],
+    # -- controlled vocabularies, referenced by id from every placement --------
+    # The name is unique CASE-INSENSITIVELY, so no write path can put "Beet
+    # Root" next to "Beet root". A differently-named index from the old
+    # case-sensitive `uq_name`, so creating it never conflicts with that one;
+    # scripts/migrate_vocabulary_refs.py drops the old index.
+    COLL_STATES: [{"keys": [("name", ASCENDING)], "unique": True, "name": "uq_name_ci",
+                   "collation": CI_COLLATION}],
+    # pop_crops is a verbatim copy of the crop master, which has its own
+    # (case-SENSITIVE) unique name -- and "Amaranth" next to "amaranth" -- so no
+    # index of ours is imposed on the copy.
+    COLL_CROPS: [],
+    COLL_ORGANIZATIONS: [{"keys": [("name", ASCENDING)], "unique": True, "name": "uq_name_ci",
+                          "collation": CI_COLLATION}],
+    COLL_CROP_ALIASES: [{"keys": [("spelling", ASCENDING)], "unique": True, "name": "uq_spelling_ci",
+                         "collation": CI_COLLATION}],
     COLL_LANGUAGES: [{"keys": [("code", ASCENDING)], "unique": True, "name": "uq_code"}],
     COLL_UPLOAD_QUEUE_ITEMS: [
         {"keys": [("created_at", DESCENDING), ("_id", ASCENDING)], "name": "created_at_id"},

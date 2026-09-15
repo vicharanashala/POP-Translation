@@ -74,9 +74,15 @@ filter[date_of_collection_to]=2026-08-31
 
 **Multi-select is comma-separated, not a repeated param.** A repeated
 `filter[state]=A&filter[state]=B` keeps only the **last** value — that was the
-multi-select bug. Whitespace and a trailing comma are tolerated. A value
-containing a comma cannot be filtered as one term; no state or crop name has one
-today.
+multi-select bug. Whitespace and a trailing comma are tolerated.
+
+`filter[state]` / `filter[crop]` match names (case-insensitive, substring, and
+also each entry's other spellings — `filter[crop]=Black Pepper` finds `Pepper`).
+`filter[crop]` covers the whole Crop column: crops **and** organisations.
+**Many organisation names contain commas** (`"Ministry of Jal Shakti, Government
+of India"`), and those split — so dropdown filters should send ids instead:
+`filter[state_id]`, `filter[crop_id]`, `filter[organization_id]` (exact, comma =
+any of). `filter[crop_kind]=crop|organization` narrows to one kind.
 
 **Ranges**: `_min`/`_max` on numeric keys, `_from`/`_to` on date keys. Either end
 may be omitted. Dates are `YYYY-MM-DD`. A range on a text column returns an empty
@@ -115,7 +121,8 @@ Send any mix; the backend decides where each field lands.
 
 ```jsonc
 PATCH /documents/{id}
-{ "crop": "Ragi",          // → this row only
+{ "crop_id": "<id>",       // → this row only; or "organization_id", or a name:
+                           //   "crop" must be a master crop, "organization" is created if new
   "season": "Kharif",      // → the DOCUMENT, so all its placements
   "language": "kan" }      // → the document; must be a code from /languages
 ```
@@ -186,13 +193,17 @@ can simply be retried.
   "duplicate_links": [
     { "zoho_file_id": "ifu0n51…", "shareable_link": "https://workdrive.zoho.in/file/ifu0n51…",
       "shareable_name": "Global Potato Conclave – 2020 - ICAR-CPRI.pdf",
-      "state": "Central Advisories", "crop": "ICAR-Central Potato Research Institute…",
+      "state": "Central", "crop": "ICAR-Central Potato Research Institute…",
       "row_id": 341 } ],
   "merged_from": [] }
 ```
 
 **`duplicate_links` is every physical FILE of this document in WorkDrive** — not
 one per placement. A file is listed exactly once.
+
+An entry's `state`/`crop` are read from the placement named by its `row_id`, so
+they are the same names the main table shows (`"Rajasthan"`) — they used to be
+the raw folder spelling (`"State Rajasthan"`), and they follow a rename.
 
 For the crawled corpus the two counts coincide: WorkDrive stores a copy per
 folder rather than linking one file into many, so 9,811 placements really are
@@ -248,9 +259,17 @@ Placements are **per-state crop groups** — a state, then that state's crops, t
 another state:
 
 ```
-placements_json = [ {"state": "State Karnataka", "crops": ["Paddy", "Ragi"]},
-                    {"state": "State Kerala",    "crops": ["Coconut"]} ]
+placements_json = [ {"state": "State Karnataka",
+                     "crop_ids": ["<master id>"],                 // or "crops": ["Paddy"]
+                     "organization_ids": ["<id>"]},               // or "organizations": ["ICAR - ..."]
+                    {"state": "State Kerala", "crops": ["Coconut"]} ]
 ```
+
+Each group needs at least one entry across the four lists. A name under
+`"crops"` must be a crop master crop (an existing organisation's name is also
+accepted there) — anything else is a **400** telling the user to pick from
+`/crops` or send it as an organisation. `"organizations"` may introduce a new
+one; it is created when the upload is filed. Prefer ids from the dropdowns.
 
 `states_json` + `crops_json` are still accepted and mean the cross product of the
 two; use them only when every state really does get the same crop list.
@@ -357,18 +376,56 @@ anchor does not move. `merged_from` is the audit trail.
 ## Lookups
 
 ```
-GET /states            [{name, raw_names, document_count}]
-GET /crops[?state=X]   same shape; ?state narrows to crops used in that state
-GET /languages         [{code, label}] — 15
-POST /states  {"name": "..."}      idempotent
-POST /crops   {"name": "..."}      idempotent
+GET    /states                            [{id, name, raw_names, document_count}]
+GET    /crops[?state=X|?state_id=]        same shape — crop master crops, read-only
+GET    /organizations[?state=X|?state_id=] same shape
+GET    /languages                         [{code, label, tessdata_best}] — 24
+
+POST   /states          {"name": "..."}   idempotent → the entry (201)
+POST   /organizations   {"name": "..."}   idempotent → the entry (201)
+PATCH  /organizations/{id}        {"name": "..."}          rename → the entry
+POST   /organizations/{id}/merge  {"absorb": ["<id>", ...]} → {id, name, absorbed, placements_repointed}
+DELETE /organizations/{id}                                 204, or 409 while in use
+        (the same three for /states/{id})
+
+POST / PATCH / merge / DELETE on /crops → 403 — crops are maintained elsewhere
 ```
 
-`raw_names` is the original folder spelling (`"State Karnataka"`). Do not show it
-— it exists because the OCR language lookup keys off it.
+**The folder under a state is a crop OR an organisation.** Every placement
+stores `state_id` plus exactly one of `crop_id` (an entry in the **crop master**)
+or `organization_id` (an organisation, department or grouping — `"ICAR - Indian
+Council Of Agriculture Research"`, `"General"`, `"Pulses"`).
 
-**Language is a dropdown, never free text.** 14 tessdata languages plus
-`non_english`. Two fields matter together:
+The row still has one **`crop`** column holding whichever name applies, plus
+`crop_kind: "crop" | "organization"`, `crop_id` and `organization_id` (one of
+the two is null). Show them in the one Crop column; `crop_kind` is there if you
+want to badge or filter organisations.
+
+**Crops are read-only.** They come from the crop master, which another
+application edits. There is no add/rename/merge/delete for crops here — hide
+those controls. Pesticides the master also lists are never returned.
+
+**States and organisations are ours and editable:**
+
+- **Rename** changes the name on every row at once, stored exactly as sent. The
+  old name is kept in `raw_names`. Renaming onto a name another entry already has
+  (any letter case) is a **409 whose message says to merge instead**.
+- **Merge** moves the absorbed entries' placements (and any pending uploads) to
+  the survivor, keeps their names in its `raw_names`, and deletes them. No row is
+  deleted.
+- **Delete** only succeeds for an entry nothing uses; otherwise 409 naming how
+  many placements and pending uploads still use it — offer merge.
+- Names are **unique regardless of letter case**; posting `"icar - x"` returns the
+  existing `"ICAR - X"`. Don't dedupe on the client.
+
+For every lookup, `document_count` is computed on read, and `raw_names` are other
+spellings that resolve to the entry — for a state its original folder name
+(`"State Karnataka"`), for a crop our older names before the master
+(`"Ground Nut"` → `Groundnut`). Fine as "also known as" on a management screen;
+not in dropdowns.
+
+**Language is a dropdown, never free text.** English, the 22 Eighth Schedule
+languages (`tessdata_best` says which can be OCR'd) plus `non_english`. Two fields matter together:
 
 - `language` — the code.
 - `language_source` — a closed vocabulary of three. `detected` (5,183: **known**

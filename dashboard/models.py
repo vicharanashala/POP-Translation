@@ -4,8 +4,8 @@ TWO core collections plus three lookups.
 
   documents          the MAIN TABLE. One row per (file x state x crop) placement
                      exactly as it appears under the Zoho WorkDrive corpus root.
-                     It is a pure ASSOCIATION: state, crop, and a pointer to the
-                     unique document. It carries no metadata and no links of its
+                     It is a pure ASSOCIATION: a state id, a crop id, and a
+                     pointer to the unique document. It carries no metadata and no links of its
                      own -- the API joins those in for display.
   unique_documents   one row per distinct document, keyed by sha256. Everything
                      about the CONTENT lives here: the ANNAM id, the 18 manual
@@ -36,11 +36,13 @@ person accepts -- see dashboard/routes_merge.py. A merge repoints placements and
 deletes the absorbed DOCUMENT; it never deletes a `documents` row, because each
 one is a real file sitting in a real folder.
 
-Lookups (`states`, `crops`, `languages`) are controlled vocabularies for the
-dashboard's dropdowns, NOT foreign keys -- rows still store the name as a plain
-string. That is deliberate: the previous schema's integer lookup ids were not
-stable (pruned crops came back with a different id), so anything persistent had
-to store the name anyway.
+Lookups. States, crops and organisations are REFERENCED: a placement stores
+`state_id` plus `crop_id` or `organization_id`, and the name lives only in the
+lookup, so a rename or a merge is one write -- see dashboard/vocabulary.py.
+Crops come from the crop master, which another application edits; this backend
+only reads them. (An earlier schema abandoned lookup ids because pruned crops
+came back with a different id; entries are now never pruned while in use.)
+`languages` is still a plain code on the document.
 
 Field names stay snake_case, matching the API contract in dashboard/schemas.py.
 """
@@ -58,10 +60,20 @@ from datetime import datetime, timezone
 # from colliding, and what makes it obvious at a glance which are ours.
 COLL_DOCUMENTS = "pop_documents"
 COLL_UNIQUE_DOCUMENTS = "pop_unique_documents"
-# Controlled vocabularies for the dashboard's dropdowns. See the module
-# docstring: these are not foreign keys.
+# Controlled vocabularies. Placements reference states and crops by id; see
+# dashboard/vocabulary.py.
 COLL_STATES = "pop_states"
+# Staging's copy of the crop master. Production reads agriai.crop_master
+# instead -- see dashboard/db.py:crops_collection. Never written by the API.
 COLL_CROPS = "pop_crops"
+# Everything a folder names that is NOT a crop: organisations and departments
+# ("ICAR - Indian Council Of Agriculture Research") and groupings ("General",
+# "Pulses"). Ours, and editable, unlike crops.
+COLL_ORGANIZATIONS = "pop_organizations"
+# Our own spellings of master crops ("Ground Nut" -> Groundnut), so a folder or
+# a form using an old spelling still lands on the master entry. The master's
+# `aliases` are regional names ("sajje"), a different thing.
+COLL_CROP_ALIASES = "pop_crop_aliases"
 COLL_LANGUAGES = "pop_languages"
 COLL_UPLOAD_QUEUE_ITEMS = "pop_upload_queue_items"
 COLL_TRANSLATION_JOBS = "pop_translation_jobs"
@@ -126,8 +138,8 @@ class TranslationJobStatus(str, enum.Enum):
 #
 # CAUTION: the OCR language for a document is keyed off the ORIGINAL state name
 # as it appears in the source corpus ("State Karnataka"), not the normalised
-# one. Rows keep `state_raw` alongside the normalised `state` for exactly that
-# reason -- normalising in place would silently break non-English OCR.
+# one. Rows keep `state_raw` alongside their `state_id` for exactly that reason
+# -- replacing it with the standard name would silently break non-English OCR.
 
 # Words stripped from state names: the source data prefixed every state with
 # "State" and used "Central Advisories" for the non-state, all-India category.
@@ -183,6 +195,18 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def normalize_format(value: str | None) -> str | None:
+    """format_original as stored: lower-case, trimmed, blank -> None.
+
+    Stored values are lower-case file extensions (pdf, png, docx), plus `url`
+    for a web page and `printed` for a printed document. The column filter
+    matches exactly, so a person picking "PDF" in a form must not store a
+    second, upper-case spelling that the filter for `pdf` would then miss.
+    """
+    value = (value or "").strip().lower()
+    return value or None
+
+
 # Every manually-entered metadata field on a document row. Kept as one list so
 # the upload payload, the migration and the document factory can't drift apart.
 # Mirrors DocumentMetadata in dashboard/schemas.py.
@@ -208,16 +232,19 @@ MANUAL_METADATA_FIELDS = (
 )
 
 
-def new_document(*, row_id: int, unique_document_id, state: str, crop: str, **fields) -> dict:
+def new_document(*, row_id: int, unique_document_id, state_id, state_raw: str,
+                 crop_raw: str, crop_id=None, organization_id=None, **fields) -> dict:
     """One row of the main table: this document, filed under this state and crop.
 
     An ASSOCIATION and nothing more. No sha256, no link, no metadata -- those
     belong to the unique document this row points at, and the API joins them in.
 
-    `state`/`crop` are stored normalised; `state_raw`/`crop_raw` keep the
-    original folder names from Zoho, because the OCR language lookup keys off
-    the raw state name and because a folder has to stay findable by the name it
-    actually has in WorkDrive.
+    `state_id` references pop_states. The folder under it is EITHER a crop --
+    `crop_id`, a crop master entry -- OR an organisation / grouping --
+    `organization_id`, into pop_organizations. Exactly one of the two is set.
+    `state_raw`/`crop_raw` keep the original folder names from Zoho, because the
+    OCR language lookup keys off the raw state name and because a folder has to
+    stay findable by the name it actually has in WorkDrive.
     """
     now = utcnow()
     doc = {
@@ -226,11 +253,11 @@ def new_document(*, row_id: int, unique_document_id, state: str, crop: str, **fi
         # the row. A merge repoints the row and never renumbers it.
         "row_id": row_id,
         "unique_document_id": unique_document_id,
-        # -- placement (plain strings; the lookups are vocabularies, not keys) --
-        "state": normalize_state_name(state),
-        "state_raw": state,
-        "crop": normalize_crop_name(crop),
-        "crop_raw": crop,
+        # -- placement: references, plus the folder names as found --
+        "state_id": state_id,
+        "state_raw": state_raw,
+        **({"crop_id": crop_id} if crop_id is not None else {"organization_id": organization_id}),
+        "crop_raw": crop_raw,
         # Anything nested deeper than <state>/<crop>/<file> in WorkDrive. Empty
         # for the corpus as it stands; recorded rather than flattened so an
         # unexpected extra folder level is visible instead of silently changing
@@ -328,20 +355,22 @@ def new_unique_document(*, display_id: int, sha256: str | None = None, **fields)
 
 
 def new_copy_link(*, zoho_file_id: str | None, shareable_link: str | None,
-                  shareable_name: str | None, state: str, crop: str,
-                  row_id: int | None = None) -> dict:
+                  shareable_name: str | None, row_id: int | None = None) -> dict:
     """One entry of a unique document's `duplicate_links`.
 
     A physical copy in WorkDrive. There is one of these per `documents` row,
     because WorkDrive keeps a separate file in every folder rather than linking
     one file into many.
+
+    No state or crop: the entry names its placement by `row_id`, and the API
+    reads the folder from there. Copying the names in is how the two drifted --
+    the corpus load wrote raw folder spellings here and normalised ones on the
+    placement.
     """
     return {
         "zoho_file_id": zoho_file_id,
         "shareable_link": shareable_link,
         "shareable_name": shareable_name,
-        "state": state,
-        "crop": crop,
         "row_id": row_id,
     }
 
@@ -500,36 +529,6 @@ def link_placement(db, unique_document_id, *, row_obj_id, row_id: int, copy_link
                  {"representative_row_id": {"$exists": False}}]},
         {"$set": {"representative_row_id": row_id}},
     )
-
-
-def remember_vocabulary(db, *, state: str | None = None, crop: str | None = None) -> None:
-    """Add a state or crop to its dropdown if it is not there yet.
-
-    Called on every write path that can introduce a name -- an upload naming a
-    crop nobody has used before, a placement moved to a new one. Without this
-    the vocabularies would only ever describe the corpus as it was loaded, and
-    the team could add a crop that then vanished from their own dropdown.
-
-    Upsert, never delete: a name that stops being used stays available, and the
-    counts are refreshed by the corpus load rather than incremented here (an
-    increment would drift the moment anything is deleted).
-    """
-    for collection, raw, normalize in (
-        (COLL_STATES, state, normalize_state_name),
-        (COLL_CROPS, crop, normalize_crop_name),
-    ):
-        if not raw or not raw.strip():
-            continue
-        name = normalize(raw)
-        if not name:
-            continue
-        db[collection].update_one(
-            {"name": name},
-            {"$addToSet": {"raw_names": raw},
-             "$set": {"updated_at": utcnow()},
-             "$setOnInsert": {"created_at": utcnow(), "document_count": 0}},
-            upsert=True,
-        )
 
 
 def unlink_placement(db, unique_document_id, *, row_obj_id, row_id: int) -> None:

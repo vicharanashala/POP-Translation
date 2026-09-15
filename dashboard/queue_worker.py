@@ -46,7 +46,7 @@ from pathlib import Path
 
 from bson import ObjectId
 
-from dashboard import zoho_layout
+from dashboard import vocabulary, zoho_layout
 from dashboard.db import get_session
 from dashboard.display_id import format_display_id, format_row_id, free_display_ids, free_row_ids
 from dashboard.models import (
@@ -60,9 +60,6 @@ from dashboard.models import (
     new_document,
     new_unique_document,
     new_upload_candidate,
-    normalize_crop_name,
-    normalize_state_name,
-    remember_vocabulary,
     utcnow,
 )
 
@@ -126,13 +123,39 @@ def enqueue_decision(item_id: ObjectId, document_id: ObjectId | None) -> None:
     _executor.submit(_finish, item_id, document_id)
 
 
-def _placement_key(placement: dict) -> tuple:
-    """Compare placements on their NORMALISED names, so "State Karnataka" and
-    "Karnataka" are the same placement rather than two."""
-    return (
-        normalize_state_name(placement.get("state") or ""),
-        normalize_crop_name(placement.get("crop") or ""),
-    )
+def _placement_ids(db, placement: dict, *, create: bool = False) -> tuple:
+    """(state_id, folder kind, folder id) for a queued placement, the folder
+    being a crop ("crop") or an organisation ("organization").
+
+    A stored id wins while its entry still exists; otherwise the name is looked
+    up -- case-insensitively and through the other known spellings. With
+    create=True a state or organisation nobody has used yet is created; a crop
+    never is. Anything that cannot be resolved comes back as None.
+    """
+    state = vocabulary.get(db, "state", placement["state_id"]) if placement.get("state_id") else None
+    if state is None:
+        state = (vocabulary.resolve if create else vocabulary.find)(db, "state", placement.get("state"))
+
+    folder = None
+    for kind in ("crop", "organization"):
+        if placement.get(vocabulary.field(kind)):
+            entry = vocabulary.get(db, kind, placement[vocabulary.field(kind)])
+            if entry is not None:
+                folder = (kind, entry)
+                break
+    if folder is None:
+        name, kind = placement.get("crop"), placement.get("crop_kind")
+        if kind == "crop":
+            entry = vocabulary.find(db, "crop", name)
+            folder = ("crop", entry) if entry else None
+        elif kind == "organization":
+            entry = (vocabulary.resolve if create else vocabulary.find)(db, "organization", name)
+            folder = ("organization", entry) if entry else None
+        else:
+            folder = vocabulary.folder(db, name, create=create)
+    return (state["_id"] if state else None,
+            folder[0] if folder else None,
+            folder[1]["_id"] if folder else None)
 
 
 def new_placements_for(db, document, placements: list[dict]) -> list[dict]:
@@ -141,20 +164,27 @@ def new_placements_for(db, document, placements: list[dict]) -> list[dict]:
     Read from the `documents` collection rather than from the document's own
     duplicate_links, because the rows are the authority on where a document is
     filed -- links describe physical files, which is a different question.
+    Compared by id: a pair naming something that does not exist yet cannot
+    already be one of the document's placements.
     """
     have = {
-        (row.get("state") or "", row.get("crop") or "")
+        (row.get("state_id"),
+         "crop" if row.get("crop_id") else "organization",
+         row.get("crop_id") or row.get("organization_id"))
         for row in db[COLL_DOCUMENTS].find(
-            {"unique_document_id": document["_id"]}, {"state": 1, "crop": 1}
-        )
+            {"unique_document_id": document["_id"]},
+            {"state_id": 1, "crop_id": 1, "organization_id": 1})
     }
     out, seen = [], set()
     for placement in placements:
-        key = _placement_key(placement)
-        if key in have or key in seen:
+        ids = _placement_ids(db, placement)
+        known = None not in ids
+        key = ids if known else (str(placement.get("state", "")).lower(),
+                                 str(placement.get("crop", "")).lower())
+        if (known and ids in have) or key in seen:
             continue
         seen.add(key)
-        out.append({"state": key[0], "crop": key[1]})
+        out.append(placement)
     return out
 
 
@@ -237,15 +267,31 @@ def create_placements(db, *, document, placements: list[dict], copy: dict) -> li
     dashboard uploads -- unlike the crawled corpus, where WorkDrive really does
     hold a separate file per folder.
     """
-    if not placements:
+    # Resolved to ids first -- creating any state or organisation the form
+    # introduced -- and deduped on the ids, so two spellings of one crop in the
+    # same form cannot become two rows for one folder. A crop the master does
+    # not have fails the upload loudly rather than being filed as something else.
+    resolved, seen = [], set()
+    for placement in placements:
+        ids = _placement_ids(db, placement, create=True)
+        if ids[0] is None:
+            raise ValueError(f"state {placement.get('state')!r} could not be resolved")
+        if ids[2] is None:
+            raise ValueError(f"{placement.get('crop')!r} is not a crop in the crop master")
+        if ids in seen:
+            continue
+        seen.add(ids)
+        resolved.append((placement, ids))
+    if not resolved:
         return []
-    row_ids = free_row_ids(db, len(placements))
+    row_ids = free_row_ids(db, len(resolved))
     rows = []
-    for placement, row_id in zip(placements, row_ids):
-        state, crop = placement["state"], placement["crop"]
-        remember_vocabulary(db, state=state, crop=crop)
-        rows.append(new_document(row_id=row_id, unique_document_id=document["_id"],
-                                 state=state, crop=crop))
+    for (placement, (state_id, kind, folder_id)), row_id in zip(resolved, row_ids):
+        rows.append(new_document(
+            row_id=row_id, unique_document_id=document["_id"], state_id=state_id,
+            state_raw=placement.get("state") or "", crop_raw=placement.get("crop") or "",
+            **{vocabulary.field(kind): folder_id},
+        ))
     result = db[COLL_DOCUMENTS].insert_many(rows)
     for row, inserted_id in zip(rows, result.inserted_ids):
         row["_id"] = inserted_id
@@ -253,7 +299,7 @@ def create_placements(db, *, document, placements: list[dict], copy: dict) -> li
             db, document["_id"],
             row_obj_id=inserted_id,
             row_id=row["row_id"],
-            copy_link=new_copy_link(state=row["state"], crop=row["crop"], **copy),
+            copy_link=new_copy_link(**copy),
         )
     return rows
 
@@ -350,7 +396,8 @@ def _finish(item_id: ObjectId, document_id: ObjectId | None) -> None:
                         "shareable_link": zoho_layout.shareable_link(zoho_file_id),
                         "representative_file_id": zoho_file_id,
                         "num_pages": item.get("num_pages"),
-                        "format_original": (filename.rsplit(".", 1)[-1] or "pdf").lower(),
+                        "format_original": metadata.get("format_original")
+                        or (filename.rsplit(".", 1)[-1] or "pdf").lower(),
                         # The uploader's tessdata choice is both the OCR setting
                         # and the document's language, and a person choosing it
                         # is its own provenance -- neither read off the file

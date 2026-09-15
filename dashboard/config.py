@@ -84,6 +84,30 @@ DB_NAME = (
     or "agriai-test-riya"
 )
 
+# Crops are NOT ours. Production references the crop master that another
+# application maintains (agriai.crop_master, same cluster as PROD_DB_URL, read
+# access only). Staging's cluster cannot reach it, so staging keeps a copy in
+# its own `pop_crops` (dashboard/migrate_vocabulary_refs.py --sync-master).
+# Either way this backend only READS crops; see dashboard/vocabulary.py.
+#
+# Which one a database uses is decided per database, not per process: the
+# production dashboard database (PROD_DB_NAME) reads the master, any other reads
+# its local copy. That keeps a script that opens both deployments from reading
+# the wrong list for one of them.
+CROP_MASTER_HOST_DB = _env("PROD_DB_NAME") or "pop_dashboard"
+CROP_MASTER_DB_NAME = _env("CROP_MASTER_DB_NAME") or "agriai"
+CROP_MASTER_COLLECTION = _env("CROP_MASTER_COLLECTION") or "crop_master"
+
+# The people a document can be "verified by". There is no user list of our
+# own: this reads the `users` collection of the OTHER application that shares
+# the staging database -- always staging, whatever POP_ENV says, because the
+# production database has no users at all. Read-only, and only name / role /
+# status are ever read out of it (see dashboard/db.py:get_users_collection);
+# that collection also holds emails, phone numbers and password hashes.
+USERS_DB_URL = _env("STAGING_DB_URL")
+USERS_DB_NAME = _env("STAGING_DB_NAME") or "agriai-test-riya"
+USERS_COLLECTION = "users"
+
 # Fixed, pre-created Zoho WorkDrive subfolder IDs for the dashboard's three
 # upload kinds -- see dashboard/zoho_layout.py.
 ZOHO_DASHBOARD_ORIGINALS_FOLDER_ID = os.environ.get("ZOHO_DASHBOARD_ORIGINALS_FOLDER_ID")

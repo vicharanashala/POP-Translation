@@ -34,8 +34,11 @@ another state:
                       {"state":"State Kerala","crops":["Coconut"]}]'
 
 `states_json` + `crops_json` remain accepted for the simple case, and mean the
-cross product of the two. Crops that do not exist yet are created; the form can
-introduce a new one.
+cross product of the two. A group may also name `crop_ids`, `organizations`
+and `organization_ids` -- see _parse_placements. Crops must already exist in
+the crop master; a new state or organisation is created when the upload is
+filed. Names are matched case-insensitively and through each entry's other
+known spellings, so an old spelling still lands on the standard entry.
 
 Wire format: JSON-array-encoded strings rather than native repeated Form fields
 -- list-typed Form() parameters aren't reliably supported across the FastAPI
@@ -53,20 +56,17 @@ from bson.errors import InvalidId
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile
 from pymongo import ASCENDING, DESCENDING
 
-from dashboard import queue_worker
-from dashboard.db import CI_COLLATION, get_db
+from dashboard import queue_worker, vocabulary
+from dashboard.db import get_db
 from dashboard.display_id import parse_display_id
 from dashboard.models import (
-    COLL_CROPS,
     COLL_LANGUAGES,
-    COLL_STATES,
     COLL_UNIQUE_DOCUMENTS,
     COLL_UPLOAD_QUEUE_ITEMS,
     MANUAL_METADATA_FIELDS,
     UploadQueueStatus,
     new_upload_queue_item,
-    normalize_crop_name,
-    normalize_state_name,
+    normalize_format,
     utcnow,
 )
 from dashboard.schemas import UploadQueueItemOut
@@ -83,33 +83,40 @@ def _to_object_id(value: str) -> ObjectId:
         raise HTTPException(422, "malformed upload id")
 
 
+def _stringify_ids(placements: list[dict] | None) -> list[dict]:
+    return [{**p, **{k: str(p[k]) for k in ("state_id", "crop_id", "organization_id")
+                     if p.get(k) is not None}}
+            for p in placements or []]
+
+
 def _item_out(item: dict) -> UploadQueueItemOut:
     data = dict(item)
     data["id"] = str(data.pop("_id"))
+    data["placements"] = _stringify_ids(data.get("placements"))
+    data["candidates"] = [{**c, "new_placements": _stringify_ids(c.get("new_placements"))}
+                          for c in data.get("candidates") or []]
     return UploadQueueItemOut(**data)
-
-
-def _canonical(db, collection, name: str) -> str:
-    """The vocabulary's spelling of a name, if it already knows one.
-
-    normalize_state_name() strips noise words but does not re-case: "State
-    Karnataka" gives "Karnataka" while "state karnataka" gives "karnataka", and
-    title-casing everything is not an option either ("Jammu and Kashmir" would
-    become "Jammu And Kashmir"). So the vocabulary decides. A name it has never
-    seen is stored as typed and becomes the canonical spelling itself.
-    """
-    existing = db[collection].find_one({"name": name}, collation=CI_COLLATION)
-    return existing["name"] if existing else name
 
 
 def _parse_placements(db, placements_json: str | None, states_json: str | None,
                       crops_json: str | None) -> list[dict]:
-    """The (state, crop) pairs the form is asking for, normalised and deduped.
+    """The (state, folder) pairs the form is asking for, resolved and deduped.
+
+    Each state group names its folders in any of four lists:
+
+        {"state": "Karnataka",
+         "crops": ["Paddy"],               crop master names
+         "crop_ids": ["<id>"],             crop master ids
+         "organizations": ["ICAR - ..."],  our organisations (created if new)
+         "organization_ids": ["<id>"]}
+
+    A name under "crops" must be a crop the master knows -- this form cannot
+    create one -- but an existing organisation's name is accepted there too, so
+    a form that still sends every folder as a "crop" keeps working.
 
     Deduped because the same pair arriving twice would otherwise create two rows
-    for one folder, and a form that lists a crop under two states is a normal
-    thing for a person to do. Deduped AFTER the vocabulary has had its say, so
-    two spellings of one state collapse rather than becoming two placements.
+    for one folder. Deduped AFTER the lookups have had their say, so two
+    spellings of one crop collapse rather than becoming two placements.
     """
     groups: list[dict] = []
     if placements_json:
@@ -122,10 +129,12 @@ def _parse_placements(db, placements_json: str | None, states_json: str | None,
         for group in parsed:
             if not isinstance(group, dict) or not group.get("state"):
                 raise HTTPException(400, 'each placement needs {"state": ..., "crops": [...]}')
-            crops = group.get("crops") or []
-            if not isinstance(crops, list) or not crops:
+            lists = {k: group.get(k) or [] for k in _FOLDER_LISTS}
+            if any(not isinstance(v, list) for v in lists.values()):
+                raise HTTPException(400, f"state {group['state']!r}: {', '.join(_FOLDER_LISTS)} must be arrays")
+            if not any(lists.values()):
                 raise HTTPException(400, f"state {group['state']!r} has no crops")
-            groups.append({"state": group["state"], "crops": crops})
+            groups.append({"state": group["state"], **lists})
     else:
         try:
             states = json.loads(states_json or "[]")
@@ -138,23 +147,69 @@ def _parse_placements(db, placements_json: str | None, states_json: str | None,
             raise HTTPException(400, "at least one state must be selected")
         if not crops:
             raise HTTPException(400, "at least one crop must be selected")
-        groups = [{"state": s, "crops": crops} for s in states]
+        groups = [{"state": st, **{k: [] for k in _FOLDER_LISTS}, "crops": crops} for st in states]
 
     if not groups:
         raise HTTPException(400, "at least one state must be selected")
 
     pairs, seen = [], set()
     for group in groups:
-        state = _canonical(db, COLL_STATES, normalize_state_name(str(group["state"]).strip()))
-        for crop in group["crops"]:
-            crop = _canonical(db, COLL_CROPS, normalize_crop_name(str(crop).strip()))
-            if not state or not crop:
-                raise HTTPException(400, "state and crop names cannot be empty")
-            if (state, crop) in seen:
+        state = _state_side(db, group["state"])
+        if not state["name"]:
+            raise HTTPException(400, "state and crop names cannot be empty")
+        for folder in _folders(db, group):
+            key = (state["id"] or state["name"].lower(), folder["kind"],
+                   folder["id"] or folder["name"].lower())
+            if key in seen:
                 continue
-            seen.add((state, crop))
-            pairs.append({"state": state, "crop": crop})
+            seen.add(key)
+            pairs.append({"state": state["name"], "state_id": state["id"],
+                          "crop": folder["name"], "crop_kind": folder["kind"],
+                          vocabulary.field(folder["kind"]): folder["id"]})
     return pairs
+
+
+_FOLDER_LISTS = ("crops", "crop_ids", "organizations", "organization_ids")
+
+
+def _state_side(db, raw) -> dict:
+    """The state's entry, or the name a new one would get. Nothing is created
+    here: a cancelled upload must not leave a state behind."""
+    entry = vocabulary.find(db, "state", raw)
+    if entry is not None:
+        return {"name": entry["name"], "id": entry["_id"]}
+    return {"name": vocabulary.KINDS["state"][1](" ".join(str(raw or "").split())), "id": None}
+
+
+def _folders(db, group: dict):
+    """Every folder a state group names, as {kind, name, id}. A 400 for a crop
+    the master does not have, or an id naming nothing."""
+    for kind, key in (("crop", "crop_ids"), ("organization", "organization_ids")):
+        for raw_id in group[key]:
+            entry = vocabulary.get(db, kind, raw_id)
+            if entry is None:
+                raise HTTPException(400, f"{key}: {raw_id!r} does not name an existing {kind}")
+            yield {"kind": kind, "name": entry["name"], "id": entry["_id"]}
+    for raw in group["crops"]:
+        if not " ".join(str(raw or "").split()):
+            raise HTTPException(400, "state and crop names cannot be empty")
+        crop = vocabulary.find(db, "crop", raw)
+        if crop is not None:
+            yield {"kind": "crop", "name": crop["name"], "id": crop["_id"]}
+            continue
+        org = vocabulary.find(db, "organization", raw)
+        if org is None:
+            raise HTTPException(
+                400, f"{raw!r} is not a crop in the crop master. Pick one from GET /dashboard/crops, "
+                     f"or send it under \"organizations\" if it is an organisation or grouping")
+        yield {"kind": "organization", "name": org["name"], "id": org["_id"]}
+    for raw in group["organizations"]:
+        name = " ".join(str(raw or "").split())
+        if not name:
+            raise HTTPException(400, "state and crop names cannot be empty")
+        org = vocabulary.find(db, "organization", name)
+        yield ({"kind": "organization", "name": org["name"], "id": org["_id"]} if org
+               else {"kind": "organization", "name": vocabulary.KINDS["organization"][1](name), "id": None})
 
 
 @router.post("/uploads", response_model=UploadQueueItemOut, status_code=201)
@@ -182,6 +237,9 @@ async def create_upload(
     verification_status: str | None = Form(None),
     verified_by: str | None = Form(None),
     document_status: str | None = Form(None),
+    # Optional. Blank means "derive it from the file's extension", as before;
+    # set, it wins -- e.g. a PDF that is a scan of a printed document.
+    format_original: str | None = Form(None),
     db=Depends(get_db),
 ):
     placements = _parse_placements(db, placements_json, states_json, crops_json)
@@ -193,7 +251,8 @@ async def create_upload(
         raise HTTPException(400, "uploaded file is empty")
 
     local = locals()
-    metadata = {"language": language, **{name: local.get(name) for name in MANUAL_METADATA_FIELDS}}
+    metadata = {"language": language, **{name: local.get(name) for name in MANUAL_METADATA_FIELDS},
+                "format_original": normalize_format(format_original)}
 
     item = new_upload_queue_item(filename=file.filename, placements=placements, metadata=metadata)
     item_id = db[COLL_UPLOAD_QUEUE_ITEMS].insert_one(item).inserted_id

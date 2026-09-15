@@ -55,7 +55,36 @@ def db():
 
 
 @pytest.fixture
-def scratch(db):
+def vocab_guard(db):
+    """Deletes any state or organisation a test created and left unused, so runs
+    do not accumulate "Scratchland" entries in the real dropdowns. Entries that
+    existed before the test are never touched. (Crops are never created.)"""
+    from dashboard.models import COLL_DOCUMENTS, COLL_ORGANIZATIONS, COLL_STATES
+
+    before = {c: {e["_id"] for e in db[c].find({}, {"_id": 1})} for c in (COLL_STATES, COLL_ORGANIZATIONS)}
+    yield
+    for coll, field in ((COLL_STATES, "state_id"), (COLL_ORGANIZATIONS, "organization_id")):
+        for e in db[coll].find({"_id": {"$nin": list(before[coll])}}, {"_id": 1}):
+            if db[COLL_DOCUMENTS].count_documents({field: e["_id"]}, limit=1) == 0:
+                db[coll].delete_one({"_id": e["_id"]})
+
+
+def _placement_row(db, *, row_id, unique_document_id, state, crop, **fields):
+    """A placement for a test fixture, referencing (and if need be creating)
+    its state and folder the way the real write paths do. A folder name the crop
+    master does not know -- every "Scratch ..." name -- becomes an organisation."""
+    from dashboard import vocabulary
+    from dashboard.models import new_document
+
+    kind, entry = vocabulary.folder(db, crop)
+    return new_document(
+        row_id=row_id, unique_document_id=unique_document_id,
+        state_id=vocabulary.resolve(db, "state", state)["_id"],
+        state_raw=state, crop_raw=crop, **{vocabulary.field(kind): entry["_id"]}, **fields)
+
+
+@pytest.fixture
+def scratch(db, vocab_guard):
     """A throwaway document with two placements, cleaned up afterwards.
 
     Yields (document, [rows]). Ids are drawn from the live allocators, so this
@@ -67,7 +96,6 @@ def scratch(db):
         COLL_UNIQUE_DOCUMENTS,
         link_placement,
         new_copy_link,
-        new_document,
         new_unique_document,
     )
 
@@ -81,14 +109,13 @@ def scratch(db):
 
     rows = []
     for row_id, crop in zip(free_row_ids(db, 2), ("Scratch Alpha", "Scratch Beta")):
-        row = new_document(row_id=row_id, unique_document_id=doc["_id"],
-                           state="State Scratchland", crop=crop, source="upload")
+        row = _placement_row(db, row_id=row_id, unique_document_id=doc["_id"],
+                             state="State Scratchland", crop=crop, source="upload")
         row["_id"] = db[COLL_DOCUMENTS].insert_one(row).inserted_id
         link_placement(db, doc["_id"], row_obj_id=row["_id"], row_id=row_id,
                        copy_link=new_copy_link(zoho_file_id=f"fid{row_id}",
                                                shareable_link=f"http://example/{row_id}",
-                                               shareable_name="scratch-test.pdf",
-                                               state="Scratchland", crop=crop))
+                                               shareable_name="scratch-test.pdf"))
         rows.append(row)
     yield db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc["_id"]}), rows
 
@@ -419,7 +446,7 @@ def test_merge_does_not_move_the_anchor(client, db, scratch):
     from dashboard.display_id import free_display_ids, free_row_ids
     from dashboard.models import (
         COLL_DOCUMENTS, COLL_UNIQUE_DOCUMENTS, link_placement,
-        new_copy_link, new_document, new_unique_document,
+        new_copy_link, new_unique_document,
     )
 
     survivor, _rows = scratch
@@ -429,13 +456,12 @@ def test_merge_does_not_move_the_anchor(client, db, scratch):
                                 representative_file_id="fidOTHER")
     other["_id"] = db[COLL_UNIQUE_DOCUMENTS].insert_one(other).inserted_id
     row_id = free_row_ids(db, 1)[0]
-    row = new_document(row_id=row_id, unique_document_id=other["_id"],
-                       state="State Scratchland", crop="Scratch Delta", source="upload")
+    row = _placement_row(db, row_id=row_id, unique_document_id=other["_id"],
+                         state="State Scratchland", crop="Scratch Delta", source="upload")
     row["_id"] = db[COLL_DOCUMENTS].insert_one(row).inserted_id
     link_placement(db, other["_id"], row_obj_id=row["_id"], row_id=row_id,
                    copy_link=new_copy_link(zoho_file_id="fidOTHER", shareable_link="http://example/o",
-                                           shareable_name="other.pdf",
-                                           state="Scratchland", crop="Scratch Delta"))
+                                           shareable_name="other.pdf"))
     try:
         client.post(f"/dashboard/unique-documents/{survivor['_id']}/merge",
                     json={"absorb": [str(other["_id"])]})
@@ -467,11 +493,13 @@ def test_patch_metadata_goes_to_the_document(client, scratch):
 
 def test_patch_placement_stays_on_the_row(client, db, scratch):
     doc, rows = scratch
-    resp = client.patch(f"/dashboard/documents/{rows[0]['_id']}", json={"crop": "moved crop"})
+    resp = client.patch(f"/dashboard/documents/{rows[0]['_id']}", json={"organization": "moved crop"})
     assert resp.json()["crop"] == "Moved Crop"  # normalised
+    assert resp.json()["crop_kind"] == "organization"
     # The other placement is untouched.
     assert client.get(f"/dashboard/documents/{rows[1]['_id']}").json()["crop"] == "Scratch Beta"
-    # The copy entry on the document records the folder, so it moves too.
+    # The copy entry reads its folder from the placement, so it shows the move
+    # without anything having written to the document.
     out = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()
     moved = [l for l in out["duplicate_links"] if l["row_id"] == rows[0]["row_id"]]
     assert moved and moved[0]["crop"] == "Moved Crop"
@@ -483,9 +511,12 @@ def test_patch_keeps_the_raw_name(db, client, scratch):
     from dashboard.models import COLL_DOCUMENTS
 
     _doc, rows = scratch
+    from dashboard import vocabulary
+
     client.patch(f"/dashboard/documents/{rows[0]['_id']}", json={"state": "State Karnataka"})
     stored = db[COLL_DOCUMENTS].find_one({"_id": rows[0]["_id"]})
-    assert stored["state"] == "Karnataka" and stored["state_raw"] == "State Karnataka"
+    assert vocabulary.get(db, "state", stored["state_id"])["name"] == "Karnataka"
+    assert stored["state_raw"] == "State Karnataka"
 
 
 def test_language_must_come_from_the_collection(client, scratch):
@@ -636,7 +667,7 @@ def test_merge_repoints_placements_and_never_deletes_a_row(client, db, scratch):
     from dashboard.display_id import free_display_ids, free_row_ids
     from dashboard.models import (
         COLL_DOCUMENTS, COLL_UNIQUE_DOCUMENTS, link_placement,
-        new_copy_link, new_document, new_unique_document,
+        new_copy_link, new_unique_document,
     )
 
     survivor, survivor_rows = scratch
@@ -644,13 +675,12 @@ def test_merge_repoints_placements_and_never_deletes_a_row(client, db, scratch):
                                 sha256="mergeme" + "0" * 57, shareable_name="merge-me.pdf")
     other["_id"] = db[COLL_UNIQUE_DOCUMENTS].insert_one(other).inserted_id
     row_id = free_row_ids(db, 1)[0]
-    row = new_document(row_id=row_id, unique_document_id=other["_id"],
-                       state="State Scratchland", crop="Scratch Gamma", source="upload")
+    row = _placement_row(db, row_id=row_id, unique_document_id=other["_id"],
+                         state="State Scratchland", crop="Scratch Gamma", source="upload")
     row["_id"] = db[COLL_DOCUMENTS].insert_one(row).inserted_id
     link_placement(db, other["_id"], row_obj_id=row["_id"], row_id=row_id,
                    copy_link=new_copy_link(zoho_file_id="fidX", shareable_link="http://example/x",
-                                           shareable_name="merge-me.pdf",
-                                           state="Scratchland", crop="Scratch Gamma"))
+                                           shareable_name="merge-me.pdf"))
     rows_before = db[COLL_DOCUMENTS].count_documents({})
     try:
         result = client.post(f"/dashboard/unique-documents/{survivor['_id']}/merge",
@@ -698,29 +728,53 @@ def test_states_and_crops_are_vocabularies(client):
     assert all(not c["name"].startswith("State ") for c in client.get("/dashboard/crops").json())
 
 
-def test_a_new_crop_can_be_added_and_appears_in_the_dropdown(client, db):
-    """The upload form lets the team type a crop nobody has used before; it has
-    to be in their own dropdown afterwards."""
-    from dashboard.models import COLL_CROPS
+def test_a_new_organization_can_be_added_and_appears_in_the_dropdown(client, db):
+    """The team can add an organisation nobody has used before; it has to be in
+    their own dropdown afterwards."""
+    from dashboard.models import COLL_ORGANIZATIONS
 
-    name = "zz test crop for schema check"
+    name = "zz test organisation for schema check"
     try:
-        created = client.post("/dashboard/crops", json={"name": name}).json()
-        assert created["name"] == "Zz Test Crop For Schema Check"  # normalised
-        assert name in created["raw_names"]                        # ...reversibly
-        assert any(c["name"] == created["name"] for c in client.get("/dashboard/crops").json())
+        created = client.post("/dashboard/organizations", json={"name": name}).json()
+        assert created["name"] == "Zz Test Organisation For Schema Check"  # normalised
+        assert name in created["raw_names"]                                # ...reversibly
+        assert any(o["name"] == created["name"] for o in client.get("/dashboard/organizations").json())
         # Idempotent: asking twice is not an error.
-        assert client.post("/dashboard/crops", json={"name": name}).status_code == 201
-        assert client.post("/dashboard/crops", json={}).status_code == 400
+        assert client.post("/dashboard/organizations", json={"name": name}).status_code == 201
+        assert client.post("/dashboard/organizations", json={}).status_code == 400
     finally:
-        db[COLL_CROPS].delete_one({"name": "Zz Test Crop For Schema Check"})
+        db[COLL_ORGANIZATIONS].delete_one({"name": "Zz Test Organisation For Schema Check"})
 
 
-def test_upload_registers_an_unseen_crop(client, db):
-    """create_placements() is what a decision calls, so a crop introduced by an
-    upload joins the vocabulary without a separate step."""
+def test_crops_cannot_be_written_here(client):
+    """The crop master is maintained by another application. Every write is a
+    403 that says so -- not a 405 a caller has to puzzle over."""
+    crop = client.get("/dashboard/crops").json()[0]
+    for method, path, body in (
+        ("post", "/dashboard/crops", {"name": "Zz New Crop"}),
+        ("patch", f"/dashboard/crops/{crop['id']}", {"name": "Renamed"}),
+        ("post", f"/dashboard/crops/{crop['id']}/merge", {"absorb": [crop["id"]]}),
+        ("delete", f"/dashboard/crops/{crop['id']}", None),
+    ):
+        resp = getattr(client, method)(path, **({"json": body} if body is not None else {}))
+        assert resp.status_code == 403 and "crop master" in resp.json()["detail"], (method, path)
+
+
+def test_the_crop_dropdown_never_offers_pesticides(client, db):
+    from dashboard.db import crops_collection
+
+    chemicals = {c["name"] for c in crops_collection(db).find({"type": "chemical"}, {"name": 1})}
+    offered = {c["name"] for c in client.get("/dashboard/crops").json()}
+    assert offered and not (offered & chemicals)
+
+
+def test_upload_registers_an_unseen_organization_but_never_a_crop(client, db):
+    """create_placements() is what a decision calls, so an organisation
+    introduced by an upload joins the vocabulary without a separate step. A
+    crop cannot be introduced that way: it fails loudly instead of being filed
+    as something else."""
     from dashboard.db import get_database
-    from dashboard.models import COLL_CROPS, COLL_DOCUMENTS, COLL_UNIQUE_DOCUMENTS
+    from dashboard.models import COLL_DOCUMENTS, COLL_ORGANIZATIONS, COLL_UNIQUE_DOCUMENTS
     from dashboard.display_id import free_display_ids
     from dashboard.models import new_unique_document
     from dashboard.queue_worker import create_placements
@@ -729,16 +783,18 @@ def test_upload_registers_an_unseen_crop(client, db):
     doc = new_unique_document(display_id=free_display_ids(live, 1)[0], sha256="vocab" + "0" * 59)
     doc["_id"] = live[COLL_UNIQUE_DOCUMENTS].insert_one(doc).inserted_id
     try:
-        rows = create_placements(live, document=doc,
-                                 placements=[{"state": "Karnataka", "crop": "Zz Brand New Crop"}],
-                                 copy={"zoho_file_id": "fidV", "shareable_link": "http://example/v",
-                                       "shareable_name": "v.pdf"})
-        assert len(rows) == 1
-        assert live[COLL_CROPS].find_one({"name": "Zz Brand New Crop"}) is not None
+        copy = {"zoho_file_id": "fidV", "shareable_link": "http://example/v", "shareable_name": "v.pdf"}
+        rows = create_placements(live, document=doc, copy=copy, placements=[
+            {"state": "Karnataka", "crop": "Zz Brand New Org", "crop_kind": "organization"}])
+        assert len(rows) == 1 and rows[0]["organization_id"]
+        assert live[COLL_ORGANIZATIONS].find_one({"name": "Zz Brand New Org"}) is not None
+        with pytest.raises(ValueError, match="not a crop in the crop master"):
+            create_placements(live, document=doc, copy=copy, placements=[
+                {"state": "Karnataka", "crop": "Zz Brand New Crop", "crop_kind": "crop"}])
     finally:
         live[COLL_DOCUMENTS].delete_many({"unique_document_id": doc["_id"]})
         live[COLL_UNIQUE_DOCUMENTS].delete_one({"_id": doc["_id"]})
-        live[COLL_CROPS].delete_one({"name": "Zz Brand New Crop"})
+        live[COLL_ORGANIZATIONS].delete_one({"name": "Zz Brand New Org"})
 
 
 def test_document_carries_its_own_shareable_link(client, db):
@@ -770,6 +826,266 @@ def test_crops_can_be_narrowed_by_state(client):
     everything = client.get("/dashboard/crops").json()
     narrowed = client.get("/dashboard/crops?state=Karnataka").json()
     assert 0 < len(narrowed) < len(everything)
+
+
+# -- states, crops and organisations are references ----------------------------
+
+
+def test_every_placement_references_a_real_state_and_one_folder(db):
+    """A placement points at a state and at EXACTLY ONE of a crop master entry or
+    an organisation. An id naming nothing would render as a blank column."""
+    from dashboard.db import crops_collection
+    from dashboard.models import COLL_DOCUMENTS, COLL_ORGANIZATIONS, COLL_STATES
+
+    states = {e["_id"] for e in db[COLL_STATES].find({}, {"_id": 1})}
+    crops = {e["_id"] for e in crops_collection(db).find({"type": {"$ne": "chemical"}}, {"_id": 1})}
+    orgs = {e["_id"] for e in db[COLL_ORGANIZATIONS].find({}, {"_id": 1})}
+    bad = []
+    for r in db[COLL_DOCUMENTS].find({}, {"row_id": 1, "state_id": 1, "crop_id": 1, "organization_id": 1}):
+        if r.get("state_id") not in states or ("crop_id" in r) == ("organization_id" in r) \
+                or ("crop_id" in r and r["crop_id"] not in crops) \
+                or ("organization_id" in r and r["organization_id"] not in orgs):
+            bad.append(r["row_id"])
+    assert bad == [], f"{len(bad)} placement(s) with a bad reference: {bad[:5]}"
+
+
+def test_new_placements_store_ids_not_names(client, db, scratch):
+    """No write path puts a name string back on a placement or a copy link --
+    that duplication is what made renaming a three-collection job."""
+    from dashboard.models import COLL_DOCUMENTS, COLL_UNIQUE_DOCUMENTS
+
+    doc, rows = scratch
+    client.patch(f"/dashboard/documents/{rows[0]['_id']}", json={"organization": "Scratch Moved"})
+    for r in db[COLL_DOCUMENTS].find({"unique_document_id": doc["_id"]}):
+        assert "state" not in r and "crop" not in r, r
+        assert r["state_id"] and r["organization_id"] and "crop_id" not in r
+    for link in db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc["_id"]})["duplicate_links"]:
+        assert "state" not in link and "crop" not in link, link
+
+
+def test_rows_and_copies_show_the_placements_names(client, scratch):
+    doc, rows = scratch
+    row = client.get(f"/dashboard/documents/{rows[0]['_id']}").json()
+    assert (row["state"], row["crop"], row["crop_kind"]) == ("Scratchland", "Scratch Alpha", "organization")
+    assert row["state_id"] and row["organization_id"] and row["crop_id"] is None
+    links = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()["duplicate_links"]
+    assert sorted((l["state"], l["crop"]) for l in links) == [
+        ("Scratchland", "Scratch Alpha"), ("Scratchland", "Scratch Beta")]
+
+
+def test_moving_a_placement_between_a_crop_and_an_organization(client, db, scratch):
+    """Exactly one folder field is set at a time; moving to a crop clears the
+    organisation and back."""
+    from dashboard.models import COLL_DOCUMENTS
+
+    _doc, rows = scratch
+    paddy = client.patch(f"/dashboard/documents/{rows[0]['_id']}", json={"crop": "paddy"}).json()
+    assert (paddy["crop"], paddy["crop_kind"]) == ("Paddy", "crop") and paddy["organization_id"] is None
+    stored = db[COLL_DOCUMENTS].find_one({"_id": rows[0]["_id"]})
+    assert "organization_id" not in stored and stored["crop_raw"] == "paddy"
+
+    back = client.patch(f"/dashboard/documents/{rows[0]['_id']}",
+                        json={"organization_id": str(rows[1]["organization_id"])}).json()
+    assert (back["crop"], back["crop_kind"], back["crop_id"]) == ("Scratch Beta", "organization", None)
+
+    # A crop name the master does not have is refused, not quietly made an organisation.
+    resp = client.patch(f"/dashboard/documents/{rows[0]['_id']}", json={"crop": "Zz Not A Master Crop"})
+    assert resp.status_code == 400 and "crop master" in resp.json()["detail"]
+    assert client.patch(f"/dashboard/documents/{rows[0]['_id']}",
+                        json={"crop": "Paddy", "organization": "X"}).status_code == 400
+
+
+def test_an_old_spelling_finds_the_master_crop(client, db):
+    """Our pre-master names resolve to the master entry through pop_crop_aliases."""
+    from dashboard import vocabulary
+    from dashboard.models import COLL_CROP_ALIASES
+
+    alias = db[COLL_CROP_ALIASES].find_one()
+    if alias is None:
+        pytest.skip("no crop aliases in this database -- the crops migration has not run")
+    crop = vocabulary.find(db, "crop", alias["spelling"].upper())
+    assert crop is not None and crop["_id"] == alias["crop_id"]
+    listed = next(c for c in client.get("/dashboard/crops").json() if c["id"] == str(alias["crop_id"]))
+    assert alias["spelling"] in listed["raw_names"]
+
+
+def test_filters_by_id_by_name_and_by_kind_agree(client, scratch):
+    _doc, rows = scratch
+    row = client.get(f"/dashboard/documents/{rows[0]['_id']}").json()
+    by_id = client.get(f"/dashboard/documents?filter[organization_id]={row['organization_id']}").json()
+    by_name = client.get("/dashboard/documents?filter[crop]=Scratch Alpha").json()
+    assert by_id["total"] == by_name["total"] == 1
+    assert client.get("/dashboard/documents?filter[organization_id]=000000000000000000000000").json()["total"] == 0
+    crops = client.get("/dashboard/documents?filter[crop_kind]=crop").json()["total"]
+    orgs = client.get("/dashboard/documents?filter[crop_kind]=organization").json()["total"]
+    assert crops > 0 and orgs > 0
+    assert crops + orgs == client.get("/dashboard/documents").json()["total"]
+    assert client.get("/dashboard/documents?filter[crop_kind]=fruit").json()["total"] == 0
+    # "Crop" is one column: a crop name and an organisation name both match it.
+    paddy = client.get("/dashboard/documents?filter[crop]=Paddy").json()["total"]
+    both = client.get("/dashboard/documents?filter[crop]=Paddy,Scratch Alpha").json()["total"]
+    assert paddy > 0 and both == paddy + 1
+
+
+def test_renaming_an_organization_renames_it_everywhere(client, db, scratch):
+    """One write. Every placement, copy link and filter follows, and the old
+    spelling still finds it."""
+    from dashboard import vocabulary
+
+    doc, rows = scratch
+    org_id = client.get(f"/dashboard/documents/{rows[0]['_id']}").json()["organization_id"]
+    resp = client.patch(f"/dashboard/organizations/{org_id}", json={"name": "Scratch alpha (standard)"})
+    assert resp.status_code == 200, resp.text
+    out = resp.json()
+    # Stored exactly as sent -- NOT title-cased back to "Scratch Alpha (Standard)".
+    assert out["name"] == "Scratch alpha (standard)"
+    assert "Scratch Alpha" in out["raw_names"] and out["document_count"] == 1
+
+    assert client.get(f"/dashboard/documents/{rows[0]['_id']}").json()["crop"] == "Scratch alpha (standard)"
+    links = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()["duplicate_links"]
+    assert "Scratch alpha (standard)" in [l["crop"] for l in links]
+    assert str(vocabulary.find(db, "organization", "scratch alpha")["_id"]) == org_id
+    assert client.post("/dashboard/organizations", json={"name": "Scratch Alpha"}).json()["id"] == org_id
+
+
+def test_renaming_onto_an_existing_name_is_refused(client, scratch):
+    _doc, rows = scratch
+    a = client.get(f"/dashboard/documents/{rows[0]['_id']}").json()["organization_id"]
+    # Another entry's name, in any letter case, is a merge -- not a rename.
+    resp = client.patch(f"/dashboard/organizations/{a}", json={"name": "SCRATCH BETA"})
+    assert resp.status_code == 409 and "merge" in resp.json()["detail"]
+    # Changing only the letter case of its OWN name is a rename.
+    assert client.patch(f"/dashboard/organizations/{a}", json={"name": "scratch ALPHA"}).json()["name"] == "scratch ALPHA"
+    assert client.patch(f"/dashboard/organizations/{a}", json={"name": "  "}).status_code == 400
+    assert client.patch("/dashboard/organizations/000000000000000000000000", json={"name": "x"}).status_code == 404
+
+
+def test_merging_organizations_repoints_placements(client, db, scratch):
+    from bson import ObjectId
+
+    from dashboard.models import COLL_DOCUMENTS, COLL_ORGANIZATIONS
+
+    _doc, rows = scratch
+    alpha = client.get(f"/dashboard/documents/{rows[0]['_id']}").json()["organization_id"]
+    beta = client.get(f"/dashboard/documents/{rows[1]['_id']}").json()["organization_id"]
+    total_before = db[COLL_DOCUMENTS].count_documents({})
+
+    resp = client.post(f"/dashboard/organizations/{alpha}/merge", json={"absorb": [beta]})
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"id": alpha, "name": "Scratch Alpha", "absorbed": ["Scratch Beta"],
+                           "placements_repointed": 1}
+    assert {client.get(f"/dashboard/documents/{r['_id']}").json()["crop"] for r in rows} == {"Scratch Alpha"}
+    assert db[COLL_DOCUMENTS].count_documents({}) == total_before
+    survivor = db[COLL_ORGANIZATIONS].find_one({"_id": ObjectId(alpha)})
+    assert "Scratch Beta" in survivor["raw_names"]
+    assert db[COLL_ORGANIZATIONS].find_one({"_id": ObjectId(beta)}) is None
+
+    # Validated before anything is written.
+    assert client.post(f"/dashboard/organizations/{alpha}/merge", json={"absorb": []}).status_code == 400
+    assert client.post(f"/dashboard/organizations/{alpha}/merge", json={"absorb": [alpha]}).status_code == 400
+    assert client.post(f"/dashboard/organizations/{alpha}/merge", json={"absorb": ["nope"]}).status_code == 422
+    assert client.post(f"/dashboard/organizations/{alpha}/merge",
+                       json={"absorb": ["000000000000000000000000"]}).status_code == 404
+
+
+def test_merge_repoints_pending_uploads(client, db, vocab_guard):
+    """An upload waiting for review names an organisation too; merging it away
+    must not leave the upload to re-create it when it is filed."""
+    from bson import ObjectId
+
+    from dashboard.models import COLL_UPLOAD_QUEUE_ITEMS
+
+    keep = client.post("/dashboard/organizations", json={"name": "Zz Merge Keep"}).json()
+    gone = client.post("/dashboard/organizations", json={"name": "Zz Merge Gone"}).json()
+    item_id = _submit(client, placements_json='[{"state":"State Karnataka","organizations":["Zz Merge Gone"]}]')
+    try:
+        placement = client.get(f"/dashboard/uploads/{item_id}").json()["placements"][0]
+        assert placement["organization_id"] == gone["id"] and placement["crop_kind"] == "organization"
+        # Something a pending upload uses cannot be deleted out from under it.
+        assert client.delete(f"/dashboard/organizations/{gone['id']}").status_code == 409
+        client.post(f"/dashboard/organizations/{keep['id']}/merge", json={"absorb": [gone["id"]]})
+        placement = db[COLL_UPLOAD_QUEUE_ITEMS].find_one({"_id": ObjectId(item_id)})["placements"][0]
+        assert str(placement["organization_id"]) == keep["id"] and placement["crop"] == "Zz Merge Keep"
+    finally:
+        client.post(f"/dashboard/uploads/{item_id}/cancel")
+
+
+def test_upload_folders_are_checked_against_the_crop_master(client, vocab_guard):
+    """"crops" must be master crops -- an existing organisation's name is
+    accepted there too, for a form that still sends every folder as a crop --
+    and "organizations" may introduce a new one."""
+    org = client.post("/dashboard/organizations", json={"name": "Zz Upload Org"}).json()
+    item_id = _submit(client, placements_json=json.dumps([
+        {"state": "State Karnataka", "crops": ["Paddy", "Zz Upload Org"], "organizations": ["Zz Upload New Org"]}]))
+    try:
+        got = [(p["crop"], p["crop_kind"], bool(p.get("crop_id") or p.get("organization_id")))
+               for p in client.get(f"/dashboard/uploads/{item_id}").json()["placements"]]
+        assert got == [("Paddy", "crop", True), ("Zz Upload Org", "organization", True),
+                       ("Zz Upload New Org", "organization", False)]  # created only when filed
+    finally:
+        client.post(f"/dashboard/uploads/{item_id}/cancel")
+    resp = client.post("/dashboard/uploads", files={"file": ("x.pdf", _MINIMAL_PDF, "application/pdf")},
+                       data={"language": "eng", "placements_json": json.dumps(
+                           [{"state": "State Karnataka", "crops": ["Zz Not A Master Crop"]}])})
+    assert resp.status_code == 400 and "crop master" in resp.json()["detail"]
+    assert client.delete(f"/dashboard/organizations/{org['id']}").status_code == 204
+
+
+def test_an_organization_in_use_cannot_be_deleted(client, scratch):
+    _doc, rows = scratch
+    org_id = client.get(f"/dashboard/documents/{rows[0]['_id']}").json()["organization_id"]
+    resp = client.delete(f"/dashboard/organizations/{org_id}")
+    assert resp.status_code == 409 and "1 placement" in resp.json()["detail"]
+    unused = client.post("/dashboard/organizations", json={"name": "Zz Delete Me"}).json()
+    assert client.delete(f"/dashboard/organizations/{unused['id']}").status_code == 204
+    assert client.delete(f"/dashboard/organizations/{unused['id']}").status_code == 404
+
+
+def test_organization_names_are_unique_regardless_of_case(client, db, vocab_guard):
+    """"ICAR - X" next to "Icar - X" is the duplication this schema removes."""
+    from pymongo.errors import DuplicateKeyError
+
+    from dashboard.models import COLL_ORGANIZATIONS, utcnow
+
+    existing = client.post("/dashboard/organizations", json={"name": "Zz Case Org"}).json()
+    again = client.post("/dashboard/organizations", json={"name": "zz CASE org"}).json()
+    assert again["id"] == existing["id"]
+    with pytest.raises(DuplicateKeyError):
+        db[COLL_ORGANIZATIONS].insert_one({"name": "ZZ CASE ORG", "raw_names": [],
+                                           "created_at": utcnow(), "updated_at": utcnow()})
+    client.delete(f"/dashboard/organizations/{existing['id']}")
+
+
+def test_states_rename_merge_and_delete_like_organizations(client, db, scratch):
+    from dashboard.models import COLL_DOCUMENTS
+
+    _doc, rows = scratch
+    state_id = client.get(f"/dashboard/documents/{rows[0]['_id']}").json()["state_id"]
+    other = client.post("/dashboard/states", json={"name": "Zz Scratch Region"}).json()
+    assert client.delete(f"/dashboard/states/{state_id}").status_code == 409
+
+    renamed = client.patch(f"/dashboard/states/{state_id}", json={"name": "Scratchland Renamed"}).json()
+    assert renamed["name"] == "Scratchland Renamed"
+    assert client.get(f"/dashboard/documents/{rows[1]['_id']}").json()["state"] == "Scratchland Renamed"
+
+    merged = client.post(f"/dashboard/states/{other['id']}/merge", json={"absorb": [state_id]}).json()
+    assert merged["placements_repointed"] == 2 and merged["name"] == "Zz Scratch Region"
+    assert {str(r["state_id"]) for r in db[COLL_DOCUMENTS].find(
+        {"_id": {"$in": [r["_id"] for r in rows]}})} == {other["id"]}
+
+
+def test_lookup_lists_carry_ids_and_live_counts(client, scratch):
+    _doc, rows = scratch
+    org_id = client.get(f"/dashboard/documents/{rows[0]['_id']}").json()["organization_id"]
+    entry = next(o for o in client.get("/dashboard/organizations").json() if o["id"] == org_id)
+    assert entry["document_count"] == 1
+    client.delete(f"/dashboard/documents/{rows[0]['_id']}")
+    entry = next(o for o in client.get("/dashboard/organizations").json() if o["id"] == org_id)
+    assert entry["document_count"] == 0  # computed on read, so a delete cannot leave it stale
+    state_id = client.get(f"/dashboard/documents/{rows[1]['_id']}").json()["state_id"]
+    assert [o["name"] for o in client.get(f"/dashboard/organizations?state_id={state_id}").json()] == ["Scratch Beta"]
+    assert client.get(f"/dashboard/crops?state_id={state_id}").json() == []
+    assert client.get("/dashboard/crops?state=Karnataka").json()
 
 
 def test_languages_include_the_verdicts_and_the_tessdata_pack(client):
@@ -837,8 +1153,10 @@ def test_upload_takes_per_state_crop_groups(client):
     ]))
     try:
         item = client.get(f"/dashboard/uploads/{item_id}").json()
+        # "Ragi" is one of our older spellings of a master crop, so the form
+        # lands on the master's entry rather than on a name the master lacks.
         assert [(p["state"], p["crop"]) for p in item["placements"]] == [
-            ("Karnataka", "Paddy"), ("Karnataka", "Ragi"), ("Kerala", "Coconut")]
+            ("Karnataka", "Paddy"), ("Karnataka", "Finger Millet"), ("Kerala", "Coconut")]
     finally:
         client.post(f"/dashboard/uploads/{item_id}/cancel")
 
@@ -893,8 +1211,12 @@ def test_candidates_report_what_is_new_and_what_is_not(client, db):
     live = get_database()
     known = live[COLL_UNIQUE_DOCUMENTS].find_one({"sha256": {"$ne": None},
                                                   "main_row_ids.1": {"$exists": True}})
+    from dashboard import vocabulary
+
     placed = live[COLL_DOCUMENTS].find_one({"unique_document_id": known["_id"]})
-    asked = [{"state": placed["state"], "crop": placed["crop"]},
+    folder_kind = "crop" if placed.get("crop_id") else "organization"
+    asked = [{"state": vocabulary.get(live, "state", placed["state_id"])["name"],
+              "crop": vocabulary.get(live, folder_kind, placed[vocabulary.field(folder_kind)])["name"]},
              {"state": "Nowhere", "crop": "Nothing"}]
 
     candidates = find_candidates(live, known["sha256"], asked)
@@ -1114,12 +1436,16 @@ def test_documents_carry_only_the_agreed_fields(db):
         "representative_file_id", "representative_row_id",
         "created_at", "updated_at",
     }
+    # `state`/`crop` name strings are tolerated only until
+    # dashboard/migrate_vocabulary_refs.py phase 2 removes them; nothing writes
+    # them any more (see test_new_placements_store_ids_not_names).
     allowed_row = {
-        "_id", "row_id", "unique_document_id", "state", "state_raw",
-        "crop", "crop_raw", "subpath", "source_key", "created_at", "updated_at",
+        "_id", "row_id", "unique_document_id", "state_id", "state_raw",
+        "crop_id", "organization_id", "crop_raw", "subpath", "source_key", "created_at", "updated_at",
+        "state", "crop",
     }
-    allowed_copy = {"zoho_file_id", "shareable_link", "shareable_name",
-                    "state", "crop", "row_id"}
+    allowed_copy = {"zoho_file_id", "shareable_link", "shareable_name", "row_id",
+                    "state", "crop"}
 
     for d in db[COLL_UNIQUE_DOCUMENTS].find().limit(200):
         assert set(d) <= allowed_doc, set(d) - allowed_doc

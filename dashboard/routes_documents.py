@@ -1,24 +1,25 @@
 """CRUD routes for the main table (`documents`) and the documents behind it
 (`unique_documents`).
 
-A main-table row is a pure association -- state, crop, and a pointer. Every
-listing therefore $lookups its unique document and returns a complete row, so
-the frontend renders the table without a second request. Stored split, served
-joined.
+A main-table row is a pure association -- a state id, a crop id, and a pointer.
+Every listing therefore $lookups its unique document, resolves the two ids to
+names, and returns a complete row, so the frontend renders the table without a
+second request. Stored split, served joined.
 
 WHICH COLLECTION A FILTER HITS is decided by _DOCUMENT_FILTERS / _JOINED_FILTERS
-below. Placement filters (state, crop) run BEFORE the join so the (state, crop)
-index does the work; document filters run after it, against the joined field.
+below. Placement filters run BEFORE the join so an index does the work;
+`filter[state]` / `filter[crop]` first turn the typed names into ids, then
+match on those. Document filters run after the join, against the joined field.
 Both are whitelisted, so arbitrary field names can't be injected.
 
 A PATCH is routed the same way: state/crop change the row, everything else
 changes the DOCUMENT and therefore every placement of it. That is the point of
 the split -- editing "the document" is now one write instead of up to 66.
 
-`GET /states`, `/crops` and `/languages` read the lookup collections, which are
-controlled vocabularies for the dropdowns rather than foreign keys. They are
-seeded by the corpus load and upserted, never pruned, so a name the team added
-by hand survives a reload.
+`GET /states`, `/crops`, `/organizations` and `/languages` read the lookups.
+States and organisations can also be renamed, merged and deleted here
+(dashboard/vocabulary.py); a delete is refused while anything still uses the
+entry. Crops come from the crop master, maintained elsewhere, and are read-only.
 """
 from __future__ import annotations
 
@@ -27,23 +28,22 @@ from datetime import date, datetime, time, timedelta
 
 from bson import ObjectId
 from bson.errors import InvalidId
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pymongo import ASCENDING, DESCENDING
 
+from dashboard import vocabulary
 from dashboard.config import PAGE_SIZE
-from dashboard.db import get_db
+from dashboard.db import get_db, get_users_collection
 from dashboard.display_id import format_display_id, format_row_id, parse_display_id, parse_row_id
-from dashboard.languages import LANGUAGES
+from dashboard.languages import LANGUAGES, TESSDATA_BEST
 from dashboard.models import (
-    COLL_CROPS,
     COLL_DOCUMENTS,
     COLL_LANGUAGES,
+    COLL_ORGANIZATIONS,
     COLL_STATES,
     COLL_TRANSLATION_JOBS,
     COLL_UNIQUE_DOCUMENTS,
-    normalize_crop_name,
-    normalize_state_name,
-    remember_vocabulary,
+    normalize_format,
     unlink_placement,
     utcnow,
 )
@@ -52,10 +52,15 @@ from dashboard.schemas import (
     DocumentOut,
     DocumentUpdate,
     LanguageOut,
+    OrganizationOut,
+    UserOut,
     Paginated,
     StateOut,
     UniqueDocumentOut,
     UniqueDocumentUpdate,
+    VocabularyMerge,
+    VocabularyMergeResult,
+    VocabularyRename,
 )
 
 router = APIRouter()
@@ -124,9 +129,9 @@ def _split(value: str) -> list[str]:
     two-state selection quietly filtered on one state. A single comma-joined
     value has one obvious reading.
 
-    A crop with a comma in its name ("Bengal gram, chickpea") therefore cannot
-    be filtered as one term -- it splits. None of the 473 crop names contain a
-    comma today; the state ones do not either.
+    A name with a comma in it ("Ministry of Jal Shakti, Government of India")
+    therefore cannot be filtered as one term by name -- it splits. Filter on
+    filter[crop_id] for those.
     """
     return [part.strip() for part in value.split(",") if part.strip()]
 
@@ -243,12 +248,80 @@ def _range_for(kind: str, low: str | None, high: str | None):
 
 
 # filter[<key>] on fields stored on the PLACEMENT. Applied before the join.
+# `state` and `crop` are not here: they are names, and the placement stores
+# ids -- see _vocabulary_filter.
 _DOCUMENT_FILTERS = {
     "row_id": ("row_id", POP),
-    "state": ("state", TEXT),
-    "crop": ("crop", TEXT),
     "created_at": ("created_at", DATETIME),
 }
+
+
+def _vocabulary_filter(db, request: Request) -> dict | None:
+    """The folder filters, as a clause on the placement's id fields. None when
+    nothing can match.
+
+      filter[state]=<names>              case-insensitive substring, comma = any of
+      filter[state_id]=<ids>             exact, comma = any of
+      filter[crop]=<names>               matches crops AND organisations by name --
+                                         it is the one "Crop" column
+      filter[crop_id]=<ids>              crop master ids
+      filter[organization_id]=<ids>      organisation ids
+      filter[crop_kind]=crop|organization
+    """
+    for key in ("state", "crop"):
+        # A range on a name column is a caller error; answered with an empty
+        # page, as for every other text column, rather than silently ignored.
+        if any(request.query_params.get(f"filter[{key}{suffix}]")
+               for suffix in ("_min", "_max", "_from", "_to")):
+            return None
+
+    def ids_param(name: str) -> set | None:
+        raw = request.query_params.get(f"filter[{name}]")
+        if not raw:
+            return None
+        ids = {vocabulary.to_object_id(v) for v in _split(raw)}
+        ids.discard(None)
+        return ids
+
+    clauses: list[dict] = []
+    # -- state
+    wanted = None
+    if request.query_params.get("filter[state]"):
+        wanted = set(vocabulary.ids_matching(db, "state", _split(request.query_params["filter[state]"])))
+    by_id = ids_param("state_id")
+    if by_id is not None:
+        wanted = by_id if wanted is None else wanted & by_id
+    if wanted is not None:
+        if not wanted:
+            return None
+        clauses.append({"state_id": {"$in": sorted(wanted)}})
+
+    # -- the folder: crop or organisation
+    kind = request.query_params.get("filter[crop_kind]")
+    if kind:
+        if kind not in ("crop", "organization"):
+            return None
+        clauses.append({vocabulary.field(kind): {"$exists": True}})
+    for name in ("crop_id", "organization_id"):
+        ids = ids_param(name)
+        if ids is not None:
+            if not ids:
+                return None
+            clauses.append({name: {"$in": sorted(ids)}})
+    raw_names = request.query_params.get("filter[crop]")
+    if raw_names:
+        values = _split(raw_names)
+        either = [{vocabulary.field(k): {"$in": ids}}
+                  for k in ("crop", "organization")
+                  if (ids := vocabulary.ids_matching(db, k, values))]
+        if not either:
+            return None
+        clauses.append({"$or": either})
+
+    if not clauses:
+        return {}
+    return clauses[0] if len(clauses) == 1 else {"$and": clauses}
+
 
 # filter[<key>] on fields stored on the DOCUMENT. Applied after the join, so the
 # field name is prefixed with the joined alias.
@@ -290,8 +363,9 @@ _JOINED_FILTERS = {
     "year_of_collection": ("year_of_collection", INT),
 }
 
-# Fields a PATCH on a main-table row sends to the DOCUMENT rather than the row.
-_ROW_FIELDS = {"state", "crop"}
+# Fields a PATCH on a main-table row applies to the ROW; everything else goes to
+# the document.
+_ROW_FIELDS = {"state", "crop", "organization", "state_id", "crop_id", "organization_id"}
 
 
 def _build_filter(request: Request, allowed: dict, prefix: str = "") -> dict | None:
@@ -341,15 +415,34 @@ def _empty_page(page: int, page_size: int) -> Paginated:
     return Paginated(items=[], total=0, page=page, page_size=page_size)
 
 
-def _document_out(row: dict) -> DocumentOut:
+def _names(db) -> dict:
+    """id -> name for every vocabulary, loaded once per request."""
+    return {kind: vocabulary.name_map(db, kind) for kind in vocabulary.KINDS}
+
+
+def _folder_of(row: dict, names: dict) -> tuple[str, str | None]:
+    """(name, kind) of the folder a placement is filed under."""
+    if row.get("crop_id") is not None:
+        return names["crop"].get(row["crop_id"], ""), "crop"
+    if row.get("organization_id") is not None:
+        return names["organization"].get(row["organization_id"], ""), "organization"
+    return "", None
+
+
+def _document_out(row: dict, names: dict) -> DocumentOut:
     """A joined row -> the API shape. `row["doc"]` is the unique document, put
-    there by _JOIN_STAGES (or by a manual find for the single-row endpoints)."""
+    there by _JOIN_STAGES (or by a manual find for the single-row endpoints);
+    `names` is _names()."""
     doc = row.get("doc") or {}
     return DocumentOut(
         id=str(row["_id"]),
         row_id=format_row_id(row.get("row_id")) or "",
-        state=row.get("state", ""),
-        crop=row.get("crop", ""),
+        state=names["state"].get(row.get("state_id"), ""),
+        crop=_folder_of(row, names)[0],
+        crop_kind=_folder_of(row, names)[1],
+        state_id=str(row["state_id"]) if row.get("state_id") else None,
+        crop_id=str(row["crop_id"]) if row.get("crop_id") else None,
+        organization_id=str(row["organization_id"]) if row.get("organization_id") else None,
         subpath=row.get("subpath"),
         unique_document_id=str(row.get("unique_document_id", "")),
         document_id=format_display_id(doc.get("display_id")) or "",
@@ -373,8 +466,33 @@ def _document_out(row: dict) -> DocumentOut:
     )
 
 
-def _unique_out(doc: dict) -> UniqueDocumentOut:
+def _copy_places(db, docs: list[dict]) -> dict[int, tuple[str, str]]:
+    """row_id -> (state name, crop name) for every copy on these documents.
+
+    A copy entry names its placement by row_id and carries no folder of its
+    own, so the folder is read from the placement. One query for a whole page.
+    """
+    row_ids = {c.get("row_id") for d in docs for c in (d.get("duplicate_links") or [])}
+    row_ids.discard(None)
+    if not row_ids:
+        return {}
+    names = _names(db)
+    return {
+        r["row_id"]: (names["state"].get(r.get("state_id"), ""), _folder_of(r, names)[0])
+        for r in db[COLL_DOCUMENTS].find(
+            {"row_id": {"$in": list(row_ids)}},
+            {"row_id": 1, "state_id": 1, "crop_id": 1, "organization_id": 1})
+    }
+
+
+def _unique_out(doc: dict, places: dict[int, tuple[str, str]]) -> UniqueDocumentOut:
+    """`places` is _copy_places() for a set of documents including this one."""
     data = dict(doc)
+    links = []
+    for link in data.get("duplicate_links") or []:
+        state, crop = places.get(link.get("row_id"), (None, None))
+        links.append({**link, "state": state, "crop": crop})
+    data["duplicate_links"] = links
     data["id"] = str(data.pop("_id"))
     data["document_id"] = format_display_id(data.pop("display_id", None)) or ""
     data["placement_count"] = len(data.get("main_row_ids") or [])
@@ -395,7 +513,11 @@ def _unique_out(doc: dict) -> UniqueDocumentOut:
 def _joined_one(db, row: dict) -> DocumentOut:
     row = dict(row)
     row["doc"] = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": row.get("unique_document_id")}) or {}
-    return _document_out(row)
+    return _document_out(row, _names(db))
+
+
+def _unique_one(db, doc: dict) -> UniqueDocumentOut:
+    return _unique_out(doc, _copy_places(db, [doc]))
 
 
 # -- the main table ------------------------------------------------------------
@@ -405,12 +527,15 @@ def _joined_one(db, row: dict) -> DocumentOut:
 def list_documents(request: Request, db=Depends(get_db)):
     page, page_size = _pagination(request)
     row_query = _build_filter(request, _DOCUMENT_FILTERS)
+    names_query = _vocabulary_filter(db, request)
     doc_query = _build_filter(request, _JOINED_FILTERS, prefix="doc.")
-    if row_query is None or doc_query is None:
+    if row_query is None or names_query is None or doc_query is None:
         return _empty_page(page, page_size)
+    row_query.update(names_query)
 
-    # Placement filters first so the (state, crop) index narrows the set before
-    # the join runs; document filters after, because they need the joined field.
+    # Placement filters first so the (state_id, crop_id) index narrows the set
+    # before the join runs; document filters after, because they need the
+    # joined field.
     pipeline: list[dict] = []
     if row_query:
         pipeline.append({"$match": row_query})
@@ -427,8 +552,9 @@ def list_documents(request: Request, db=Depends(get_db)):
     }})
     result = next(iter(db[COLL_DOCUMENTS].aggregate(pipeline)), {"items": [], "total": []})
     total = result["total"][0]["n"] if result["total"] else 0
+    names = _names(db)
     return Paginated(
-        items=[_document_out(row) for row in result["items"]],
+        items=[_document_out(row, names) for row in result["items"]],
         total=total,
         page=page,
         page_size=page_size,
@@ -461,7 +587,8 @@ def list_siblings(row_id: str, db=Depends(get_db)):
         *_JOIN_STAGES,
         {"$sort": _PAGE_SORT_AGG},
     ])
-    return [_document_out(other) for other in others]
+    names = _names(db)
+    return [_document_out(other, names) for other in others]
 
 
 @router.patch("/documents/{row_id}", response_model=DocumentOut)
@@ -477,29 +604,62 @@ def update_document(row_id: str, body: DocumentUpdate, db=Depends(get_db)):
     row_updates = {k: v for k, v in submitted.items() if k in _ROW_FIELDS}
     doc_updates = {k: v for k, v in submitted.items() if k not in _ROW_FIELDS}
 
-    # Moving a row to another state/crop keeps the raw name in step, so the
-    # OCR-language lookup and the WorkDrive folder name don't silently point at
-    # the row's previous placement.
-    if row_updates.get("state") is not None:
-        row_updates["state_raw"] = row_updates["state"]
-        row_updates["state"] = normalize_state_name(row_updates["state"])
-    if row_updates.get("crop") is not None:
-        row_updates["crop_raw"] = row_updates["crop"]
-        row_updates["crop"] = normalize_crop_name(row_updates["crop"])
+    # Moving a row: an id must name an existing entry; a state or organisation
+    # name is resolved, and created if nobody has used it; a crop name must be
+    # in the crop master (or be an existing organisation's name). The raw name
+    # moves with it, so the OCR-language lookup and the WorkDrive folder name
+    # don't silently point at the row's previous placement. Nothing on the
+    # document needs touching -- its copy entries read their folder from here.
+    move: dict = {}
+    unset: dict = {}
+    if row_updates.get("state_id") is not None or row_updates.get("state") is not None:
+        if row_updates.get("state_id") is not None:
+            state = vocabulary.get(db, "state", row_updates["state_id"])
+            if state is None:
+                raise HTTPException(400, "state_id does not name an existing state")
+        else:
+            state = vocabulary.resolve(db, "state", row_updates["state"])
+            if state is None:
+                raise HTTPException(400, "state name cannot be empty")
+        move["state_id"] = state["_id"]
+        move["state_raw"] = row_updates.get("state") if row_updates.get("state_id") is None else state["name"]
+
+    folder = None  # (kind, entry, raw)
+    asked = [k for k in ("crop_id", "organization_id", "crop", "organization") if row_updates.get(k) is not None]
+    if len(asked) > 1:
+        raise HTTPException(400, "send only one of crop, crop_id, organization, organization_id")
+    if asked:
+        key, value = asked[0], row_updates[asked[0]]
+        if key in ("crop_id", "organization_id"):
+            kind = "crop" if key == "crop_id" else "organization"
+            entry = vocabulary.get(db, kind, value)
+            if entry is None:
+                raise HTTPException(400, f"{key} does not name an existing {kind}")
+            folder = (kind, entry, entry["name"])
+        elif key == "organization":
+            entry = vocabulary.resolve(db, "organization", value)
+            if entry is None:
+                raise HTTPException(400, "organization name cannot be empty")
+            folder = ("organization", entry, value)
+        else:
+            found = vocabulary.folder(db, value, create=False)
+            if found is None:
+                raise HTTPException(
+                    400, f"{value!r} is not a crop in the crop master -- send it as "
+                         f"\"organization\" if it is an organisation or grouping")
+            folder = (found[0], found[1], value)
+    if folder is not None:
+        kind, entry, raw = folder
+        other = "organization" if kind == "crop" else "crop"
+        move[vocabulary.field(kind)] = entry["_id"]
+        move["crop_raw"] = raw
+        unset[vocabulary.field(other)] = ""
 
     if doc_updates:
         _apply_document_updates(db, row["unique_document_id"], doc_updates)
-    if row_updates:
-        row_updates["updated_at"] = utcnow()
-        db[COLL_DOCUMENTS].update_one({"_id": oid}, {"$set": row_updates})
-        remember_vocabulary(db, state=row_updates.get("state_raw"), crop=row_updates.get("crop_raw"))
-        # The copy entry on the document records which folder this placement is
-        # in, so a move has to update it there too or the two disagree.
-        db[COLL_UNIQUE_DOCUMENTS].update_one(
-            {"_id": row["unique_document_id"], "duplicate_links.row_id": row["row_id"]},
-            {"$set": {f"duplicate_links.$.{k}": v
-                      for k, v in row_updates.items() if k in ("state", "crop")}},
-        )
+    if move:
+        move["updated_at"] = utcnow()
+        db[COLL_DOCUMENTS].update_one({"_id": oid}, {"$set": move, **({"$unset": unset} if unset else {})})
     return _joined_one(db, db[COLL_DOCUMENTS].find_one({"_id": oid}))
 
 
@@ -595,6 +755,8 @@ def delete_unique_document(document_id: str, db=Depends(get_db)):
 def _apply_document_updates(db, unique_document_id, updates: dict) -> None:
     """Validate and write document-level fields. Shared by PATCH /documents and
     PATCH /unique-documents so the two cannot validate differently."""
+    if "format_original" in updates:
+        updates["format_original"] = normalize_format(updates["format_original"])
     if updates.get("language") is not None:
         # Must be a code from the languages collection -- that is the whole
         # reason the collection exists, so free text is refused here.
@@ -676,7 +838,9 @@ def list_unique_documents(request: Request, db=Depends(get_db)):
         .skip((page - 1) * page_size)
         .limit(page_size)
     )
-    return Paginated(items=[_unique_out(row) for row in rows], total=total,
+    rows = list(rows)
+    places = _copy_places(db, rows)
+    return Paginated(items=[_unique_out(row, places) for row in rows], total=total,
                      page=page, page_size=page_size)
 
 
@@ -685,7 +849,7 @@ def get_unique_document(document_id: str, db=Depends(get_db)):
     doc = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": _to_object_id(document_id)})
     if doc is None:
         raise HTTPException(404, "unique document not found")
-    return _unique_out(doc)
+    return _unique_one(db, doc)
 
 
 @router.patch("/unique-documents/{document_id}", response_model=UniqueDocumentOut)
@@ -696,7 +860,7 @@ def update_unique_document(document_id: str, body: UniqueDocumentUpdate, db=Depe
     updates = body.model_dump(exclude_unset=True)
     if updates:
         _apply_document_updates(db, oid, updates)
-    return _unique_out(db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": oid}))
+    return _unique_one(db, db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": oid}))
 
 
 @router.get("/unique-documents/{document_id}/placements", response_model=list[DocumentOut])
@@ -708,10 +872,38 @@ def list_placements(document_id: str, db=Depends(get_db)):
     rows = db[COLL_DOCUMENTS].aggregate([
         {"$match": {"unique_document_id": oid}}, *_JOIN_STAGES, {"$sort": _PAGE_SORT_AGG},
     ])
-    return [_document_out(row) for row in rows]
+    names = _names(db)
+    return [_document_out(row, names) for row in rows]
 
 
 # -- lookups -------------------------------------------------------------------
+
+
+def _entry_out(model, row: dict, counts: dict, spellings: dict | None = None):
+    raw = (spellings or {}).get(row["_id"]) if spellings is not None else row.get("raw_names")
+    return model(id=str(row["_id"]), name=row["name"], raw_names=sorted(raw or []),
+                 document_count=counts.get(row["_id"], 0))
+
+
+def _vocabulary_call(fn, *args):
+    try:
+        return fn(*args)
+    except vocabulary.VocabularyError as e:
+        raise HTTPException(e.status, str(e))
+
+
+def _narrowed_by_state(db, request: Request, kind: str) -> dict | None:
+    """`?state=<name>` / `?state_id=<id>`: only entries actually used under
+    that state -- what the upload form needs. {} when not narrowed, None when
+    the state does not exist."""
+    state_id, state_name = request.query_params.get("state_id"), request.query_params.get("state")
+    if not (state_id or state_name):
+        return {}
+    state = vocabulary.get(db, "state", state_id) if state_id else vocabulary.find(db, "state", state_name)
+    if state is None:
+        return None
+    f = vocabulary.field(kind)
+    return {"_id": {"$in": db[COLL_DOCUMENTS].distinct(f, {"state_id": state["_id"], f: {"$exists": True}})}}
 
 
 @router.get("/states", response_model=list[StateOut])
@@ -719,66 +911,185 @@ def list_states(db=Depends(get_db)):
     """The states vocabulary, for the dropdown. Read from the lookup collection
     rather than derived with distinct(), so a state the team added survives even
     before any row uses it."""
-    return [StateOut(**{k: v for k, v in row.items() if k in StateOut.model_fields})
+    counts = vocabulary.usage_counts(db, "state")
+    return [_entry_out(StateOut, row, counts)
             for row in db[COLL_STATES].find().sort("name", ASCENDING)]
 
 
 @router.get("/crops", response_model=list[CropOut])
 def list_crops(request: Request, db=Depends(get_db)):
-    """The crops vocabulary. `?state=<name>` narrows it to the crops actually
-    filed under one state, which is what the upload form needs -- that one IS
-    derived from the rows, because it is a question about the data."""
-    state = request.query_params.get("state")
-    if state:
-        names = set(db[COLL_DOCUMENTS].distinct("crop", {"state": normalize_state_name(state)}))
-        rows = db[COLL_CROPS].find({"name": {"$in": sorted(n for n in names if n)}})
-    else:
-        rows = db[COLL_CROPS].find()
-    return sorted(
-        (CropOut(**{k: v for k, v in row.items() if k in CropOut.model_fields}) for row in rows),
-        key=lambda c: c.name,
-    )
+    """The crop master's crops (never its pesticides), for the dropdown.
+    `?state=` / `?state_id=` narrows to the crops filed under that state.
+    `raw_names` are our older spellings that resolve to each crop."""
+    query = _narrowed_by_state(db, request, "crop")
+    if query is None:
+        return []
+    counts, spellings = vocabulary.usage_counts(db, "crop"), vocabulary.crop_spellings(db)
+    return sorted((_entry_out(CropOut, row, counts, spellings)
+                   for row in vocabulary.entries(db, "crop", query)),
+                  key=lambda c: c.name.lower())
+
+
+@router.get("/organizations", response_model=list[OrganizationOut])
+def list_organizations(request: Request, db=Depends(get_db)):
+    """Folders that are not crops: organisations, departments, groupings.
+    `?state=` / `?state_id=` narrows to those filed under that state."""
+    query = _narrowed_by_state(db, request, "organization")
+    if query is None:
+        return []
+    counts = vocabulary.usage_counts(db, "organization")
+    return sorted((_entry_out(OrganizationOut, row, counts) for row in db[COLL_ORGANIZATIONS].find(query)),
+                  key=lambda o: o.name.lower())
+
+
+def _create_entry(db, kind: str, body: dict, model):
+    raw = (body or {}).get("name")
+    if not raw or not str(raw).strip():
+        raise HTTPException(400, "name is required")
+    entry = vocabulary.resolve(db, kind, raw)
+    return _entry_out(model, entry, vocabulary.usage_counts(db, kind))
+
+
+def _rename_entry(db, kind: str, entry_id: str, body: VocabularyRename, model):
+    entry = _vocabulary_call(vocabulary.rename, db, kind, entry_id, body.name)
+    return _entry_out(model, entry, vocabulary.usage_counts(db, kind))
+
+
+def _merge_entries(db, kind: str, entry_id: str, body: VocabularyMerge) -> VocabularyMergeResult:
+    result = _vocabulary_call(vocabulary.merge, db, kind, entry_id, body.absorb)
+    return VocabularyMergeResult(
+        id=str(result["survivor"]["_id"]), name=result["survivor"]["name"],
+        absorbed=result["absorbed"], placements_repointed=result["placements_repointed"])
 
 
 @router.post("/states", response_model=StateOut, status_code=201)
 def create_state(body: dict, db=Depends(get_db)):
     """Add a state to the dropdown before anything uses it. Idempotent -- posting
-    an existing name returns it rather than erroring, because the caller's intent
-    ("make sure this exists") is already satisfied."""
-    return _create_vocabulary_entry(db, COLL_STATES, body, normalize_state_name, StateOut)
+    an existing name (in any letter case, or a known alternative spelling)
+    returns that entry rather than erroring, because the caller's intent ("make
+    sure this exists") is already satisfied."""
+    return _create_entry(db, "state", body, StateOut)
 
 
-@router.post("/crops", response_model=CropOut, status_code=201)
-def create_crop(body: dict, db=Depends(get_db)):
-    """Add a crop to the dropdown. The upload form also adds any crop it uses,
-    so this is for creating one ahead of time."""
-    return _create_vocabulary_entry(db, COLL_CROPS, body, normalize_crop_name, CropOut)
+@router.patch("/states/{state_id}", response_model=StateOut)
+def rename_state(state_id: str, body: VocabularyRename, db=Depends(get_db)):
+    """Rename a state. Every placement shows the new name at once. The old name
+    is kept as an alternative spelling. 409 if another state already has the
+    name -- merge into that one instead."""
+    return _rename_entry(db, "state", state_id, body, StateOut)
 
 
-def _create_vocabulary_entry(db, collection, body, normalize, model):
-    raw = (body or {}).get("name")
-    if not raw or not str(raw).strip():
-        raise HTTPException(400, "name is required")
-    remember_vocabulary(
-        db,
-        state=raw if collection == COLL_STATES else None,
-        crop=raw if collection == COLL_CROPS else None,
-    )
-    row = db[collection].find_one({"name": normalize(str(raw))})
-    return model(**{k: v for k, v in row.items() if k in model.model_fields})
+@router.post("/states/{state_id}/merge", response_model=VocabularyMergeResult)
+def merge_states(state_id: str, body: VocabularyMerge, db=Depends(get_db)):
+    """Fold the `absorb` states into this one: their placements move here, their
+    names become alternative spellings of this one, and they are deleted."""
+    return _merge_entries(db, "state", state_id, body)
+
+
+@router.delete("/states/{state_id}", status_code=204)
+def delete_state(state_id: str, db=Depends(get_db)):
+    """Delete a state nothing uses. 409 while any placement or pending upload
+    still references it."""
+    _vocabulary_call(vocabulary.delete, db, "state", state_id)
+
+
+@router.post("/organizations", response_model=OrganizationOut, status_code=201)
+def create_organization(body: dict, db=Depends(get_db)):
+    """Add an organisation or grouping. Idempotent, like POST /states."""
+    return _create_entry(db, "organization", body, OrganizationOut)
+
+
+@router.patch("/organizations/{organization_id}", response_model=OrganizationOut)
+def rename_organization(organization_id: str, body: VocabularyRename, db=Depends(get_db)):
+    """Rename, stored exactly as sent. 409 if another organisation already has
+    the name -- merge into that one instead."""
+    return _rename_entry(db, "organization", organization_id, body, OrganizationOut)
+
+
+@router.post("/organizations/{organization_id}/merge", response_model=VocabularyMergeResult)
+def merge_organizations(organization_id: str, body: VocabularyMerge, db=Depends(get_db)):
+    """Fold the `absorb` organisations into this one."""
+    return _merge_entries(db, "organization", organization_id, body)
+
+
+@router.delete("/organizations/{organization_id}", status_code=204)
+def delete_organization(organization_id: str, db=Depends(get_db)):
+    """Delete an organisation nothing uses. 409 while anything references it."""
+    _vocabulary_call(vocabulary.delete, db, "organization", organization_id)
+
+
+# Crops are read-only here: the crop master is edited from another application.
+# The write routes stay so a caller gets a clear 403 instead of a bare 405.
+@router.post("/crops", status_code=201)
+def create_crop(body: dict | None = None):
+    raise HTTPException(403, vocabulary.READ_ONLY_CROPS)
+
+
+@router.patch("/crops/{crop_id}")
+def rename_crop(crop_id: str, body: dict | None = None):
+    raise HTTPException(403, vocabulary.READ_ONLY_CROPS)
+
+
+@router.post("/crops/{crop_id}/merge")
+def merge_crops(crop_id: str, body: dict | None = None):
+    raise HTTPException(403, vocabulary.READ_ONLY_CROPS)
+
+
+@router.delete("/crops/{crop_id}")
+def delete_crop(crop_id: str):
+    raise HTTPException(403, vocabulary.READ_ONLY_CROPS)
+
+
+@router.get("/users", response_model=list[UserOut])
+def list_users(status: str = Query("active", pattern="^(active|all)$")):
+    """The people a document can be verified by, for the Verified By dropdown.
+
+    Read from the OTHER application's `users` collection (see
+    dashboard/config.py) -- read-only, and projected to name/role/status so
+    nothing else in it is ever loaded.
+
+    status=active (default): active and not blocked. status=all: everyone,
+    each marked active or inactive. Load-test accounts (`loadTestTag`, 83 of
+    the 100 rows on 2026-09-11) are never returned: they are not people.
+
+    A document still stores only the name string in verified_by, so a user
+    renamed or removed later leaves existing documents untouched.
+    """
+    try:
+        rows = list(get_users_collection().find(
+            {"loadTestTag": {"$in": [None, ""]}},
+            {"firstName": 1, "lastName": 1, "role": 1, "status": 1, "isBlocked": 1},
+        ))
+    except Exception as exc:  # noqa: BLE001 -- any failure means "no list"; the form falls back
+        raise HTTPException(503, f"user list unavailable: {type(exc).__name__}") from exc
+    out = []
+    for r in rows:
+        name = " ".join(x.strip() for x in (r.get("firstName"), r.get("lastName")) if x and x.strip())
+        if not name:
+            continue
+        active = r.get("status") == "active" and not r.get("isBlocked")
+        if status == "active" and not active:
+            continue
+        out.append(UserOut(id=str(r["_id"]), name=name, role=r.get("role"),
+                           status="active" if active else "inactive"))
+    return sorted(out, key=lambda u: u.name.lower())
 
 
 @router.get("/languages", response_model=list[LanguageOut])
 def list_languages(db=Depends(get_db)):
-    """The languages vocabulary: the 14 tessdata_best languages plus
+    """The languages vocabulary: English, the 22 Eighth Schedule languages, and
     Non-English, which is not a language but IS what the OCR pass concluded for
-    761 documents, so the team needs it in the list to refine them from."""
+    761 documents, so the team needs it in the list to refine them from.
+    `tessdata_best` says whether each one can be OCR'd."""
     rows = list(db[COLL_LANGUAGES].find())
     if not rows:
         # The collection is seeded by the corpus load; fall back to the static
         # list so a fresh database still serves a usable dropdown.
-        return [LanguageOut(code=c, label=l) for c, l in sorted(LANGUAGES.items(), key=lambda kv: kv[1])]
-    return sorted((LanguageOut(code=r["code"], label=r["label"]) for r in rows), key=lambda l: l.label)
+        return [LanguageOut(code=c, label=l, tessdata_best=c in TESSDATA_BEST)
+                for c, l in sorted(LANGUAGES.items(), key=lambda kv: kv[1])]
+    return sorted((LanguageOut(code=r["code"], label=r["label"],
+                               tessdata_best=r.get("tessdata_best")) for r in rows),
+                  key=lambda l: l.label)
 
 
 @router.get("/stats")
@@ -795,7 +1106,8 @@ def stats(db=Depends(get_db)):
         "documents": rows.count_documents({}),
         "files": docs.count_documents({}),
         "states": db[COLL_STATES].count_documents({}),
-        "crops": db[COLL_CROPS].count_documents({}),
+        "crops": vocabulary.coll(db, "crop").count_documents({"type": {"$ne": "chemical"}}),
+        "organizations": db[COLL_ORGANIZATIONS].count_documents({}),
         "translated": docs.count_documents({"translation_status": "done"}),
         "reviewed": docs.count_documents({"review_status": "done"}),
     }

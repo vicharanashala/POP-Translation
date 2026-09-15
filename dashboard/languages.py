@@ -1,8 +1,16 @@
-"""The OCR languages an upload may declare.
+"""The languages a document may be tagged with.
 
-Keys are tessdata_best codes -- exactly what the OCR pass expects -- and they
-are what `GET /dashboard/languages` offers and what the upload form's
-`language` field must contain.
+English plus the 22 languages of the Eighth Schedule. Keys are 3-letter codes:
+the tessdata code where tessdata_best has a model -- exactly what the OCR pass
+expects -- and the ISO 639-2/3 code otherwise. They are what
+`GET /dashboard/languages` offers and what the upload form's `language` field
+must contain.
+
+Not every language here can be OCR'd. TESSDATA_BEST marks the ones
+tessdata_best publishes a model for (checked against the upstream repo,
+2026-09-11); the rest are listed because the agri team needs to tag documents
+in them, not because the pipeline can read them. Two that DO have an upstream
+model -- san, snd -- are not downloaded into ./tessdata_best.
 
 Lives here rather than in the old dashboard/dedup.py, which is gone along with
 the embedding pipeline. Nothing in this module loads a model or touches the
@@ -26,19 +34,35 @@ from __future__ import annotations
 LANGUAGES = {
     "asm": "Assamese",
     "ben": "Bengali",
+    "brx": "Bodo",
+    "doi": "Dogri",
     "eng": "English",
     "guj": "Gujarati",
     "hin": "Hindi",
     "kan": "Kannada",
+    "kas": "Kashmiri",
+    "kok": "Konkani",
+    "mai": "Maithili",
     "mal": "Malayalam",
+    "mni": "Manipuri (Meitei)",
     "mar": "Marathi",
     "nep": "Nepali",
     "ori": "Odia",
     "pan": "Punjabi",
+    "san": "Sanskrit",
+    "sat": "Santali",
+    "snd": "Sindhi",
     "tam": "Tamil",
     "tel": "Telugu",
     "urd": "Urdu",
 }
+
+# The LANGUAGES codes tessdata_best has a model for. brx, doi, kas, kok, mai,
+# mni and sat have none upstream.
+TESSDATA_BEST = frozenset({
+    "asm", "ben", "eng", "guj", "hin", "kan", "mal", "mar",
+    "nep", "ori", "pan", "san", "snd", "tam", "tel", "urd",
+})
 
 
 # The tessdata model to use for a document in each state, keyed by the state's

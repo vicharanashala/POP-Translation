@@ -40,29 +40,82 @@ class Paginated(BaseModel, Generic[T]):
 
 
 # -- Lookups (controlled vocabularies for the dashboard's dropdowns) ----------
-# Not foreign keys: rows store the name/code as a plain string. These exist so
-# the agri team picks from a list instead of typing a new spelling of a state
-# that already exists.
+# States, crops and organisations are REFERENCED by id from every placement --
+# the name lives only in the lookup (dashboard/vocabulary.py). Crops come from
+# the crop master and are read-only here. Languages are still a plain code.
+
+
+class UserOut(BaseModel):
+    """Someone a document can be verified by. Only what the dropdown needs --
+    the source collection holds far more, none of which leaves the server."""
+    id: str
+    name: str  # "First Last" -- what is stored in a document's verified_by
+    role: str | None = None
+    status: str  # "active" | "inactive"
 
 
 class LanguageOut(BaseModel):
     code: str  # "kan", or "non_english" for the OCR pass's Non-English verdict
     label: str  # "Kannada" / "Non-English"
+    # Whether tessdata_best has an OCR model for it. None for Non-English,
+    # which is a verdict rather than a language.
+    tessdata_best: bool | None = None
 
 
 class StateOut(BaseModel):
+    id: str  # ObjectId hex -- what a placement's state_id holds
     name: str
-    # Every source spelling that normalised to this name ("State Karnataka").
-    # Kept so the lookup stays reversible -- the OCR language for a document is
-    # keyed off the RAW state name, not this one.
+    # Every other spelling that means this entry: source folder names ("State
+    # Karnataka") and names merged or renamed away. A form typing any of them
+    # resolves here instead of creating a new entry.
     raw_names: list[str] = []
+    # Placements using it, computed on read.
     document_count: int = 0
 
 
 class CropOut(BaseModel):
+    """A crop master entry. Read-only: maintained by another application."""
+
+    id: str  # the master's ObjectId -- what a placement's crop_id holds
+    name: str
+    # Our older spellings that resolve to this crop ("Ground Nut"). Not the
+    # master's own `aliases`, which are regional names.
+    raw_names: list[str] = []
+    document_count: int = 0
+
+
+class OrganizationOut(BaseModel):
+    """A folder that is not a crop: an organisation, department or grouping
+    ("ICAR - ...", "General"). Ours, so it can be renamed, merged and deleted."""
+
+    id: str
     name: str
     raw_names: list[str] = []
     document_count: int = 0
+
+
+class VocabularyCreate(BaseModel):
+    name: str
+
+
+class VocabularyRename(BaseModel):
+    """Set the name exactly as given -- it is not re-cased, so the team's
+    standard spelling ("Beet root") is kept."""
+
+    name: str
+
+
+class VocabularyMerge(BaseModel):
+    """Fold these entries (ObjectId hex) into the one being POSTed to."""
+
+    absorb: list[str]
+
+
+class VocabularyMergeResult(BaseModel):
+    id: str
+    name: str  # the survivor's name
+    absorbed: list[str]  # names of the entries merged in, now deleted
+    placements_repointed: int
 
 
 # -- The document (unique_documents) ------------------------------------------
@@ -100,6 +153,8 @@ class CopyLink(BaseModel):
     zoho_file_id: str | None = None
     shareable_link: str | None = None
     shareable_name: str | None = None
+    # The folder of the placement named by row_id, read from that placement --
+    # not stored on the copy.
     state: str | None = None
     crop: str | None = None
     row_id: int | None = None
@@ -178,8 +233,14 @@ class DocumentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str  # ObjectId of the PLACEMENT, 24-char hex
     row_id: str  # POP_##### -- names the placement
-    state: str
+    state: str  # the name, resolved from state_id
+    # The folder under the state: a crop's name, or an organisation's. Which
+    # one is `crop_kind`, and exactly one of crop_id / organization_id is set.
     crop: str
+    crop_kind: str | None = None  # "crop" | "organization"
+    state_id: str | None = None
+    crop_id: str | None = None
+    organization_id: str | None = None
     # Anything nested deeper than <state>/<crop>/<file> in WorkDrive. Normally
     # empty; present so an unexpected folder level is visible rather than
     # silently reassigning the file to another crop.
@@ -216,13 +277,21 @@ class DocumentOut(BaseModel):
 class DocumentUpdate(DocumentMetadata):
     """PATCH body for a main-table row.
 
-    `state`/`crop` change the placement. Every other field belongs to the
-    document and is written there, so it changes for all of its placements --
-    the endpoint routes them rather than making the caller know which is which.
+    The placement moves with `state`/`state_id`, and with ONE of `crop` /
+    `crop_id` (a crop master entry) or `organization` / `organization_id`. A
+    crop must exist in the master; a new state or organisation name is created.
+    `crop` as a name also accepts an existing organisation's name. Every other
+    field belongs to the document and is written there, so it changes for all of
+    its placements -- the endpoint routes them rather than making the caller
+    know which is which.
     """
 
     state: str | None = None
     crop: str | None = None
+    organization: str | None = None
+    state_id: str | None = None
+    crop_id: str | None = None
+    organization_id: str | None = None
     shareable_name: str | None = None
     language: str | None = None
     num_pages: int | None = None
@@ -273,10 +342,16 @@ class MergeResult(BaseModel):
 
 
 class Placement(BaseModel):
-    """A (state, crop) pair, normalised."""
+    """A (state, folder) pair, the folder being a crop or an organisation.
+    Names for display; ids where the entry already exists (a state or
+    organisation the form introduces gets its id when the upload is filed)."""
 
     state: str
-    crop: str
+    crop: str  # the folder's name, crop or organisation
+    crop_kind: str | None = None  # "crop" | "organization"
+    state_id: str | None = None
+    crop_id: str | None = None
+    organization_id: str | None = None
 
 
 class UploadCandidate(BaseModel):
