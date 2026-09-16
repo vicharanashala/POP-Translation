@@ -68,7 +68,6 @@ from run_pop_to_docx_updated_pagewise_docx import (  # noqa: E402
     safe_docx_name,
     set_log_file,
     split_pdf_to_page_folders,
-    translate_pages,
 )
 
 import _job_ctl as ctl  # noqa: E402
@@ -724,6 +723,74 @@ def _job_view(job: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
+
+def _translate_pages_tracked(
+    page_pdf_files: list[Path],
+    req: PopRequest,
+    api_key: str,
+    prompt: str,
+    on_progress: Callable[[int, int], None] | None,
+) -> list[dict]:
+    """Translate every page, `req.concurrency` at a time.
+
+    Not the script's own translate_pages(): its parallel branch reports no
+    progress and cannot be cancelled -- the cancel check and the job's
+    captured stdout are thread-local, and its pool threads have neither. Here
+    each page thread inherits both, checks for a cancel before it starts, and
+    progress is reported as pages complete (in completion order).
+    """
+    import time as _t
+    from concurrent.futures import as_completed
+
+    workers = max(1, req.concurrency)
+    total = len(page_pdf_files)
+    job_id = ctl.current_job_id()
+    stdout_buf = getattr(_tl_stdout, "buf", None)
+    started = _t.perf_counter()
+    pipeline_log(
+        f"Translation stage started | pages={total} | concurrency={workers} | "
+        f"provider={LLM_PROVIDER} | model={req.model} | google_search={not req.disable_google_search}"
+    )
+
+    def one(pdf_path: Path) -> dict:
+        ctl.set_job_id(job_id)
+        _tl_stdout.buf = stdout_buf
+        try:
+            ctl.check_cancel()
+            pipeline_log(f"Translation progress | starting page={pdf_path.parent.name}")
+            return process_translation_for_page(
+                page_pdf_path=pdf_path,
+                prompt=prompt,
+                model=req.model,
+                api_key=api_key,
+                overwrite_existing=req.overwrite,
+                max_retries=req.max_retries,
+                retry_wait_seconds=req.retry_wait_seconds,
+                enable_google_search=not req.disable_google_search,
+                provider=LLM_PROVIDER,
+            )
+        finally:
+            _tl_stdout.buf = None
+
+    summary: list[dict] = []
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="translate-page")
+    try:
+        futures = [pool.submit(one, path) for path in page_pdf_files]
+        for done, future in enumerate(as_completed(futures), start=1):
+            result = future.result()  # re-raises JobCancelled from a page thread
+            summary.append(result)
+            pipeline_log(f"Translation progress | completed {done}/{total} | status={result.get('status')}")
+            if on_progress:
+                on_progress(done, total)
+            ctl.check_cancel()
+    finally:
+        # On cancel or error, pages not yet started are dropped; the few already
+        # running finish their current call and are discarded.
+        pool.shutdown(wait=True, cancel_futures=True)
+    summary.sort(key=lambda x: x["page"])
+    log_translation_summary(summary, _t.perf_counter() - started)
+    return summary
+
 def _run_one_doc(
     source_pdf_path: Path,
     doc_name: str,
@@ -751,48 +818,9 @@ def _run_one_doc(
 
     # 2. Translate
     if not req.skip_translation:
-        if req.concurrency <= 1:
-            import time as _t
-            _stage_start = _t.perf_counter()
-            translation_summary = []
-            total_pages_t = len(page_pdf_files)
-            pipeline_log(
-                f"Translation stage started | pages={total_pages_t} | "
-                f"concurrency=1 | provider={LLM_PROVIDER} | model={req.model} | "
-                f"google_search={not req.disable_google_search}"
-            )
-            for idx, pdf_path in enumerate(page_pdf_files, start=1):
-                ctl.check_cancel()
-                pipeline_log(f"Translation progress | starting {idx}/{total_pages_t} | page={pdf_path.parent.name}")
-                result = process_translation_for_page(
-                    page_pdf_path=pdf_path,
-                    prompt=prompt,
-                    model=req.model,
-                    api_key=api_key,
-                    overwrite_existing=req.overwrite,
-                    max_retries=req.max_retries,
-                    retry_wait_seconds=req.retry_wait_seconds,
-                    enable_google_search=not req.disable_google_search,
-                    provider=LLM_PROVIDER,
-                )
-                translation_summary.append(result)
-                pipeline_log(f"Translation progress | completed {idx}/{total_pages_t} | page={pdf_path.parent.name}")
-                if on_progress:
-                    on_progress(idx, total_pages_t)
-            log_translation_summary(translation_summary, _t.perf_counter() - _stage_start)
-        else:
-            translation_summary = translate_pages(
-                page_pdf_files=page_pdf_files,
-                prompt=prompt,
-                model=req.model,
-                api_key=api_key,
-                overwrite_existing=req.overwrite,
-                max_retries=req.max_retries,
-                retry_wait_seconds=req.retry_wait_seconds,
-                enable_google_search=not req.disable_google_search,
-                concurrency=req.concurrency,
-                provider=LLM_PROVIDER,
-            )
+        translation_summary = _translate_pages_tracked(
+            page_pdf_files, req, api_key, prompt, on_progress
+        )
         (workdir_root / "translation_summary.json").write_text(
             json.dumps(translation_summary, indent=2, ensure_ascii=False), encoding="utf-8"
         )
@@ -962,6 +990,8 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+    # So the frontend can read a download's real name (and size/range).
+    expose_headers=["Content-Disposition", "Content-Length", "Content-Range", "Accept-Ranges"],
 )
 
 # ---------------------------------------------------------------------------
@@ -975,12 +1005,14 @@ from dashboard.routes_uploads import router as _dashboard_uploads_router
 from dashboard.routes_translation import router as _dashboard_translation_router
 from dashboard.routes_merge import router as _dashboard_merge_router
 from dashboard.routes_files import router as _dashboard_files_router
+from dashboard.events import router as _dashboard_events_router
 
 app.include_router(_dashboard_documents_router, prefix="/dashboard", tags=["dashboard"])
 app.include_router(_dashboard_uploads_router, prefix="/dashboard", tags=["dashboard"])
 app.include_router(_dashboard_translation_router, prefix="/dashboard", tags=["dashboard"])
 app.include_router(_dashboard_merge_router, prefix="/dashboard", tags=["dashboard"])
 app.include_router(_dashboard_files_router, prefix="/dashboard", tags=["dashboard"])
+app.include_router(_dashboard_events_router, prefix="/dashboard", tags=["dashboard"])
 # No dedup router: this schema has no embeddings and no duplicate-review flow.
 # Duplicates are expected in the main table and grouping them is a later job.
 

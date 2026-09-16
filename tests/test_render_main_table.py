@@ -1450,6 +1450,7 @@ def test_documents_carry_only_the_agreed_fields(db):
         "document_status",
         "translation_status", "translation_zoho_file_id", "translation_shareable_link",
         "review_status", "review_zoho_file_id", "review_shareable_link",
+        "translated_by", "translated_at", "reviewed_by", "reviewed_at",
         "chunk_embeddings", "main_row_ids", "duplicate_links", "merged_from",
         "representative_file_id", "representative_row_id",
         "created_at", "updated_at",
@@ -1471,3 +1472,150 @@ def test_documents_carry_only_the_agreed_fields(db):
             assert set(link) <= allowed_copy, set(link) - allowed_copy
     for r in db[COLL_DOCUMENTS].find().limit(200):
         assert set(r) <= allowed_row, set(r) - allowed_row
+
+
+# -- audit trail, sort, search, downloads, live events -------------------------
+
+
+def test_search_keeps_the_spaces_inside_a_phrase(client, scratch):
+    """Only the ends are trimmed: the words in between are matched as typed."""
+    doc, rows = scratch
+    client.patch(f"/dashboard/documents/{rows[0]['_id']}",
+                 json={"advisory_name": "Scratch crop dan something something"})
+
+    def hits(term):
+        page = client.get("/dashboard/unique-documents",
+                          params={"filter[advisory_name]": term}).json()
+        return {d["id"] for d in page["items"]}
+
+    assert str(doc["_id"]) in hits("  crop dan something ")
+    assert str(doc["_id"]) not in hits("crop something")
+    assert str(doc["_id"]) not in hits("cropdan")
+
+
+def test_audit_fields_are_served_filtered_and_sorted(client, db, scratch):
+    from datetime import datetime, timedelta, timezone
+
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    doc, rows = scratch
+    at = datetime(2020, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": doc["_id"]}, {"$set": {
+        "translated_by": "Scratch Translator", "translated_at": at,
+        "reviewed_by": "Scratch Reviewer", "reviewed_at": at + timedelta(days=1)}})
+
+    one = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()
+    assert one["translated_by"] == "Scratch Translator"
+    assert one["reviewed_by"] == "Scratch Reviewer"
+    assert one["translated_at"].startswith("2020-01-02T03:04:05")
+    row = client.get(f"/dashboard/documents/{rows[0]['_id']}").json()
+    assert row["translated_by"] == "Scratch Translator" and row["reviewed_at"].startswith("2020-01-03")
+
+    for path in ("/dashboard/unique-documents", "/dashboard/documents"):
+        by = client.get(path, params={"filter[translated_by]": "scratch translator"}).json()
+        assert by["total"] >= 1
+        day = client.get(path, params={"filter[reviewed_at_from]": "2020-01-03",
+                                       "filter[reviewed_at_to]": "2020-01-03"}).json()
+        assert day["items"] and all(i["reviewed_at"].startswith("2020-01-03") for i in day["items"])
+
+        # Blanks sort last in BOTH directions.
+        for order in ("translated_at", "-translated_at"):
+            first = client.get(path, params={"sort": order, "page_size": 5}).json()["items"]
+            assert first[0]["translated_at"] is not None
+        oldest = client.get(path, params={"sort": "translated_at",
+                                          "filter[shareable_name]": "scratch-test"}).json()["items"]
+        assert oldest and oldest[0]["translated_by"] == "Scratch Translator"
+
+    assert client.get("/dashboard/unique-documents", params={"sort": "shareable_name"}).status_code == 400
+    assert client.get("/dashboard/documents", params={"sort": "-nope"}).status_code == 400
+
+
+def test_deleting_a_review_clears_who_and_when(client, db, scratch):
+    from datetime import datetime, timezone
+
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    doc, _ = scratch
+    db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": doc["_id"]}, {"$set": {
+        "review_status": "done", "reviewed_by": "Scratch Reviewer",
+        "reviewed_at": datetime.now(timezone.utc),
+        "translation_status": "done", "translated_by": "Scratch Translator",
+        "translated_at": datetime.now(timezone.utc)}})
+    assert client.delete(f"/dashboard/unique-documents/{doc['_id']}/review").status_code == 204
+    assert client.delete(f"/dashboard/unique-documents/{doc['_id']}/translation").status_code == 204
+    out = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()
+    assert (out["reviewed_by"], out["reviewed_at"], out["translated_by"], out["translated_at"]) == (None,) * 4
+
+
+def test_download_names_follow_the_shareable_name(client, scratch):
+    from dashboard.routes_files import download_name
+
+    assert download_name("Paddy_KA_2021.pdf", "x_translated.docx", "_translation") == "Paddy_KA_2021_translation.docx"
+    assert download_name("Rice v1.2 guide.pdf", "r.pdf", "_reviewed") == "Rice v1.2 guide_reviewed.pdf"
+    doc, _ = scratch
+    for kind in ("translation", "review"):
+        assert client.get(f"/dashboard/unique-documents/{doc['_id']}/{kind}/download").status_code == 404
+    assert client.get(f"/dashboard/unique-documents/{doc['_id']}/original/download").status_code == 404
+
+
+def test_translation_jobs_carry_the_unique_document_id(client, db, scratch):
+    from dashboard.models import COLL_TRANSLATION_JOBS, TranslationJobKind, new_translation_job
+
+    doc, _ = scratch
+    job = new_translation_job(document_id=doc["_id"], kind=TranslationJobKind.translate)
+    job["status"] = "done"
+    job_id = db[COLL_TRANSLATION_JOBS].insert_one(job).inserted_id
+    try:
+        jobs = client.get("/dashboard/translation-jobs", params={"status": "done"}).json()
+        mine = next(j for j in jobs if j["id"] == str(job_id))
+        assert mine["unique_document_id"] == str(doc["_id"]) == mine["document_id"]
+    finally:
+        db[COLL_TRANSLATION_JOBS].delete_one({"_id": job_id})
+
+
+def test_events_stream_pushes_queue_changes(client, db, scratch):
+    """Open the stream, delete a finished job, and see the event arrive."""
+    import threading
+
+    from dashboard.models import COLL_TRANSLATION_JOBS, TranslationJobKind, new_translation_job
+
+    doc, _ = scratch
+    job = new_translation_job(document_id=doc["_id"], kind=TranslationJobKind.translate)
+    job["status"] = "done"
+    job_id = db[COLL_TRANSLATION_JOBS].insert_one(job).inserted_id
+    seen = []
+    try:
+        with httpx.Client(base_url=BASE_URL, timeout=20.0) as stream_client:
+            with stream_client.stream("GET", "/dashboard/events") as resp:
+                assert resp.status_code == 200
+                assert resp.headers["content-type"].startswith("text/event-stream")
+                lines = resp.iter_lines()
+                assert any(": connected" in line for line in (next(lines), next(lines)))
+                threading.Timer(0.3, lambda: client.delete(f"/dashboard/translation-jobs/{job_id}")).start()
+                event = None
+                for line in lines:
+                    if line.startswith("event: "):
+                        event = line[7:]
+                    elif line.startswith("data: ") and event == "translation":
+                        data = json.loads(line[6:])
+                        if data.get("id") == str(job_id):
+                            seen.append(data)
+                            break
+    finally:
+        db[COLL_TRANSLATION_JOBS].delete_one({"_id": job_id})
+    assert seen == [{"id": str(job_id), "deleted": True}]
+
+
+def test_row_routes_pass_the_audit_fields_through(client, db, scratch):
+    """The /documents/{row_id}/... wrappers delegate to the document routes;
+    the extra by-name parameters must not shift their arguments."""
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    doc, rows = scratch
+    db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": doc["_id"]}, {"$set": {"translation_status": "in_progress"}})
+    resp = client.post(f"/dashboard/documents/{rows[0]['_id']}/translate", json={"translated_by": "Scratch"})
+    assert resp.status_code in (400, 409, 503), resp.text  # refused, never a 500
+    db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": doc["_id"]}, {"$set": {
+        "translation_status": "done", "translated_by": "Scratch Translator"}})
+    assert client.delete(f"/dashboard/documents/{rows[0]['_id']}/translation").status_code == 204
+    assert client.get(f"/dashboard/unique-documents/{doc['_id']}").json()["translated_by"] is None

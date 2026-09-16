@@ -77,6 +77,32 @@ _NO_MATCH = object()
 _PAGE_SORT = [("created_at", DESCENDING), ("_id", ASCENDING)]
 _PAGE_SORT_AGG = {"created_at": -1, "_id": 1}
 
+# `sort=<field>` / `sort=-<field>` on the two listings. Only the audit
+# timestamps for now; no param keeps the default order above.
+_SORTABLE = ("translated_at", "reviewed_at")
+
+
+def _sort_stages(request: Request, prefix: str = "") -> list[dict]:
+    """The aggregation stages for ?sort=, or [] for the default order.
+
+    Documents with no value sort LAST in both directions -- most documents have
+    never been translated, and "oldest first" should start at the oldest
+    translation, not at thousands of blanks. `_id` breaks ties so skip/limit
+    stays stable.
+    """
+    raw = (request.query_params.get("sort") or "").strip()
+    if not raw:
+        return []
+    field = raw.lstrip("-")
+    if field not in _SORTABLE:
+        raise HTTPException(400, f"sort must be one of {', '.join(_SORTABLE)} (prefix '-' for descending)")
+    path = f"{prefix}{field}"
+    return [
+        {"$addFields": {"_sort_missing": {"$cond": [{"$ifNull": [f"${path}", False]}, 0, 1]}}},
+        {"$sort": {"_sort_missing": 1, path: -1 if raw.startswith("-") else 1, "_id": 1}},
+        {"$project": {"_sort_missing": 0}},
+    ]
+
 # The join, as an aggregation stage pair. `doc` is the unique document; a row
 # whose document has somehow gone missing still comes back (preserveNull...),
 # because dropping it would make a listing silently under-report.
@@ -361,6 +387,11 @@ _JOINED_FILTERS = {
     "date_of_collection": ("date_of_collection", DATE),
     "month_of_collection": ("month_of_collection", INT),
     "year_of_collection": ("year_of_collection", INT),
+    # The audit trail. *_at are real datetimes: a day match, or _from/_to.
+    "translated_by": ("translated_by", TEXT),
+    "translated_at": ("translated_at", DATETIME),
+    "reviewed_by": ("reviewed_by", TEXT),
+    "reviewed_at": ("reviewed_at", DATETIME),
 }
 
 # Fields a PATCH on a main-table row applies to the ROW; everything else goes to
@@ -460,6 +491,10 @@ def _document_out(row: dict, names: dict) -> DocumentOut:
         review_status=doc.get("review_status"),
         review_file_id=doc.get("review_zoho_file_id"),
         review_shareable_link=doc.get("review_shareable_link"),
+        translated_by=doc.get("translated_by"),
+        translated_at=doc.get("translated_at"),
+        reviewed_by=doc.get("reviewed_by"),
+        reviewed_at=doc.get("reviewed_at"),
         placement_count=len(doc.get("main_row_ids") or []) or 1,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -526,6 +561,7 @@ def _unique_one(db, doc: dict) -> UniqueDocumentOut:
 @router.get("/documents", response_model=Paginated[DocumentOut])
 def list_documents(request: Request, db=Depends(get_db)):
     page, page_size = _pagination(request)
+    sort = _sort_stages(request, prefix="doc.") or [{"$sort": _PAGE_SORT_AGG}]
     row_query = _build_filter(request, _DOCUMENT_FILTERS)
     names_query = _vocabulary_filter(db, request)
     doc_query = _build_filter(request, _JOINED_FILTERS, prefix="doc.")
@@ -547,7 +583,7 @@ def list_documents(request: Request, db=Depends(get_db)):
     # the same filtered stream, so the filters cannot be applied differently to
     # the two the way two separate queries could drift.
     pipeline.append({"$facet": {
-        "items": [{"$sort": _PAGE_SORT_AGG}, {"$skip": (page - 1) * page_size}, {"$limit": page_size}],
+        "items": [*sort, {"$skip": (page - 1) * page_size}, {"$limit": page_size}],
         "total": [{"$count": "n"}],
     }})
     result = next(iter(db[COLL_DOCUMENTS].aggregate(pipeline)), {"items": [], "total": []})
@@ -819,6 +855,7 @@ def list_unique_documents(request: Request, db=Depends(get_db)):
     place.
     """
     page, page_size = _pagination(request)
+    sort = _sort_stages(request)
     query = _build_filter(request, _UNIQUE_FILTERS)
     if query is None:
         return _empty_page(page, page_size)
@@ -831,14 +868,18 @@ def list_unique_documents(request: Request, db=Depends(get_db)):
         query["main_row_ids.1"] = value
 
     total = db[COLL_UNIQUE_DOCUMENTS].count_documents(query)
-    rows = (
-        db[COLL_UNIQUE_DOCUMENTS]
-        .find(query)
-        .sort(_PAGE_SORT)
-        .skip((page - 1) * page_size)
-        .limit(page_size)
-    )
-    rows = list(rows)
+    if sort:
+        rows = list(db[COLL_UNIQUE_DOCUMENTS].aggregate([
+            {"$match": query}, *sort, {"$skip": (page - 1) * page_size}, {"$limit": page_size},
+        ]))
+    else:
+        rows = list(
+            db[COLL_UNIQUE_DOCUMENTS]
+            .find(query)
+            .sort(_PAGE_SORT)
+            .skip((page - 1) * page_size)
+            .limit(page_size)
+        )
     places = _copy_places(db, rows)
     return Paginated(items=[_unique_out(row, places) for row in rows], total=total,
                      page=page, page_size=page_size)

@@ -318,6 +318,10 @@ def new_unique_document(*, display_id: int, sha256: str | None = None, **fields)
         "review_zoho_file_id": None,
         "review_shareable_link": None,
         "review_status": ReviewStatus.not_started.value,
+        "translated_by": None,
+        "translated_at": None,
+        "reviewed_by": None,
+        "reviewed_at": None,
         # One vector per text chunk, in chunk order. ALWAYS EMPTY for now, by
         # design -- nothing writes it. The vectors are already computed and live
         # on local disk (fix/out/fingerprint_v3_chunks.f32, keyed by sha256);

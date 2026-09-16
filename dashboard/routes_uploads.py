@@ -56,7 +56,7 @@ from bson.errors import InvalidId
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile
 from pymongo import ASCENDING, DESCENDING
 
-from dashboard import queue_worker, vocabulary
+from dashboard import events, queue_worker, vocabulary
 from dashboard.db import get_db
 from dashboard.display_id import parse_display_id
 from dashboard.models import (
@@ -262,6 +262,7 @@ async def create_upload(
     # already visible to the worker's own connection.
     queue_worker.stage(item_id, pdf_bytes)
     queue_worker.enqueue_check(item_id)
+    events.upload_changed(item_id)
     return _item_out(item)
 
 
@@ -310,6 +311,7 @@ def _start(db, oid: ObjectId, document_id: ObjectId | None) -> UploadQueueItemOu
                   "progress_pct": 55, "updated_at": utcnow()}},
     )
     queue_worker.enqueue_decision(oid, document_id)
+    events.upload_changed(oid)
     return _item_out(db[COLL_UPLOAD_QUEUE_ITEMS].find_one({"_id": oid}))
 
 
@@ -406,3 +408,4 @@ def _discard(db, item_id: str) -> None:
         raise HTTPException(409, "cannot cancel an upload that is already uploading")
     queue_worker.unstage(oid)
     db[COLL_UPLOAD_QUEUE_ITEMS].delete_one({"_id": oid})
+    events.upload_removed(oid)

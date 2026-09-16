@@ -98,6 +98,9 @@ CROP_MASTER_HOST_DB = _env("PROD_DB_NAME") or "pop_dashboard"
 CROP_MASTER_DB_NAME = _env("CROP_MASTER_DB_NAME") or "agriai"
 CROP_MASTER_COLLECTION = _env("CROP_MASTER_COLLECTION") or "crop_master"
 
+# Pages a dashboard translation sends to the LLM at once.
+DASHBOARD_TRANSLATE_CONCURRENCY = max(1, int(_env("DASHBOARD_TRANSLATE_CONCURRENCY") or 3))
+
 # Fixed, pre-created Zoho WorkDrive subfolder IDs for the dashboard's three
 # upload kinds -- see dashboard/zoho_layout.py.
 ZOHO_DASHBOARD_ORIGINALS_FOLDER_ID = os.environ.get("ZOHO_DASHBOARD_ORIGINALS_FOLDER_ID")

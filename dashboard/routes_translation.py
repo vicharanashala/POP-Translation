@@ -35,11 +35,11 @@ from pathlib import Path
 
 from bson import ObjectId
 from bson.errors import InvalidId
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Request, UploadFile
 from pymongo import ASCENDING, DESCENDING
 
-from dashboard import zoho_layout
-from dashboard.config import REPO_ROOT, TRANS_ENABLED
+from dashboard import events, zoho_layout
+from dashboard.config import DASHBOARD_TRANSLATE_CONCURRENCY, REPO_ROOT, TRANS_ENABLED
 from dashboard.db import get_db, get_session
 from dashboard.display_id import format_display_id
 from dashboard.models import (
@@ -77,6 +77,7 @@ def _translation_job_out(row: dict, doc: dict | None) -> TranslationJobOut:
     return TranslationJobOut(
         id=str(row["_id"]),
         document_id=str(row["document_id"]),
+        unique_document_id=str(row["document_id"]),
         document_code=format_display_id(doc.get("display_id")) if doc else None,
         shareable_name=doc.get("shareable_name") if doc else None,
         kind=row["kind"],
@@ -111,8 +112,16 @@ def get_config():
     return ConfigOut(translation_available=TRANS_ENABLED and bool(os.environ.get(LLM_API_KEY_ENV)))
 
 
+def _person(value) -> str | None:
+    """A *_by name as sent, trimmed; blank means unknown."""
+    return (str(value).strip() or None) if value is not None else None
+
+
 @router.post("/unique-documents/{document_id}/translate", status_code=202)
-def start_translation(document_id: str, db=Depends(get_db)):
+def start_translation(document_id: str, body: dict | None = Body(default=None), db=Depends(get_db)):
+    """Queue the pipeline for this document. Optional JSON body
+    `{"translated_by": "<display name>"}` -- recorded on the document when the
+    translation lands."""
     from pop_server import LLM_API_KEY_ENV
 
     if not TRANS_ENABLED:
@@ -134,7 +143,10 @@ def start_translation(document_id: str, db=Depends(get_db)):
         {"$set": {"translation_status": TranslationStatus.in_progress.value, "updated_at": utcnow()}},
     )
     job = new_translation_job(document_id=oid, kind=TranslationJobKind.translate)
+    job["requested_by"] = _person((body or {}).get("translated_by"))
     job_id = db[COLL_TRANSLATION_JOBS].insert_one(job).inserted_id
+    events.translation_changed(job_id)
+    events.document_changed(oid)
     # pymongo writes apply immediately -- already visible to the background
     # thread's own connection before handoff.
 
@@ -197,18 +209,21 @@ def delete_translation_job(job_id: str, db=Depends(get_db)):
     if job["status"] in (TranslationJobStatus.queued.value, TranslationJobStatus.running.value):
         raise HTTPException(409, f"job is {job['status']} -- cancel it first")
     db[COLL_TRANSLATION_JOBS].delete_one({"_id": oid})
+    events.publish("translation", {"id": str(oid), "deleted": True})
 
 
 def _set_job(job_id: ObjectId, **fields) -> None:
     fields["updated_at"] = utcnow()
     with get_session() as db:
         db[COLL_TRANSLATION_JOBS].update_one({"_id": job_id}, {"$set": fields})
+    events.translation_changed(job_id)
 
 
 def _set_doc(document_id: ObjectId, **fields) -> None:
     fields["updated_at"] = utcnow()
     with get_session() as db:
         db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": document_id}, {"$set": fields})
+    events.document_changed(document_id)
 
 
 def _progress_cb(job_id: ObjectId):
@@ -233,6 +248,7 @@ def _run_translation(job_id: ObjectId, document_id: ObjectId) -> None:
         doc = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": document_id})
         zoho_file_id = _source_file_id(doc)
         doc_name = (doc.get("shareable_name") or str(document_id)).rsplit(".", 1)[0]
+        job = db[COLL_TRANSLATION_JOBS].find_one({"_id": job_id}, {"requested_by": 1}) or {}
 
     # _run_one_doc builds its own workdir internally as
     # POP_WORK/Workdir/<req.state>/<req.crop>/<doc_name> -- doc_root here must
@@ -246,7 +262,8 @@ def _run_translation(job_id: ObjectId, document_id: ObjectId) -> None:
         _DASHBOARD_WORK_ROOT.mkdir(parents=True, exist_ok=True)
         tmp_pdf.write_bytes(pdf_bytes)
 
-        req = PopRequest(state="_dashboard", crop=str(document_id), model=DEFAULT_MODEL)
+        req = PopRequest(state="_dashboard", crop=str(document_id), model=DEFAULT_MODEL,
+                         concurrency=DASHBOARD_TRANSLATE_CONCURRENCY)
         api_key = os.environ[LLM_API_KEY_ENV]
         prompt = PROMPT_FILE.read_text(encoding="utf-8")
 
@@ -263,6 +280,8 @@ def _run_translation(job_id: ObjectId, document_id: ObjectId) -> None:
             translation_zoho_file_id=translation_zoho_file_id,
             translation_shareable_link=zoho_layout.shareable_link(translation_zoho_file_id),
             translation_status=TranslationStatus.done.value,
+            translated_by=job.get("requested_by"),
+            translated_at=utcnow(),
         )
         _set_job(job_id, status=TranslationJobStatus.done.value, progress_pct=100)
     except ctl.JobCancelled:
@@ -278,7 +297,8 @@ def _run_translation(job_id: ObjectId, document_id: ObjectId) -> None:
 
 
 @router.post("/unique-documents/{document_id}/translation", status_code=201)
-async def upload_translation(document_id: str, file: UploadFile = File(...), db=Depends(get_db)):
+async def upload_translation(document_id: str, file: UploadFile = File(...),
+                             translated_by: str | None = Form(None), db=Depends(get_db)):
     """Attach a translation produced somewhere else.
 
     The same end state the pipeline reaches on its own -- the file lands in the
@@ -324,10 +344,13 @@ async def upload_translation(document_id: str, file: UploadFile = File(...), db=
                 "translation_zoho_file_id": translation_zoho_file_id,
                 "translation_shareable_link": zoho_layout.shareable_link(translation_zoho_file_id),
                 "translation_status": TranslationStatus.done.value,
+                "translated_by": _person(translated_by),
+                "translated_at": utcnow(),
                 "updated_at": utcnow(),
             }
         },
     )
+    events.document_changed(oid)
     # Only after the new one is recorded: a failed delete must not be able to
     # leave the document pointing at a file that is already gone.
     if superseded and superseded != translation_zoho_file_id:
@@ -358,14 +381,18 @@ def delete_translation(document_id: str, db=Depends(get_db)):
                 "translation_zoho_file_id": None,
                 "translation_shareable_link": None,
                 "translation_status": TranslationStatus.not_started.value,
+                "translated_by": None,
+                "translated_at": None,
                 "updated_at": utcnow(),
             }
         },
     )
+    events.document_changed(oid)
 
 
 @router.post("/unique-documents/{document_id}/review", status_code=201)
-async def upload_review(document_id: str, file: UploadFile = File(...), db=Depends(get_db)):
+async def upload_review(document_id: str, file: UploadFile = File(...),
+                        reviewed_by: str | None = Form(None), db=Depends(get_db)):
     oid = _to_object_id(document_id, "document")
     doc = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": oid})
     if doc is None:
@@ -384,10 +411,13 @@ async def upload_review(document_id: str, file: UploadFile = File(...), db=Depen
                 "review_zoho_file_id": review_zoho_file_id,
                 "review_shareable_link": zoho_layout.shareable_link(review_zoho_file_id),
                 "review_status": ReviewStatus.done.value,
+                "reviewed_by": _person(reviewed_by),
+                "reviewed_at": utcnow(),
                 "updated_at": utcnow(),
             }
         },
     )
+    events.document_changed(oid)
     # review_file_id is the name every read endpoint uses for this; the
     # older key is kept so an existing caller does not break.
     return {"review_file_id": review_zoho_file_id,
@@ -414,10 +444,13 @@ def delete_review(document_id: str, db=Depends(get_db)):
                 "review_zoho_file_id": None,
                 "review_shareable_link": None,
                 "review_status": ReviewStatus.not_started.value,
+                "reviewed_by": None,
+                "reviewed_at": None,
                 "updated_at": utcnow(),
             }
         },
     )
+    events.document_changed(oid)
 
 
 # -- row-addressed aliases -----------------------------------------------------
@@ -463,25 +496,28 @@ def _document_id_for_row(db, row_id: str) -> str:
 
 
 @router.post("/documents/{row_id}/translate", status_code=202)
-def start_translation_for_row(row_id: str, db=Depends(get_db)):
-    return start_translation(_document_id_for_row(db, row_id), db)
+def start_translation_for_row(row_id: str, body: dict | None = Body(default=None), db=Depends(get_db)):
+    return start_translation(_document_id_for_row(db, row_id), body=body, db=db)
 
 
 @router.delete("/documents/{row_id}/translation", status_code=204)
 def delete_translation_for_row(row_id: str, db=Depends(get_db)):
-    return delete_translation(_document_id_for_row(db, row_id), db)
+    return delete_translation(_document_id_for_row(db, row_id), db=db)
 
 
 @router.post("/documents/{row_id}/translation", status_code=201)
-async def upload_translation_for_row(row_id: str, file: UploadFile = File(...), db=Depends(get_db)):
-    return await upload_translation(_document_id_for_row(db, row_id), file, db)
+async def upload_translation_for_row(row_id: str, file: UploadFile = File(...),
+                                     translated_by: str | None = Form(None), db=Depends(get_db)):
+    return await upload_translation(_document_id_for_row(db, row_id), file,
+                                    translated_by=translated_by, db=db)
 
 
 @router.post("/documents/{row_id}/review", status_code=201)
-async def upload_review_for_row(row_id: str, file: UploadFile = File(...), db=Depends(get_db)):
-    return await upload_review(_document_id_for_row(db, row_id), file, db)
+async def upload_review_for_row(row_id: str, file: UploadFile = File(...),
+                                reviewed_by: str | None = Form(None), db=Depends(get_db)):
+    return await upload_review(_document_id_for_row(db, row_id), file, reviewed_by=reviewed_by, db=db)
 
 
 @router.delete("/documents/{row_id}/review", status_code=204)
 def delete_review_for_row(row_id: str, db=Depends(get_db)):
-    return delete_review(_document_id_for_row(db, row_id), db)
+    return delete_review(_document_id_for_row(db, row_id), db=db)

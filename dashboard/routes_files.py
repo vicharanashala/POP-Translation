@@ -24,8 +24,13 @@ from __future__ import annotations
 import mimetypes
 import re
 
-from fastapi import APIRouter, HTTPException, Request
+from bson import ObjectId
+from bson.errors import InvalidId
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
+
+from dashboard.db import get_db
+from dashboard.models import COLL_UNIQUE_DOCUMENTS
 
 from helpers.http_headers import content_disposition
 
@@ -84,6 +89,49 @@ def file_link(zoho_file_id: str):
 
 @router.get("/files/{zoho_file_id}/download")
 def download_file(zoho_file_id: str, request: Request, inline: bool = False):
+    return _serve(zoho_file_id, request, inline)
+
+
+# The name a translation / review downloads as: the document's shareable name
+# plus this suffix, keeping the stored file's own extension.
+_NAMED_KINDS = {
+    "translation": ("translation_zoho_file_id", "_translation"),
+    "review": ("review_zoho_file_id", "_reviewed"),
+}
+
+
+def download_name(shareable_name: str | None, stored_name: str | None, suffix: str) -> str:
+    """"Paddy_KA_2021.pdf" + stored "x_translated.docx" + "_translation"
+    -> "Paddy_KA_2021_translation.docx"."""
+    stem = (shareable_name or "").strip()
+    if "." in stem:
+        stem = stem.rsplit(".", 1)[0]
+    ext = stored_name.rsplit(".", 1)[1] if stored_name and "." in stored_name else ""
+    stem = stem or (stored_name.rsplit(".", 1)[0] if stored_name and "." in stored_name else (stored_name or "download"))
+    return f"{stem}{suffix}" + (f".{ext}" if ext else "")
+
+
+@router.get("/unique-documents/{document_id}/{kind}/download")
+def download_named(document_id: str, kind: str, request: Request, inline: bool = False, db=Depends(get_db)):
+    """The document's translation or review, named after the document:
+    `<shareable name>_translation.<ext>` / `<shareable name>_reviewed.<ext>`."""
+    if kind not in _NAMED_KINDS:
+        raise HTTPException(404, "not found")
+    field, suffix = _NAMED_KINDS[kind]
+    try:
+        oid = ObjectId(document_id)
+    except (InvalidId, TypeError):
+        raise HTTPException(422, "malformed document id")
+    doc = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": oid}, {"shareable_name": 1, field: 1})
+    if doc is None:
+        raise HTTPException(404, "document not found")
+    if not doc.get(field):
+        raise HTTPException(404, f"this document has no {kind}")
+    return _serve(doc[field], request, inline,
+                  name=lambda stored: download_name(doc.get("shareable_name"), stored, suffix))
+
+
+def _serve(zoho_file_id: str, request: Request, inline: bool, name=None):
     from pop_server import _get_zoho
 
     wd = _get_zoho()
@@ -91,6 +139,8 @@ def download_file(zoho_file_id: str, request: Request, inline: bool = False):
     if meta is None:
         raise HTTPException(404, "file not found")
     filename = meta.get("name") or zoho_file_id
+    if name is not None:
+        filename = name(meta.get("name"))
     media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     headers = {
         "Content-Disposition": content_disposition(filename, inline=inline),

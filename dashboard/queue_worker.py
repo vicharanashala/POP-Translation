@@ -46,7 +46,7 @@ from pathlib import Path
 
 from bson import ObjectId
 
-from dashboard import vocabulary, zoho_layout
+from dashboard import events, vocabulary, zoho_layout
 from dashboard.db import get_session
 from dashboard.display_id import format_display_id, format_row_id, free_display_ids, free_row_ids
 from dashboard.models import (
@@ -110,6 +110,7 @@ def _set_status(item_id: ObjectId, **fields) -> None:
             fields[key] = value.value
     with get_session() as db:
         db[COLL_UPLOAD_QUEUE_ITEMS].update_one({"_id": item_id}, {"$set": fields})
+    events.upload_changed(item_id)
 
 
 def enqueue_check(item_id: ObjectId) -> None:
@@ -427,6 +428,11 @@ def _finish(item_id: ObjectId, document_id: ObjectId | None) -> None:
             # `failed` items are the one thing that stays: they carry the error
             # and are retryable via the same add/new endpoints.
             db[COLL_UPLOAD_QUEUE_ITEMS].delete_one({"_id": item_id})
+            # The item is gone, so the event says where it went: the frontend
+            # opens that document, and refreshes the tables for the new rows.
+            events.upload_removed(item_id, unique_document_id=str(document["_id"]),
+                                  document_code=code, row_ids=row_codes)
+            events.document_changed(document["_id"])
             print(f"[upload] {verb} {code} in {len(rows)} place(s)"
                   + (f": {', '.join(row_codes)}" if row_codes else ""), flush=True)
         # Only once the rows exist: a failure above leaves the staged file in

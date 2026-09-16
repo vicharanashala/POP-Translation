@@ -194,6 +194,14 @@ class UniqueDocumentOut(DocumentMetadata):
     review_status: ReviewStatus
     review_file_id: str | None = None
     review_shareable_link: str | None = None
+    # Audit trail. *_by is the display name the frontend sent with the action
+    # (not verified -- /api/pop has no auth yet); *_at is when the translation
+    # or review landed. Both cleared when the file is deleted; null on
+    # documents translated before these fields existed.
+    translated_by: str | None = None
+    translated_at: datetime | None = None
+    reviewed_by: str | None = None
+    reviewed_at: datetime | None = None
 
     placement_count: int = 0  # how many main-table rows point here
     # THE ANCHOR: which entry of duplicate_links is this document, as opposed to
@@ -267,6 +275,14 @@ class DocumentOut(BaseModel):
     review_status: ReviewStatus | None = None
     review_file_id: str | None = None
     review_shareable_link: str | None = None
+    # Audit trail. *_by is the display name the frontend sent with the action
+    # (not verified -- /api/pop has no auth yet); *_at is when the translation
+    # or review landed. Both cleared when the file is deleted; null on
+    # documents translated before these fields existed.
+    translated_by: str | None = None
+    translated_at: datetime | None = None
+    reviewed_by: str | None = None
+    reviewed_at: datetime | None = None
     # How many placements share this row's document, this one included. 1 means
     # the document appears in exactly one folder.
     placement_count: int = 1
@@ -412,6 +428,7 @@ class TranslationJobOut(BaseModel):
     id: str  # ObjectId, 24-char hex
     document_id: str  # the unique document's ObjectId hex
     document_code: str | None = None  # its ANNAM_##### id
+    unique_document_id: str | None = None  # same as document_id; the name the frontend keys the modal on
     shareable_name: str | None = None
     kind: TranslationJobKind
     status: TranslationJobStatus
