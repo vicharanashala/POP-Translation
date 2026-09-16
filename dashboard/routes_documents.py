@@ -28,12 +28,12 @@ from datetime import date, datetime, time, timedelta
 
 from bson import ObjectId
 from bson.errors import InvalidId
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pymongo import ASCENDING, DESCENDING
 
 from dashboard import vocabulary
 from dashboard.config import PAGE_SIZE
-from dashboard.db import get_db, get_users_collection
+from dashboard.db import get_db
 from dashboard.display_id import format_display_id, format_row_id, parse_display_id, parse_row_id
 from dashboard.languages import LANGUAGES, TESSDATA_BEST
 from dashboard.models import (
@@ -54,7 +54,6 @@ from dashboard.schemas import (
     FolderOut,
     LanguageOut,
     OrganizationOut,
-    UserOut,
     Paginated,
     StateOut,
     UniqueDocumentOut,
@@ -1064,41 +1063,6 @@ def merge_crops(crop_id: str, body: dict | None = None):
 @router.delete("/crops/{crop_id}")
 def delete_crop(crop_id: str):
     raise HTTPException(403, vocabulary.READ_ONLY_CROPS)
-
-
-@router.get("/users", response_model=list[UserOut])
-def list_users(status: str = Query("active", pattern="^(active|all)$")):
-    """The people a document can be verified by, for the Verified By dropdown.
-
-    Read from the OTHER application's `users` collection (see
-    dashboard/config.py) -- read-only, and projected to name/role/status so
-    nothing else in it is ever loaded.
-
-    status=active (default): active and not blocked. status=all: everyone,
-    each marked active or inactive. Load-test accounts (`loadTestTag`, 83 of
-    the 100 rows on 2026-09-11) are never returned: they are not people.
-
-    A document still stores only the name string in verified_by, so a user
-    renamed or removed later leaves existing documents untouched.
-    """
-    try:
-        rows = list(get_users_collection().find(
-            {"loadTestTag": {"$in": [None, ""]}},
-            {"firstName": 1, "lastName": 1, "role": 1, "status": 1, "isBlocked": 1},
-        ))
-    except Exception as exc:  # noqa: BLE001 -- any failure means "no list"; the form falls back
-        raise HTTPException(503, f"user list unavailable: {type(exc).__name__}") from exc
-    out = []
-    for r in rows:
-        name = " ".join(x.strip() for x in (r.get("firstName"), r.get("lastName")) if x and x.strip())
-        if not name:
-            continue
-        active = r.get("status") == "active" and not r.get("isBlocked")
-        if status == "active" and not active:
-            continue
-        out.append(UserOut(id=str(r["_id"]), name=name, role=r.get("role"),
-                           status="active" if active else "inactive"))
-    return sorted(out, key=lambda u: u.name.lower())
 
 
 @router.get("/languages", response_model=list[LanguageOut])

@@ -33,9 +33,6 @@ from dashboard.config import (
     DB_NAME,
     DB_URL,
     POP_ENV,
-    USERS_COLLECTION,
-    USERS_DB_NAME,
-    USERS_DB_URL,
 )
 from dashboard.models import (
     COLL_CONFIG,
@@ -99,29 +96,6 @@ def crops_collection(db: Database):
     if db.name == CROP_MASTER_HOST_DB:
         return db.client[CROP_MASTER_DB_NAME][CROP_MASTER_COLLECTION]
     return db[COLL_CROPS]
-
-
-# The other application's user list. A client of its own: under POP_ENV=prod
-# the dashboard's database is on a different cluster, and this is not.
-_users_client: MongoClient | None = None
-
-
-def get_users_collection():
-    """The other application's `users` collection, for reading names only.
-
-    Short timeouts: this is somebody else's database on a free tier, and a
-    dropdown that cannot load should fail fast (the caller turns it into a 503
-    and the frontend falls back to free text) rather than hang a request.
-    """
-    global _users_client
-    if _users_client is None:
-        if not USERS_DB_URL.startswith(("mongodb://", "mongodb+srv://")):
-            raise RuntimeError("STAGING_DB_URL is not set -- the user list is unavailable.")
-        _users_client = MongoClient(
-            USERS_DB_URL, appname="pop-render-users",
-            serverSelectionTimeoutMS=5000, connectTimeoutMS=5000, socketTimeoutMS=10000,
-        )
-    return _users_client[USERS_DB_NAME][USERS_COLLECTION]
 
 
 # Index specs, applied by init_db(). Kept here rather than scattered through

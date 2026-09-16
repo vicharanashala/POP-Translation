@@ -45,15 +45,6 @@ class Paginated(BaseModel, Generic[T]):
 # the crop master and are read-only here. Languages are still a plain code.
 
 
-class UserOut(BaseModel):
-    """Someone a document can be verified by. Only what the dropdown needs --
-    the source collection holds far more, none of which leaves the server."""
-    id: str
-    name: str  # "First Last" -- what is stored in a document's verified_by
-    role: str | None = None
-    status: str  # "active" | "inactive"
-
-
 class LanguageOut(BaseModel):
     code: str  # "kan", or "non_english" for the OCR pass's Non-English verdict
     label: str  # "Kannada" / "Non-English"
