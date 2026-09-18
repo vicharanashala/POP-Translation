@@ -587,8 +587,12 @@ def test_state_language_table_covers_every_state_and_only_tessdata(client):
 
     assert set(STATE_LANG.values()) <= set(LANGUAGES)
     # Every state the catalogue actually uses must map, or its documents fall
-    # back to no language at all.
+    # back to no language at all. States with no documents yet (the union
+    # territories added for the dropdown) have nothing to map; dashboard uploads
+    # take their language from the form, not from this table.
     for state in client.get("/dashboard/states").json():
+        if not state["document_count"]:
+            continue
         assert any(language_for_state(raw) for raw in state["raw_names"]), state["name"]
 
 
@@ -1446,7 +1450,7 @@ def test_documents_carry_only_the_agreed_fields(db):
         "date_of_release", "month_of_release", "year_of_release",
         "date_of_collection", "month_of_collection", "year_of_collection",
         "advisory_name", "advisory_released_org", "advisory_org_address",
-        "live_source_link", "domain", "verification_status", "verified_by",
+        "live_source_link", "domain", "verification_status", "uploaded_by",
         "document_status",
         "translation_status", "translation_zoho_file_id", "translation_shareable_link",
         "review_status", "review_zoho_file_id", "review_shareable_link",
@@ -1491,6 +1495,103 @@ def test_search_keeps_the_spaces_inside_a_phrase(client, scratch):
     assert str(doc["_id"]) in hits("  crop dan something ")
     assert str(doc["_id"]) not in hits("crop something")
     assert str(doc["_id"]) not in hits("cropdan")
+
+
+def test_search_boxes_take_commas_as_part_of_the_phrase(client, scratch):
+    """A typed search is one phrase: "Paddy, Kharif" is not "Paddy" OR "Kharif".
+    Dropdown filters still read a comma as a list."""
+    doc, rows = scratch
+    client.patch(f"/dashboard/unique-documents/{doc['_id']}",
+                 json={"shareable_name": "scratch-test Paddy, Kharif 2021.pdf"})
+
+    def hits(term, key="shareable_name"):
+        page = client.get("/dashboard/unique-documents", params={f"filter[{key}]": term}).json()
+        return {d["id"] for d in page["items"]}
+
+    assert str(doc["_id"]) in hits(" paddy, kharif ")
+    assert str(doc["_id"]) not in hits("paddy, rabi")
+    main = client.get("/dashboard/documents",
+                      params={"filter[shareable_name]": "Paddy, Kharif 2021"}).json()
+    assert {r["id"] for r in main["items"]} >= {str(r["_id"]) for r in rows}
+    # Ids stay a list.
+    annam = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()["document_id"]
+    ids = hits(f"{annam}, ANNAM_99999", key="document_id")
+    assert str(doc["_id"]) in ids
+
+
+def test_times_are_sent_as_utc_and_day_filters_mean_the_ist_day(client, db, scratch):
+    """A bare "10:00:00" reads as local time in the browser -- 5h30 off in IST."""
+    from datetime import datetime
+
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    doc, rows = scratch
+    # 20:00 UTC on 4 Jan is 01:30 IST on 5 Jan.
+    db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": doc["_id"]}, {"$set": {
+        "translated_by": "Scratch Translator", "translated_at": datetime(2020, 1, 4, 20, 0)}})
+
+    one = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()
+    assert one["translated_at"] == "2020-01-04T20:00:00Z"
+    assert one["created_at"].endswith("Z")
+    row = client.get(f"/dashboard/documents/{rows[0]['_id']}").json()
+    assert row["translated_at"] == "2020-01-04T20:00:00Z" and row["created_at"].endswith("Z")
+
+    def found(**params):
+        page = client.get("/dashboard/unique-documents",
+                          params={"filter[shareable_name]": "scratch-test", **params}).json()
+        return str(doc["_id"]) in {d["id"] for d in page["items"]}
+
+    assert found(**{"filter[translated_at]": "2020-01-05"})
+    assert not found(**{"filter[translated_at]": "2020-01-04"})
+    assert found(**{"filter[translated_at_from]": "2020-01-05", "filter[translated_at_to]": "2020-01-05"})
+    assert not found(**{"filter[translated_at_to]": "2020-01-04"})
+
+
+def test_uploaded_by_comes_with_the_upload_and_cannot_be_edited(client, db, scratch):
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    item_id = _submit(client, states_json='["State Karnataka"]', crops_json='["Paddy"]',
+                      uploaded_by="Scratch Uploader")
+    try:
+        item = client.get(f"/dashboard/uploads/{item_id}").json()
+        assert item["metadata"]["uploaded_by"] == "Scratch Uploader"
+        assert "verified_by" not in item["metadata"]
+    finally:
+        client.post(f"/dashboard/uploads/{item_id}/cancel")
+
+    doc, rows = scratch
+    db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": doc["_id"]}, {"$set": {"uploaded_by": "Scratch Uploader"}})
+    client.patch(f"/dashboard/unique-documents/{doc['_id']}", json={"uploaded_by": "Someone Else"})
+    client.patch(f"/dashboard/documents/{rows[0]['_id']}", json={"uploaded_by": "Someone Else"})
+    out = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()
+    assert out["uploaded_by"] == "Scratch Uploader"
+    assert "verified_by" not in out
+    page = client.get("/dashboard/unique-documents", params={"filter[uploaded_by]": "scratch uploader"}).json()
+    assert str(doc["_id"]) in {d["id"] for d in page["items"]}
+
+
+def test_name_lists_for_the_audit_filters(client, db, scratch):
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    doc, _ = scratch
+    db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": doc["_id"]}, {"$set": {
+        "uploaded_by": "Scratch Uploader", "translated_by": "scratch translator",
+        "reviewed_by": " Scratch Reviewer "}})
+    for path, name in (("uploaded-by", "Scratch Uploader"), ("translated-by", "scratch translator"),
+                       ("reviewed-by", "Scratch Reviewer")):
+        names = client.get(f"/dashboard/{path}").json()
+        assert name in names, path
+        assert "" not in names and None not in names
+        assert names == sorted(names, key=str.casefold)
+        assert len(names) == len(set(names))
+
+
+def test_states_list_every_state_and_union_territory(client):
+    names = {s["name"] for s in client.get("/dashboard/states").json()}
+    assert {"Chandigarh", "Dadra and Nagar Haveli and Daman and Diu", "Ladakh", "Lakshadweep",
+            "Chhattisgarh", "Tamil Nadu", "Andaman and Nicobar Islands", "Delhi",
+            "Jammu and Kashmir", "Puducherry"} <= names
+    assert not {"Chattisgarh", "Tamilnadu", "Andaman and Nicobar"} & names
 
 
 def test_audit_fields_are_served_filtered_and_sorted(client, db, scratch):

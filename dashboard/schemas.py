@@ -22,14 +22,24 @@ of 100 rows must not carry them.
 """
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Generic, TypeVar
+from datetime import datetime, timezone
+from typing import Annotated, Generic, TypeVar
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import AfterValidator, BaseModel, ConfigDict
 
 from dashboard.models import ReviewStatus, TranslationJobKind, TranslationJobStatus, TranslationStatus, UploadQueueStatus
 
 T = TypeVar("T")
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Mongo hands dates back naive, but they are UTC. Marked as such, they are
+    sent with a "Z", so the browser shows them in local time (IST) instead of
+    reading a bare "10:00:00" as 10:00 IST -- which put every time 5h30 behind."""
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+
+UTCDatetime = Annotated[datetime, AfterValidator(_as_utc)]
 
 
 class Paginated(BaseModel, Generic[T]):
@@ -123,7 +133,7 @@ class VocabularyMergeResult(BaseModel):
 
 
 class DocumentMetadata(BaseModel):
-    """The 18 manually-entered fields. All optional so a PATCH can send just
+    """The 17 manually-entered fields. All optional so a PATCH can send just
     the ones being changed."""
 
     advisory_type: str | None = None
@@ -142,7 +152,6 @@ class DocumentMetadata(BaseModel):
     live_source_link: str | None = None
     domain: str | None = None
     verification_status: str | None = None
-    verified_by: str | None = None
     document_status: str | None = None
 
 
@@ -199,9 +208,12 @@ class UniqueDocumentOut(DocumentMetadata):
     # or review landed. Both cleared when the file is deleted; null on
     # documents translated before these fields existed.
     translated_by: str | None = None
-    translated_at: datetime | None = None
+    translated_at: UTCDatetime | None = None
     reviewed_by: str | None = None
-    reviewed_at: datetime | None = None
+    reviewed_at: UTCDatetime | None = None
+    # Who uploaded it (sent by the frontend with the upload). Read-only: it is
+    # not on UniqueDocumentUpdate, so a PATCH cannot change it.
+    uploaded_by: str | None = None
 
     placement_count: int = 0  # how many main-table rows point here
     # THE ANCHOR: which entry of duplicate_links is this document, as opposed to
@@ -211,8 +223,8 @@ class UniqueDocumentOut(DocumentMetadata):
     representative_row_id: int | None = None
     duplicate_links: list[CopyLink] = []
     merged_from: list[str] = []  # ANNAM ids absorbed by a team-approved merge
-    created_at: datetime
-    updated_at: datetime
+    created_at: UTCDatetime
+    updated_at: UTCDatetime
 
 
 class UniqueDocumentUpdate(DocumentMetadata):
@@ -280,15 +292,15 @@ class DocumentOut(BaseModel):
     # or review landed. Both cleared when the file is deleted; null on
     # documents translated before these fields existed.
     translated_by: str | None = None
-    translated_at: datetime | None = None
+    translated_at: UTCDatetime | None = None
     reviewed_by: str | None = None
-    reviewed_at: datetime | None = None
+    reviewed_at: UTCDatetime | None = None
     # How many placements share this row's document, this one included. 1 means
     # the document appears in exactly one folder.
     placement_count: int = 1
 
-    created_at: datetime
-    updated_at: datetime
+    created_at: UTCDatetime
+    updated_at: UTCDatetime
 
 
 class DocumentUpdate(DocumentMetadata):
@@ -416,8 +428,8 @@ class UploadQueueItemOut(BaseModel):
     # What the decision produced.
     created_document_id: str | None = None  # ANNAM id used or created
     created_row_ids: list[str] = []  # POP ids of the placements created
-    created_at: datetime
-    updated_at: datetime
+    created_at: UTCDatetime
+    updated_at: UTCDatetime
 
 
 # -- Translation queue ---------------------------------------------------------
@@ -436,8 +448,8 @@ class TranslationJobOut(BaseModel):
     pages_done: int | None = None
     total_pages: int | None = None
     error_message: str | None = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: UTCDatetime
+    updated_at: UTCDatetime
 
 
 class ConfigOut(BaseModel):

@@ -131,6 +131,7 @@ def _pagination(request: Request) -> tuple[int, int]:
 # is what lets one place add multi-value and range handling to every filter at
 # once instead of per column.
 TEXT = "text"          # case-insensitive substring; comma-separated = OR
+PHRASE = "phrase"      # case-insensitive substring of the WHOLE value, commas included
 EXACT = "exact"        # equality; comma-separated = IN
 INT = "int"            # equality, plus <key>_min / <key>_max
 DATE = "date"          # ISO "YYYY-MM-DD" string, plus <key>_from / <key>_to
@@ -180,6 +181,16 @@ def _day_bounds(value: str):
     return start, start + timedelta(days=1)
 
 
+# The team works in IST, so a date picked on a real timestamp means that IST
+# day. Stored datetimes are naive UTC, so the IST day starts 5h30 earlier.
+IST_OFFSET = timedelta(hours=5, minutes=30)
+
+
+def _ist_day_bounds(value: str):
+    bounds = _day_bounds(value)
+    return None if bounds is None else (bounds[0] - IST_OFFSET, bounds[1] - IST_OFFSET)
+
+
 def _display_id_eq(value: str):
     parsed = parse_display_id(value)
     return _NO_MATCH if parsed is None else parsed
@@ -207,6 +218,12 @@ def _match_for(kind: str, raw: str):
     sent to the server: an unparseable filter value is an empty result set, not
     a 500 and not a silently ignored filter.
     """
+    if kind == PHRASE:
+        # A typed search box: one phrase, trimmed only at the ends. Not split on
+        # commas -- a shareable name can contain one ("Paddy, Kharif").
+        phrase = raw.strip()
+        return _icontains(phrase) if phrase else _NO_MATCH
+
     values = _split(raw)
     if not values:
         return _NO_MATCH
@@ -225,7 +242,7 @@ def _match_for(kind: str, raw: str):
     if kind == DATE:
         return values[0] if len(values) == 1 else {"$in": values}
     if kind == DATETIME:
-        bounds = _day_bounds(values[0])
+        bounds = _ist_day_bounds(values[0])
         return _NO_MATCH if bounds is None else {"$gte": bounds[0], "$lt": bounds[1]}
     if kind in (ANNAM, POP):
         build = _display_id_eq if kind == ANNAM else _row_id_eq
@@ -264,7 +281,7 @@ def _range_for(kind: str, low: str | None, high: str | None):
         for bound, op, edge in ((low, "$gte", 0), (high, "$lt", 1)):
             if bound is None:
                 continue
-            bounds = _day_bounds(bound)
+            bounds = _ist_day_bounds(bound)
             if bounds is None:
                 return _NO_MATCH
             clause[op] = bounds[edge]
@@ -356,9 +373,9 @@ def _vocabulary_filter(db, request: Request) -> dict | None:
 # `<key>_from`/`<key>_to` for dates. Every key accepts a comma-separated list.
 _JOINED_FILTERS = {
     "document_id": ("display_id", ANNAM),
-    "sha256": ("sha256", TEXT),
-    "shareable_name": ("shareable_name", TEXT),
-    "shareable_link": ("shareable_link", TEXT),
+    "sha256": ("sha256", PHRASE),
+    "shareable_name": ("shareable_name", PHRASE),
+    "shareable_link": ("shareable_link", PHRASE),
     "language": ("language", EXACT),
     "language_source": ("language_source", EXACT),
     "num_pages": ("num_pages", INT),
@@ -367,15 +384,15 @@ _JOINED_FILTERS = {
     "review_status": ("review_status", EXACT),
     "advisory_type": ("advisory_type", TEXT),
     "advisory_scope": ("advisory_scope", TEXT),
-    "advisory_name": ("advisory_name", TEXT),
-    "advisory_released_org": ("advisory_released_org", TEXT),
-    "advisory_org_address": ("advisory_org_address", TEXT),
-    "edition_revision_volume": ("edition_revision_volume", TEXT),
-    "live_source_link": ("live_source_link", TEXT),
+    "advisory_name": ("advisory_name", PHRASE),
+    "advisory_released_org": ("advisory_released_org", PHRASE),
+    "advisory_org_address": ("advisory_org_address", PHRASE),
+    "edition_revision_volume": ("edition_revision_volume", PHRASE),
+    "live_source_link": ("live_source_link", PHRASE),
     "season": ("season", TEXT),
     "domain": ("domain", TEXT),
     "verification_status": ("verification_status", TEXT),
-    "verified_by": ("verified_by", TEXT),
+    "uploaded_by": ("uploaded_by", TEXT),
     "document_status": ("document_status", TEXT),
     # The release/collection dates. NOTE: every `*_of_release` field is empty on
     # all 8,748 documents -- no corpus pass ever wrote them and they are filled
@@ -955,6 +972,29 @@ def list_states(db=Depends(get_db)):
     counts = vocabulary.usage_counts(db, "state")
     return [_entry_out(StateOut, row, counts)
             for row in db[COLL_STATES].find().sort("name", ASCENDING)]
+
+
+def _names_in(db, field: str) -> list[str]:
+    """Every distinct non-empty name in one audit field, A-Z ignoring case --
+    the options for that column's filter dropdown. Read from the documents
+    themselves, so it lists exactly the names that can match."""
+    names = {n.strip() for n in db[COLL_UNIQUE_DOCUMENTS].distinct(field) if isinstance(n, str) and n.strip()}
+    return sorted(names, key=str.casefold)
+
+
+@router.get("/uploaded-by", response_model=list[str])
+def list_uploaders(db=Depends(get_db)):
+    return _names_in(db, "uploaded_by")
+
+
+@router.get("/translated-by", response_model=list[str])
+def list_translators(db=Depends(get_db)):
+    return _names_in(db, "translated_by")
+
+
+@router.get("/reviewed-by", response_model=list[str])
+def list_reviewers(db=Depends(get_db)):
+    return _names_in(db, "reviewed_by")
 
 
 @router.get("/crops", response_model=list[CropOut])

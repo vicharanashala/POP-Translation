@@ -209,7 +209,7 @@ def normalize_format(value: str | None) -> str | None:
 
 # Every manually-entered metadata field on a document row. Kept as one list so
 # the upload payload, the migration and the document factory can't drift apart.
-# Mirrors DocumentMetadata in dashboard/schemas.py.
+# Mirrors DocumentMetadata in dashboard/schemas.py, plus uploaded_by.
 MANUAL_METADATA_FIELDS = (
     "advisory_type",
     "advisory_scope",
@@ -227,7 +227,9 @@ MANUAL_METADATA_FIELDS = (
     "live_source_link",
     "domain",
     "verification_status",
-    "verified_by",
+    # Who uploaded it: the logged-in user's name, sent by the frontend with the
+    # upload (not a form field). Never editable afterwards.
+    "uploaded_by",
     "document_status",
 )
 

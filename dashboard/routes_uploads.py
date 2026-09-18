@@ -235,7 +235,7 @@ async def create_upload(
     live_source_link: str | None = Form(None),
     domain: str | None = Form(None),
     verification_status: str | None = Form(None),
-    verified_by: str | None = Form(None),
+    uploaded_by: str | None = Form(None),
     document_status: str | None = Form(None),
     # Optional. Blank means "derive it from the file's extension", as before;
     # set, it wins -- e.g. a PDF that is a scan of a printed document.
