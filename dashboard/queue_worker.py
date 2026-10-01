@@ -124,6 +124,31 @@ def enqueue_decision(item_id: ObjectId, document_id: ObjectId | None) -> None:
     _executor.submit(_finish, item_id, document_id)
 
 
+def _optional_ref(db, placement: dict, kind: str):
+    """The district or KVK id a queued placement names, or None.
+
+    Optional: a form that sends neither files the row without them, which is
+    every corpus row. But a name or id that IS sent and does not resolve fails
+    the upload -- districts and KVKs come from the LGD sync and are never
+    created here (see dashboard/vocabulary.py).
+    """
+    stored = placement.get(vocabulary.field(kind))
+    if stored:
+        entry = vocabulary.get(db, kind, stored)
+        if entry is None:
+            raise ValueError(f"{kind}_id {stored!r} does not name an existing {kind}")
+        return entry["_id"]
+    raw = " ".join(str(placement.get(kind) or "").split())
+    if not raw:
+        return None
+    # Synced from LGD, never created here: an unknown name fails the upload
+    # rather than being silently dropped and leaving the row untagged.
+    entry = vocabulary.find(db, kind, raw)
+    if entry is None:
+        raise ValueError(f"{raw!r} is not a known {kind}")
+    return entry["_id"]
+
+
 def _placement_ids(db, placement: dict, *, create: bool = False) -> tuple:
     """(state_id, folder kind, folder id) for a queued placement, the folder
     being a crop ("crop") or an organisation ("organization").
@@ -291,6 +316,8 @@ def create_placements(db, *, document, placements: list[dict], copy: dict) -> li
         rows.append(new_document(
             row_id=row_id, unique_document_id=document["_id"], state_id=state_id,
             state_raw=placement.get("state") or "", crop_raw=placement.get("crop") or "",
+            district_id=_optional_ref(db, placement, "district"),
+            kvk_id=_optional_ref(db, placement, "kvk"),
             **{vocabulary.field(kind): folder_id},
         ))
     result = db[COLL_DOCUMENTS].insert_many(rows)

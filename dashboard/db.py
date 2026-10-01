@@ -38,7 +38,9 @@ from dashboard.models import (
     COLL_CONFIG,
     COLL_CROP_ALIASES,
     COLL_CROPS,
+    COLL_DISTRICTS,
     COLL_DOCUMENTS,
+    COLL_KVKS,
     COLL_LANGUAGES,
     COLL_ORGANIZATIONS,
     COLL_STATES,
@@ -120,6 +122,11 @@ _INDEXES: dict[str, list[dict]] = {
         # delete checks before refusing.
         {"keys": [("state_id", ASCENDING), ("crop_id", ASCENDING)], "name": "state_id_crop_id"},
         {"keys": [("crop_id", ASCENDING)], "name": "crop_id"},
+        # The two optional placement references. Sparse: nothing in the corpus
+        # has either, so indexing the ~9,800 rows that do not would be an index
+        # of nulls. A filter on one is a filter for the rows that have it.
+        {"keys": [("district_id", ASCENDING)], "name": "district_id", "sparse": True},
+        {"keys": [("kvk_id", ASCENDING)], "name": "kvk_id", "sparse": True},
         # The other kind of folder: an organisation or grouping instead of a crop.
         {"keys": [("state_id", ASCENDING), ("organization_id", ASCENDING)],
          "name": "state_id_organization_id"},
@@ -152,13 +159,39 @@ _INDEXES: dict[str, list[dict]] = {
     # case-sensitive `uq_name`, so creating it never conflicts with that one;
     # scripts/migrate_vocabulary_refs.py drops the old index.
     COLL_STATES: [{"keys": [("name", ASCENDING)], "unique": True, "name": "uq_name_ci",
-                   "collation": CI_COLLATION}],
+                   "collation": CI_COLLATION},
+                  # The LGD code the sync matches on. Partial rather than sparse:
+                  # `Central` has no LGD counterpart of its own, and several
+                  # code-less entries must not collide on null.
+                  {"keys": [("state_code", ASCENDING)], "unique": True, "name": "uq_state_code",
+                   "partialFilterExpression": {"state_code": {"$type": "number"}}}],
     # pop_crops is a verbatim copy of the crop master, which has its own
     # (case-SENSITIVE) unique name -- and "Amaranth" next to "amaranth" -- so no
     # index of ours is imposed on the copy.
     COLL_CROPS: [],
     COLL_ORGANIZATIONS: [{"keys": [("name", ASCENDING)], "unique": True, "name": "uq_name_ci",
                           "collation": CI_COLLATION}],
+    # Synced from LGD, so the CODE is the identity -- not the name. District
+    # names are NOT unique across India: Bilaspur is in both Chhattisgarh and
+    # Himachal Pradesh, Hamirpur in both Himachal Pradesh and Uttar Pradesh. A
+    # unique index on `name` alone would reject the real list, so the name is
+    # unique only WITHIN its parent (and that pair is also the dropdown's query).
+    COLL_DISTRICTS: [
+        {"keys": [("district_code", ASCENDING)], "unique": True, "name": "uq_district_code",
+         "partialFilterExpression": {"district_code": {"$type": "number"}}},
+        {"keys": [("state_id", ASCENDING), ("name", ASCENDING)], "unique": True,
+         "name": "uq_state_name_ci", "collation": CI_COLLATION},
+    ],
+    COLL_KVKS: [
+        # kvk_code is LGD's "K0001" -- a string, unlike the numeric district and
+        # state codes.
+        {"keys": [("kvk_code", ASCENDING)], "unique": True, "name": "uq_kvk_code",
+         "partialFilterExpression": {"kvk_code": {"$type": "string"}}},
+        {"keys": [("district_id", ASCENDING), ("name", ASCENDING)], "unique": True,
+         "name": "uq_district_name_ci", "collation": CI_COLLATION},
+        # Only for the sync and for stats; the dropdown narrows by district.
+        {"keys": [("state_id", ASCENDING)], "name": "state_id"},
+    ],
     COLL_CROP_ALIASES: [{"keys": [("spelling", ASCENDING)], "unique": True, "name": "uq_spelling_ci",
                          "collation": CI_COLLATION}],
     COLL_LANGUAGES: [{"keys": [("code", ASCENDING)], "unique": True, "name": "uq_code"}],

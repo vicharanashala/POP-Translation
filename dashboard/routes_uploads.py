@@ -35,9 +35,10 @@ another state:
 
 `states_json` + `crops_json` remain accepted for the simple case, and mean the
 cross product of the two. A group may also name `crop_ids`, `organizations`
-and `organization_ids` -- see _parse_placements. Crops must already exist in
-the crop master; a new state or organisation is created when the upload is
-filed. Names are matched case-insensitively and through each entry's other
+and `organization_ids`, and optionally a `district` and a `kvk` (by name or by
+`district_id`/`kvk_id`) that apply to every folder in that group -- see
+_parse_placements. Crops must already exist in the crop master; a new state,
+organisation, district or KVK is created when the upload is filed. Names are matched case-insensitively and through each entry's other
 known spellings, so an old spelling still lands on the standard entry.
 
 Wire format: JSON-array-encoded strings rather than native repeated Form fields
@@ -84,7 +85,8 @@ def _to_object_id(value: str) -> ObjectId:
 
 
 def _stringify_ids(placements: list[dict] | None) -> list[dict]:
-    return [{**p, **{k: str(p[k]) for k in ("state_id", "crop_id", "organization_id")
+    return [{**p, **{k: str(p[k]) for k in ("state_id", "crop_id", "organization_id",
+                                            "district_id", "kvk_id")
                      if p.get(k) is not None}}
             for p in placements or []]
 
@@ -134,7 +136,8 @@ def _parse_placements(db, placements_json: str | None, states_json: str | None,
                 raise HTTPException(400, f"state {group['state']!r}: {', '.join(_FOLDER_LISTS)} must be arrays")
             if not any(lists.values()):
                 raise HTTPException(400, f"state {group['state']!r} has no crops")
-            groups.append({"state": group["state"], **lists})
+            groups.append({"state": group["state"], **lists,
+                           **{k: group.get(k) for k in _OPTIONAL_REFS}})
     else:
         try:
             states = json.loads(states_json or "[]")
@@ -165,11 +168,18 @@ def _parse_placements(db, placements_json: str | None, states_json: str | None,
             seen.add(key)
             pairs.append({"state": state["name"], "state_id": state["id"],
                           "crop": folder["name"], "crop_kind": folder["kind"],
-                          vocabulary.field(folder["kind"]): folder["id"]})
+                          vocabulary.field(folder["kind"]): folder["id"],
+                          # Carried through as typed; resolved (and created) only
+                          # when the person approves the upload, like the state.
+                          **{k: group.get(k) for k in _OPTIONAL_REFS}})
     return pairs
 
 
 _FOLDER_LISTS = ("crops", "crop_ids", "organizations", "organization_ids")
+# Optional, per state group: the district the documents apply to and the KVK
+# they came from, by name or by id. Absent from every upload the form has ever
+# sent, and that stays valid -- neither is required.
+_OPTIONAL_REFS = ("district", "kvk", "district_id", "kvk_id")
 
 
 def _state_side(db, raw) -> dict:

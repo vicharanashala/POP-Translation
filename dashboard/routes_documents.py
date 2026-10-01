@@ -37,7 +37,9 @@ from dashboard.db import get_db
 from dashboard.display_id import format_display_id, format_row_id, parse_display_id, parse_row_id
 from dashboard.languages import LANGUAGES, TESSDATA_BEST
 from dashboard.models import (
+    COLL_DISTRICTS,
     COLL_DOCUMENTS,
+    COLL_KVKS,
     COLL_LANGUAGES,
     COLL_ORGANIZATIONS,
     COLL_STATES,
@@ -49,10 +51,15 @@ from dashboard.models import (
 )
 from dashboard.schemas import (
     CropOut,
+    DistrictOut,
     DocumentOut,
     DocumentUpdate,
     FolderOut,
+    KvkOut,
     LanguageOut,
+    LocationDistrict,
+    LocationKvk,
+    LocationState,
     OrganizationOut,
     Paginated,
     StateOut,
@@ -77,31 +84,6 @@ _NO_MATCH = object()
 _PAGE_SORT = [("created_at", DESCENDING), ("_id", ASCENDING)]
 _PAGE_SORT_AGG = {"created_at": -1, "_id": 1}
 
-# `sort=<field>` / `sort=-<field>` on the two listings. Only the audit
-# timestamps for now; no param keeps the default order above.
-_SORTABLE = ("translated_at", "reviewed_at")
-
-
-def _sort_stages(request: Request, prefix: str = "") -> list[dict]:
-    """The aggregation stages for ?sort=, or [] for the default order.
-
-    Documents with no value sort LAST in both directions -- most documents have
-    never been translated, and "oldest first" should start at the oldest
-    translation, not at thousands of blanks. `_id` breaks ties so skip/limit
-    stays stable.
-    """
-    raw = (request.query_params.get("sort") or "").strip()
-    if not raw:
-        return []
-    field = raw.lstrip("-")
-    if field not in _SORTABLE:
-        raise HTTPException(400, f"sort must be one of {', '.join(_SORTABLE)} (prefix '-' for descending)")
-    path = f"{prefix}{field}"
-    return [
-        {"$addFields": {"_sort_missing": {"$cond": [{"$ifNull": [f"${path}", False]}, 0, 1]}}},
-        {"$sort": {"_sort_missing": 1, path: -1 if raw.startswith("-") else 1, "_id": 1}},
-        {"$project": {"_sort_missing": 0}},
-    ]
 
 # The join, as an aggregation stage pair. `doc` is the unique document; a row
 # whose document has somehow gone missing still comes back (preserveNull...),
@@ -310,8 +292,10 @@ def _vocabulary_filter(db, request: Request) -> dict | None:
       filter[crop_id]=<ids>              crop master ids
       filter[organization_id]=<ids>      organisation ids
       filter[crop_kind]=crop|organization
+      filter[district]=<names>           as for state; same for filter[kvk]
+      filter[district_id]=<ids>          exact, comma = any of
     """
-    for key in ("state", "crop"):
+    for key in ("state", "crop", "district", "kvk"):
         # A range on a name column is a caller error; answered with an empty
         # page, as for every other text column, rather than silently ignored.
         if any(request.query_params.get(f"filter[{key}{suffix}]")
@@ -360,6 +344,20 @@ def _vocabulary_filter(db, request: Request) -> dict | None:
         if not either:
             return None
         clauses.append({"$or": either})
+
+    # -- district and KVK: optional references, matched by name or by id just
+    # like the state. A row that has neither simply never matches one of these.
+    for kind in ("district", "kvk"):
+        wanted = None
+        if request.query_params.get(f"filter[{kind}]"):
+            wanted = set(vocabulary.ids_matching(db, kind, _split(request.query_params[f"filter[{kind}]"])))
+        by_id = ids_param(f"{kind}_id")
+        if by_id is not None:
+            wanted = by_id if wanted is None else wanted & by_id
+        if wanted is not None:
+            if not wanted:
+                return None
+            clauses.append({vocabulary.field(kind): {"$in": sorted(wanted)}})
 
     if not clauses:
         return {}
@@ -413,7 +411,119 @@ _JOINED_FILTERS = {
 
 # Fields a PATCH on a main-table row applies to the ROW; everything else goes to
 # the document.
-_ROW_FIELDS = {"state", "crop", "organization", "state_id", "crop_id", "organization_id"}
+_ROW_FIELDS = {"state", "crop", "organization", "state_id", "crop_id", "organization_id",
+               "district", "kvk", "district_id", "kvk_id"}
+
+
+# -- ?sort= --------------------------------------------------------------------
+#
+# `sort=<column>` / `sort=-<column>`. ANY column the filters accept can also be
+# sorted on -- the whitelist is derived from the filter tables above rather than
+# written out again, so the two cannot drift apart. No param keeps the default
+# order (_PAGE_SORT).
+#
+# Fields stored on the PLACEMENT, sortable only on the main table.
+_SORT_ROW_FIELDS = {"row_id": "row_id", "created_at": "created_at", "updated_at": "updated_at"}
+# ... and on the document, sortable only on the documents listing. (On the main
+# table `created_at` means the placement's, which is what its column shows.)
+_SORT_DOC_FIELDS = {"created_at": "created_at", "updated_at": "updated_at"}
+# The columns whose values are NAMES the placement does not store -- it stores
+# an id into a vocabulary. See _vocabulary_sort_stages.
+_VOCABULARY_SORT = ("state", "crop", "district", "kvk")
+
+
+def _sortable(scope: str) -> dict[str, str]:
+    """Sort key -> the path to sort on, for one listing.
+
+    `scope` is "placements" (GET /documents, where the document is joined in
+    under `doc.`) or "documents" (GET /unique-documents, which IS the document).
+    """
+    document = {key: field for key, (field, _kind) in _JOINED_FILTERS.items()}
+    if scope == "placements":
+        return {**{k: f"doc.{f}" for k, f in document.items()}, **_SORT_ROW_FIELDS}
+    return {**document, **_SORT_DOC_FIELDS}
+
+
+def _ranked_ids(db, kinds: tuple[str, ...]) -> list:
+    """Every id in these vocabularies, ordered by the name the table shows.
+
+    Position in this list IS the sort key. Resolving the order here rather than
+    with a $lookup is not an optimisation: in production the crop master lives
+    in a DIFFERENT DATABASE (dashboard/config.py), and $lookup cannot cross one.
+    A few hundred entries all told, so the list is small enough to hand to the
+    pipeline whole.
+    """
+    entries = [(name, oid) for kind in kinds
+               for oid, name in vocabulary.name_map(db, kind).items()]
+    return [oid for _name, oid in sorted(entries, key=lambda pair: (pair[0] or "").lower())]
+
+
+def _vocabulary_sort_stages(db, key: str, scope: str, descending: bool) -> list[dict]:
+    """Sort by state, folder, district or KVK NAME. The placement stores an id,
+    so each row's id is looked up in a rank array built from the vocabulary.
+
+    The folder is one column over two vocabularies -- a crop or an organisation
+    -- so both are ranked together and whichever id the row has is used.
+
+    On the documents listing there is no placement to read, so the document's
+    ANCHOR placement (representative_row_id, the copy the document IS) is joined
+    in first. That is the same placement whose state/crop the row already
+    carries in duplicate_links, so the column sorts by what it displays.
+    """
+    stages: list[dict] = []
+    base = ""
+    if scope == "documents":
+        stages += [
+            {"$lookup": {"from": COLL_DOCUMENTS, "localField": "representative_row_id",
+                         "foreignField": "row_id", "as": "_anchor"}},
+            {"$unwind": {"path": "$_anchor", "preserveNullAndEmptyArrays": True}},
+        ]
+        base = "_anchor."
+    if key == "crop":
+        # One column, two vocabularies: a folder is a crop or an organisation.
+        order = _ranked_ids(db, ("crop", "organization"))
+        value = {"$ifNull": [f"${base}crop_id", f"${base}organization_id"]}
+    else:
+        order, value = _ranked_ids(db, (key,)), f"${base}{vocabulary.field(key)}"
+    return stages + [
+        # -1 is $indexOfArray's "not in the list", which covers both a row with
+        # no folder and an id whose entry has since gone -- either way there is
+        # no name to sort by, so it goes last like any other blank.
+        {"$addFields": {"_sort_rank": {"$indexOfArray": [order, value]}}},
+        {"$addFields": {"_sort_missing": {"$cond": [{"$eq": ["$_sort_rank", -1]}, 1, 0]}}},
+        {"$sort": {"_sort_missing": 1, "_sort_rank": -1 if descending else 1, "_id": 1}},
+        {"$project": {"_sort_rank": 0, "_sort_missing": 0, "_anchor": 0}},
+    ]
+
+
+def _sort_stages(db, request: Request, scope: str) -> list[dict]:
+    """The aggregation stages for ?sort=, or [] for the default order.
+
+    Rows with no value sort LAST in both directions -- most documents have never
+    been translated, and "oldest first" should start at the oldest translation,
+    not at thousands of blanks. `_id` breaks ties so skip/limit stays stable.
+    """
+    raw = (request.query_params.get("sort") or "").strip()
+    if not raw:
+        return []
+    key, descending = raw.lstrip("-"), raw.startswith("-")
+    allowed = _sortable(scope)
+    if key in _VOCABULARY_SORT:
+        return _vocabulary_sort_stages(db, key, scope, descending)
+    if key not in allowed:
+        raise HTTPException(
+            400, f"sort must be one of {', '.join(sorted(set(allowed) | set(_VOCABULARY_SORT)))} "
+                 f"(prefix '-' for descending)")
+    path = allowed[key]
+    return [
+        # Missing means ABSENT, tested by type -- not falsy. `$ifNull` would put
+        # POP_00000, a 0-page document and an empty string at the bottom with
+        # the blanks, because $cond reads 0 and "" as false.
+        {"$addFields": {"_sort_missing": {
+            "$cond": [{"$in": [{"$type": f"${path}"}, ["missing", "null"]]}, 1, 0]}}},
+        {"$sort": {"_sort_missing": 1, path: -1 if descending else 1, "_id": 1}},
+        {"$project": {"_sort_missing": 0}},
+    ]
 
 
 def _build_filter(request: Request, allowed: dict, prefix: str = "") -> dict | None:
@@ -491,6 +601,10 @@ def _document_out(row: dict, names: dict) -> DocumentOut:
         state_id=str(row["state_id"]) if row.get("state_id") else None,
         crop_id=str(row["crop_id"]) if row.get("crop_id") else None,
         organization_id=str(row["organization_id"]) if row.get("organization_id") else None,
+        district=names["district"].get(row.get("district_id")),
+        kvk=names["kvk"].get(row.get("kvk_id")),
+        district_id=str(row["district_id"]) if row.get("district_id") else None,
+        kvk_id=str(row["kvk_id"]) if row.get("kvk_id") else None,
         subpath=row.get("subpath"),
         unique_document_id=str(row.get("unique_document_id", "")),
         document_id=format_display_id(doc.get("display_id")) or "",
@@ -518,11 +632,17 @@ def _document_out(row: dict, names: dict) -> DocumentOut:
     )
 
 
-def _copy_places(db, docs: list[dict]) -> dict[int, tuple[str, str]]:
-    """row_id -> (state name, crop name) for every copy on these documents.
+def _copy_places(db, docs: list[dict]) -> dict[int, dict]:
+    """row_id -> where that placement files the copy: state, folder, district
+    and KVK, by name.
 
-    A copy entry names its placement by row_id and carries no folder of its
-    own, so the folder is read from the placement. One query for a whole page.
+    A copy entry names its placement by row_id and carries none of this itself,
+    so it is all read from the placement. One query for a whole page.
+
+    This is how the documents listing shows a state and a folder at all: a
+    document has no single one, so the frontend reads the entry whose row_id is
+    the document's `representative_row_id` -- the anchor, the copy the document
+    IS. District and KVK are here for exactly the same reason.
     """
     row_ids = {c.get("row_id") for d in docs for c in (d.get("duplicate_links") or [])}
     row_ids.discard(None)
@@ -530,10 +650,16 @@ def _copy_places(db, docs: list[dict]) -> dict[int, tuple[str, str]]:
         return {}
     names = _names(db)
     return {
-        r["row_id"]: (names["state"].get(r.get("state_id"), ""), _folder_of(r, names)[0])
+        r["row_id"]: {
+            "state": names["state"].get(r.get("state_id"), ""),
+            "crop": _folder_of(r, names)[0],
+            "district": names["district"].get(r.get("district_id")),
+            "kvk": names["kvk"].get(r.get("kvk_id")),
+        }
         for r in db[COLL_DOCUMENTS].find(
             {"row_id": {"$in": list(row_ids)}},
-            {"row_id": 1, "state_id": 1, "crop_id": 1, "organization_id": 1})
+            {"row_id": 1, "state_id": 1, "crop_id": 1, "organization_id": 1,
+             "district_id": 1, "kvk_id": 1})
     }
 
 
@@ -542,8 +668,7 @@ def _unique_out(doc: dict, places: dict[int, tuple[str, str]]) -> UniqueDocument
     data = dict(doc)
     links = []
     for link in data.get("duplicate_links") or []:
-        state, crop = places.get(link.get("row_id"), (None, None))
-        links.append({**link, "state": state, "crop": crop})
+        links.append({**link, **places.get(link.get("row_id"), {})})
     data["duplicate_links"] = links
     data["id"] = str(data.pop("_id"))
     data["document_id"] = format_display_id(data.pop("display_id", None)) or ""
@@ -578,7 +703,7 @@ def _unique_one(db, doc: dict) -> UniqueDocumentOut:
 @router.get("/documents", response_model=Paginated[DocumentOut])
 def list_documents(request: Request, db=Depends(get_db)):
     page, page_size = _pagination(request)
-    sort = _sort_stages(request, prefix="doc.") or [{"$sort": _PAGE_SORT_AGG}]
+    sort = _sort_stages(db, request, "placements") or [{"$sort": _PAGE_SORT_AGG}]
     row_query = _build_filter(request, _DOCUMENT_FILTERS)
     names_query = _vocabulary_filter(db, request)
     doc_query = _build_filter(request, _JOINED_FILTERS, prefix="doc.")
@@ -644,6 +769,48 @@ def list_siblings(row_id: str, db=Depends(get_db)):
     return [_document_out(other, names) for other in others]
 
 
+# The placement references a PATCH may set on either endpoint -- on the row
+# directly, or on a document's anchor row.
+_PLACEMENT_REF_FIELDS = ("district", "kvk", "district_id", "kvk_id")
+
+
+def _placement_refs(db, submitted: dict) -> tuple[dict, dict]:
+    """($set, $unset) for the district/kvk references in a PATCH body.
+
+    Each may arrive as an id (must name an existing entry) or as a NAME, which
+    is created if nobody has used it, like a state. An EMPTY STRING clears the
+    reference -- the only way to say "no district after all", since a null here
+    means "not sent", as it does for every other field.
+
+    Shared by PATCH /documents/{row_id} and PATCH /unique-documents/{id} so the
+    two cannot come to disagree about what clears a field.
+    """
+    move: dict = {}
+    unset: dict = {}
+    for kind in ("district", "kvk"):
+        f = vocabulary.field(kind)
+        if submitted.get(f"{kind}_id") is not None:
+            entry = vocabulary.get(db, kind, submitted[f"{kind}_id"])
+            if entry is None:
+                raise HTTPException(400, f"{kind}_id does not name an existing {kind}")
+            move[f] = entry["_id"]
+        elif submitted.get(kind) is not None:
+            raw = " ".join(str(submitted[kind]).split())
+            if not raw:
+                unset[f] = ""          # "" is the one way to clear it
+                continue
+            # Synced from LGD and never created here, so an unrecognised name is
+            # a mistake to report -- NOT something to quietly drop, which is
+            # what returning None used to cause.
+            entry = vocabulary.find(db, kind, raw)
+            if entry is None:
+                raise HTTPException(
+                    400, f"{raw!r} is not a known {kind} -- pick one from "
+                         f"GET /dashboard/{vocabulary._path(kind)}")
+            move[f] = entry["_id"]
+    return move, unset
+
+
 @router.patch("/documents/{row_id}", response_model=DocumentOut)
 def update_document(row_id: str, body: DocumentUpdate, db=Depends(get_db)):
     """Edit a row. state/crop change this placement; every other field changes
@@ -701,6 +868,11 @@ def update_document(row_id: str, body: DocumentUpdate, db=Depends(get_db)):
                     400, f"{value!r} is not a crop in the crop master -- send it as "
                          f"\"organization\" if it is an organisation or grouping")
             folder = (found[0], found[1], value)
+    # District and KVK move independently of the folder.
+    refs, ref_unset = _placement_refs(db, row_updates)
+    move.update(refs)
+    unset.update(ref_unset)
+
     if folder is not None:
         kind, entry, raw = folder
         other = "organization" if kind == "crop" else "crop"
@@ -710,7 +882,9 @@ def update_document(row_id: str, body: DocumentUpdate, db=Depends(get_db)):
 
     if doc_updates:
         _apply_document_updates(db, row["unique_document_id"], doc_updates)
-    if move:
+    if move or unset:
+        # `unset` alone is a real change -- clearing a district sets nothing --
+        # so this cannot be gated on `move`, which is empty in that case.
         move["updated_at"] = utcnow()
         db[COLL_DOCUMENTS].update_one({"_id": oid}, {"$set": move, **({"$unset": unset} if unset else {})})
     return _joined_one(db, db[COLL_DOCUMENTS].find_one({"_id": oid}))
@@ -857,6 +1031,31 @@ def _multi_placement(value: str):
     return _NO_MATCH
 
 
+def _documents_placed_like(db, request: Request) -> dict | None:
+    """The clause restricting the documents listing to documents PLACED a given
+    way -- filter[state], filter[crop], filter[district], filter[kvk] and the
+    _id forms, which are otherwise main-table-only because they live on the
+    placement rather than on the document.
+
+    Matches on ANY placement: "the documents filed in Kerala" is every document
+    with a Kerala placement, the same set the main table's filter describes,
+    lifted from placements to documents. Note the row still DISPLAYS its anchor
+    placement's state, and 59 of 8,749 documents are filed in more than one
+    state -- for those the filter can match on a placement other than the one
+    shown.
+
+    {} when nothing is being filtered, None when nothing can match.
+    """
+    clause = _vocabulary_filter(db, request)
+    if clause is None:
+        return None
+    if not clause:
+        return {}
+    # One hop: which documents those placements belong to. The corpus is ~9,800
+    # placements, so this reads at most that many ids and usually far fewer.
+    return {"_id": {"$in": db[COLL_DOCUMENTS].distinct("unique_document_id", clause)}}
+
+
 @router.get("/unique-documents", response_model=Paginated[UniqueDocumentOut])
 def list_unique_documents(request: Request, db=Depends(get_db)):
     """The documents themselves, paginated 100/page.
@@ -867,15 +1066,21 @@ def list_unique_documents(request: Request, db=Depends(get_db)):
     de-duplicating a page -- pagination is server-side, so a page of placements
     collapses to an unpredictable number of documents and the total is wrong.
 
-    Same filter names as the main table's document-level filters, plus
+    Same filter names as the main table's document-level filters, plus the
+    placement filters (state, crop, district, kvk and their _id forms) and
     `filter[multi_placement]=true` for the documents filed in more than one
     place.
     """
     page, page_size = _pagination(request)
-    sort = _sort_stages(request)
+    sort = _sort_stages(db, request, "documents")
     query = _build_filter(request, _UNIQUE_FILTERS)
     if query is None:
         return _empty_page(page, page_size)
+
+    placed = _documents_placed_like(db, request)
+    if placed is None:
+        return _empty_page(page, page_size)
+    query.update(placed)
 
     raw = request.query_params.get("filter[multi_placement]")
     if raw:
@@ -912,13 +1117,49 @@ def get_unique_document(document_id: str, db=Depends(get_db)):
 
 @router.patch("/unique-documents/{document_id}", response_model=UniqueDocumentOut)
 def update_unique_document(document_id: str, body: UniqueDocumentUpdate, db=Depends(get_db)):
+    """Edit a document. Everything lands on the document and therefore on all of
+    its placements -- EXCEPT district and kvk, which are placement fields and go
+    to this document's ANCHOR placement only. See _apply_anchor_refs.
+    """
     oid = _to_object_id(document_id)
-    if db[COLL_UNIQUE_DOCUMENTS].count_documents({"_id": oid}, limit=1) == 0:
+    doc = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": oid}, {"representative_row_id": 1})
+    if doc is None:
         raise HTTPException(404, "unique document not found")
     updates = body.model_dump(exclude_unset=True)
+    anchor = {k: updates.pop(k) for k in _PLACEMENT_REF_FIELDS if k in updates}
     if updates:
         _apply_document_updates(db, oid, updates)
+    if anchor:
+        _apply_anchor_refs(db, doc, anchor)
     return _unique_one(db, db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": oid}))
+
+
+def _apply_anchor_refs(db, doc: dict, submitted: dict) -> None:
+    """Write district/kvk to a document's ANCHOR placement -- the copy the
+    document IS (representative_row_id).
+
+    WHY THE ANCHOR AND NOT EVERY PLACEMENT. These are placement fields: a
+    document filed in two states cannot sensibly have one district, and 59 of
+    8,749 documents are filed in more than one state -- writing a Kerala
+    district onto a Karnataka placement would be worse than not writing it. The
+    anchor is also the placement the documents listing already DISPLAYS (its
+    state, folder, district and kvk are what `duplicate_links` reports for
+    `representative_row_id`), so the edit changes exactly what the row shows.
+
+    For the 8,358 single-placement documents there is no distinction to make.
+    To set a district on some other placement, PATCH that row.
+    """
+    row_id = doc.get("representative_row_id")
+    row = db[COLL_DOCUMENTS].find_one({"row_id": row_id}) if row_id is not None else None
+    if row is None:
+        raise HTTPException(
+            409, "this document has no anchor placement, so it has nowhere to keep a "
+                 "district or kvk -- file it somewhere first, or PATCH a placement directly")
+    move, unset = _placement_refs(db, submitted)
+    if move or unset:
+        move["updated_at"] = utcnow()
+        db[COLL_DOCUMENTS].update_one(
+            {"_id": row["_id"]}, {"$set": move, **({"$unset": unset} if unset else {})})
 
 
 @router.get("/unique-documents/{document_id}/placements", response_model=list[DocumentOut])
@@ -937,10 +1178,24 @@ def list_placements(document_id: str, db=Depends(get_db)):
 # -- lookups -------------------------------------------------------------------
 
 
+# The extra fields each vocabulary's output model carries beyond name/raw_names:
+# the LGD code and the parent reference, read straight off the stored entry.
+_ENTRY_EXTRAS = {
+    "DistrictOut": (("code", "district_code"), ("state_id", "state_id")),
+    "KvkOut": (("code", "kvk_code"), ("address", "address"),
+               ("district_id", "district_id"), ("state_id", "state_id")),
+    "StateOut": (("code", "state_code"),),
+}
+
+
 def _entry_out(model, row: dict, counts: dict, spellings: dict | None = None):
     raw = (spellings or {}).get(row["_id"]) if spellings is not None else row.get("raw_names")
+    extras = {}
+    for out_name, stored in _ENTRY_EXTRAS.get(model.__name__, ()):
+        value = row.get(stored)
+        extras[out_name] = str(value) if isinstance(value, ObjectId) else value
     return model(id=str(row["_id"]), name=row["name"], raw_names=sorted(raw or []),
-                 document_count=counts.get(row["_id"], 0))
+                 document_count=counts.get(row["_id"], 0), **extras)
 
 
 def _vocabulary_call(fn, *args):
@@ -1023,6 +1278,89 @@ def list_organizations(request: Request, db=Depends(get_db)):
                   key=lambda o: o.name.lower())
 
 
+def _by_parent(db, request: Request, kind: str) -> list[dict] | None:
+    """The entries a dropdown should offer, narrowed to one parent if asked.
+
+    Narrowed by PARENT REFERENCE, never by what placements already use: the Add
+    Document and Edit forms need the whole official list, and "already used" is
+    empty until people start tagging documents -- which is exactly why the
+    dropdowns were empty before the LGD sync.
+
+    Unnarrowed returns everything, which is what the column FILTER dropdowns
+    want: a filter should offer every value that could match, whatever state is
+    selected elsewhere. None when the named parent does not exist.
+    """
+    parent_kind, _f = vocabulary.PARENT[kind]
+    by_id = request.query_params.get(f"{parent_kind}_id")
+    by_name = request.query_params.get(parent_kind)
+    if not (by_id or by_name):
+        return list(vocabulary.entries(db, kind, None))
+    parent = (vocabulary.get(db, parent_kind, by_id) if by_id
+              else vocabulary.find(db, parent_kind, by_name))
+    if parent is None:
+        return None
+    return vocabulary.children_of(db, kind, parent["_id"])
+
+
+@router.get("/districts", response_model=list[DistrictOut])
+def list_districts(request: Request, db=Depends(get_db)):
+    """Districts, synced from LGD. `?state_id=` / `?state=` narrows to that
+    state's districts -- what the Add Document and Edit forms use. Unnarrowed
+    returns all of them, for the column filter dropdown."""
+    rows = _by_parent(db, request, "district")
+    if rows is None:
+        return []
+    counts = vocabulary.usage_counts(db, "district")
+    return [_entry_out(DistrictOut, row, counts) for row in rows]
+
+
+@router.get("/kvks", response_model=list[KvkOut])
+def list_kvks(request: Request, db=Depends(get_db)):
+    """KVKs, synced from LGD. `?district_id=` / `?district=` narrows to that
+    district's KVKs -- what the forms use. Unnarrowed returns all of them, for
+    the column filter dropdown."""
+    rows = _by_parent(db, request, "kvk")
+    if rows is None:
+        return []
+    counts = vocabulary.usage_counts(db, "kvk")
+    return [_entry_out(KvkOut, row, counts) for row in rows]
+
+
+@router.get("/locations", response_model=list[LocationState])
+def list_locations(db=Depends(get_db)):
+    """Every state with its districts, and every district with its KVKs, in ONE
+    request -- fetched once when the frontend loads, like the audit name lists.
+
+    Stored flat (a district holds its state_id, a KVK its district_id) and
+    assembled here, so there is one copy of the relationship rather than a
+    nested one that can drift out of step with the references placements use.
+    Three queries whatever the size: 37 states, ~790 districts, 727 KVKs.
+    """
+    kvks_by_district: dict = {}
+    for k in vocabulary.entries(db, "kvk", None):
+        kvks_by_district.setdefault(k.get("district_id"), []).append(k)
+    districts_by_state: dict = {}
+    for d in vocabulary.entries(db, "district", None):
+        districts_by_state.setdefault(d.get("state_id"), []).append(d)
+
+    def ordered(rows):
+        # "All" first, then A-Z -- the order a dropdown wants.
+        return sorted(rows, key=lambda e: (e["name"] != vocabulary.ALL, (e.get("name") or "").lower()))
+
+    out = []
+    for state in ordered(db[COLL_STATES].find()):
+        districts = []
+        for d in ordered(districts_by_state.get(state["_id"], [])):
+            districts.append(LocationDistrict(
+                id=str(d["_id"]), name=d["name"], code=d.get("district_code"),
+                kvks=[LocationKvk(id=str(k["_id"]), name=k["name"], code=k.get("kvk_code"),
+                                  address=k.get("address"))
+                      for k in ordered(kvks_by_district.get(d["_id"], []))]))
+        out.append(LocationState(id=str(state["_id"]), name=state["name"],
+                                 code=state.get("state_code"), districts=districts))
+    return out
+
+
 @router.get("/folders", response_model=list[FolderOut])
 def list_folders(request: Request, db=Depends(get_db)):
     """The Folder dropdown -- for the Add Document form and the table's Folder
@@ -1049,6 +1387,10 @@ def list_folders(request: Request, db=Depends(get_db)):
 
 
 def _create_entry(db, kind: str, body: dict, model):
+    if not vocabulary.KINDS[kind][3]:
+        # resolve() will not invent an entry for a synced kind, so say why
+        # rather than failing on the None it returns.
+        raise HTTPException(403, vocabulary.read_only_reason(kind))
     raw = (body or {}).get("name")
     if not raw or not str(raw).strip():
         raise HTTPException(400, "name is required")
@@ -1122,6 +1464,56 @@ def merge_organizations(organization_id: str, body: VocabularyMerge, db=Depends(
 def delete_organization(organization_id: str, db=Depends(get_db)):
     """Delete an organisation nothing uses. 409 while anything references it."""
     _vocabulary_call(vocabulary.delete, db, "organization", organization_id)
+
+
+@router.post("/districts", response_model=DistrictOut, status_code=201)
+def create_district(body: dict, db=Depends(get_db)):
+    """Add a district. Idempotent, like POST /states."""
+    return _create_entry(db, "district", body, DistrictOut)
+
+
+@router.patch("/districts/{district_id}", response_model=DistrictOut)
+def rename_district(district_id: str, body: VocabularyRename, db=Depends(get_db)):
+    """Rename a district. Every placement shows the new name at once. 409 if
+    another district already has the name -- merge into that one instead."""
+    return _rename_entry(db, "district", district_id, body, DistrictOut)
+
+
+@router.post("/districts/{district_id}/merge", response_model=VocabularyMergeResult)
+def merge_districts(district_id: str, body: VocabularyMerge, db=Depends(get_db)):
+    """Fold the `absorb` districts into this one -- the fix for "Mysore" and
+    "Mysuru" having become two entries."""
+    return _merge_entries(db, "district", district_id, body)
+
+
+@router.delete("/districts/{district_id}", status_code=204)
+def delete_district(district_id: str, db=Depends(get_db)):
+    """Delete a district nothing uses. 409 while anything references it."""
+    _vocabulary_call(vocabulary.delete, db, "district", district_id)
+
+
+@router.post("/kvks", response_model=KvkOut, status_code=201)
+def create_kvk(body: dict, db=Depends(get_db)):
+    """Add a KVK. Idempotent, like POST /states."""
+    return _create_entry(db, "kvk", body, KvkOut)
+
+
+@router.patch("/kvks/{kvk_id}", response_model=KvkOut)
+def rename_kvk(kvk_id: str, body: VocabularyRename, db=Depends(get_db)):
+    """Rename a KVK. 409 if another already has the name -- merge instead."""
+    return _rename_entry(db, "kvk", kvk_id, body, KvkOut)
+
+
+@router.post("/kvks/{kvk_id}/merge", response_model=VocabularyMergeResult)
+def merge_kvks(kvk_id: str, body: VocabularyMerge, db=Depends(get_db)):
+    """Fold the `absorb` KVKs into this one."""
+    return _merge_entries(db, "kvk", kvk_id, body)
+
+
+@router.delete("/kvks/{kvk_id}", status_code=204)
+def delete_kvk(kvk_id: str, db=Depends(get_db)):
+    """Delete a KVK nothing uses. 409 while anything references it."""
+    _vocabulary_call(vocabulary.delete, db, "kvk", kvk_id)
 
 
 # Crops are read-only here: the crop master is edited from another application.

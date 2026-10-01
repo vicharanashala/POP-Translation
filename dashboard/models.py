@@ -1,6 +1,6 @@
 """Collection names, enums and factories for the document management dashboard.
 
-TWO core collections plus three lookups.
+TWO core collections plus five lookups.
 
   documents          the MAIN TABLE. One row per (file x state x crop) placement
                      exactly as it appears under the Zoho WorkDrive corpus root.
@@ -36,9 +36,10 @@ person accepts -- see dashboard/routes_merge.py. A merge repoints placements and
 deletes the absorbed DOCUMENT; it never deletes a `documents` row, because each
 one is a real file sitting in a real folder.
 
-Lookups. States, crops and organisations are REFERENCED: a placement stores
-`state_id` plus `crop_id` or `organization_id`, and the name lives only in the
-lookup, so a rename or a merge is one write -- see dashboard/vocabulary.py.
+Lookups. States, crops, organisations, districts and KVKs are REFERENCED: a
+placement stores `state_id` plus `crop_id` or `organization_id`, optionally
+`district_id` and `kvk_id`, and the name lives only in the lookup, so a rename
+or a merge is one write -- see dashboard/vocabulary.py.
 Crops come from the crop master, which another application edits; this backend
 only reads them. (An earlier schema abandoned lookup ids because pruned crops
 came back with a different id; entries are now never pruned while in use.)
@@ -74,6 +75,16 @@ COLL_ORGANIZATIONS = "pop_organizations"
 # a form using an old spelling still lands on the master entry. The master's
 # `aliases` are regional names ("sajje"), a different thing.
 COLL_CROP_ALIASES = "pop_crop_aliases"
+# Where a placement's document applies, and the Krishi Vigyan Kendra it came
+# from. Both are OURS and editable, like organisations. Neither comes from the
+# WorkDrive folder tree -- the corpus is filed <state>/<folder>/, with no
+# district or KVK level -- so both are empty on every migrated placement and
+# fill up only as people set them. KVK is deliberately its own vocabulary and
+# not an organisation: `pop_organizations` holds FOLDER names (including one
+# called "KVK Files"), which is a different question from which KVK issued a
+# document.
+COLL_DISTRICTS = "pop_districts"
+COLL_KVKS = "pop_kvks"
 COLL_LANGUAGES = "pop_languages"
 COLL_UPLOAD_QUEUE_ITEMS = "pop_upload_queue_items"
 COLL_TRANSLATION_JOBS = "pop_translation_jobs"
@@ -235,7 +246,8 @@ MANUAL_METADATA_FIELDS = (
 
 
 def new_document(*, row_id: int, unique_document_id, state_id, state_raw: str,
-                 crop_raw: str, crop_id=None, organization_id=None, **fields) -> dict:
+                 crop_raw: str, crop_id=None, organization_id=None,
+                 district_id=None, kvk_id=None, **fields) -> dict:
     """One row of the main table: this document, filed under this state and crop.
 
     An ASSOCIATION and nothing more. No sha256, no link, no metadata -- those
@@ -247,6 +259,11 @@ def new_document(*, row_id: int, unique_document_id, state_id, state_raw: str,
     `state_raw`/`crop_raw` keep the original folder names from Zoho, because the
     OCR language lookup keys off the raw state name and because a folder has to
     stay findable by the name it actually has in WorkDrive.
+
+    `district_id` and `kvk_id` are optional and OMITTED when not given, rather
+    than stored as null: nothing in WorkDrive's folder tree says which district
+    or KVK a file belongs to, so every migrated placement simply does not have
+    them, and "$exists" is what tells a set one from an unset one.
     """
     now = utcnow()
     doc = {
@@ -260,6 +277,8 @@ def new_document(*, row_id: int, unique_document_id, state_id, state_raw: str,
         "state_raw": state_raw,
         **({"crop_id": crop_id} if crop_id is not None else {"organization_id": organization_id}),
         "crop_raw": crop_raw,
+        **({"district_id": district_id} if district_id is not None else {}),
+        **({"kvk_id": kvk_id} if kvk_id is not None else {}),
         # Anything nested deeper than <state>/<crop>/<file> in WorkDrive. Empty
         # for the corpus as it stands; recorded rather than flattened so an
         # unexpected extra folder level is visible instead of silently changing

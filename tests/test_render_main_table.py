@@ -56,12 +56,18 @@ def db():
 
 @pytest.fixture
 def vocab_guard(db):
-    """Deletes any state or organisation a test created and left unused, so runs
+    """Deletes any state or organisation a test seeded and left unused, so runs
     do not accumulate "Scratchland" entries in the real dropdowns. Entries that
-    existed before the test are never touched. (Crops are never created.)"""
+    existed before the test are never touched.
+
+    Districts and KVKs are deliberately NOT watched: they are synced from LGD
+    (scripts/sync_lgd.py), no test creates one -- the API answers 403 -- and
+    deleting one would quietly shrink a real dropdown. Crops likewise.
+    """
     from dashboard.models import COLL_DOCUMENTS, COLL_ORGANIZATIONS, COLL_STATES
 
-    before = {c: {e["_id"] for e in db[c].find({}, {"_id": 1})} for c in (COLL_STATES, COLL_ORGANIZATIONS)}
+    watched = (COLL_STATES, COLL_ORGANIZATIONS)
+    before = {c: {e["_id"] for e in db[c].find({}, {"_id": 1})} for c in watched}
     yield
     for coll, field in ((COLL_STATES, "state_id"), (COLL_ORGANIZATIONS, "organization_id")):
         for e in db[coll].find({"_id": {"$nin": list(before[coll])}}, {"_id": 1}):
@@ -69,17 +75,36 @@ def vocab_guard(db):
                 db[coll].delete_one({"_id": e["_id"]})
 
 
+def _scratch_state(db, raw: str) -> dict:
+    """The throwaway state's entry, inserted straight through pymongo if absent.
+
+    NOT through vocabulary.resolve(): states are synced from LGD now and nothing
+    in the API creates one, so a test seeds it the way it seeds documents.
+    vocab_guard removes it again if nothing ended up using it.
+    """
+    from dashboard.models import COLL_STATES, normalize_state_name, utcnow
+
+    name = normalize_state_name(raw)
+    entry = db[COLL_STATES].find_one({"name": name})
+    if entry is None:
+        now = utcnow()
+        db[COLL_STATES].insert_one({"name": name, "raw_names": [raw],
+                                    "created_at": now, "updated_at": now})
+        entry = db[COLL_STATES].find_one({"name": name})
+    return entry
+
+
 def _placement_row(db, *, row_id, unique_document_id, state, crop, **fields):
-    """A placement for a test fixture, referencing (and if need be creating)
-    its state and folder the way the real write paths do. A folder name the crop
-    master does not know -- every "Scratch ..." name -- becomes an organisation."""
+    """A placement for a test fixture, referencing its state and folder the way
+    the real write paths do. A folder name the crop master does not know -- every
+    "Scratch ..." name -- becomes an organisation, which IS still ours."""
     from dashboard import vocabulary
     from dashboard.models import new_document
 
     kind, entry = vocabulary.folder(db, crop)
     return new_document(
         row_id=row_id, unique_document_id=unique_document_id,
-        state_id=vocabulary.resolve(db, "state", state)["_id"],
+        state_id=_scratch_state(db, state)["_id"],
         state_raw=state, crop_raw=crop, **{vocabulary.field(kind): entry["_id"]}, **fields)
 
 
@@ -1060,22 +1085,27 @@ def test_organization_names_are_unique_regardless_of_case(client, db, vocab_guar
     client.delete(f"/dashboard/organizations/{existing['id']}")
 
 
-def test_states_rename_merge_and_delete_like_organizations(client, db, scratch):
+def test_organizations_rename_merge_and_delete(client, db, scratch):
+    """Organisations are the one vocabulary still ours to edit -- they are
+    WorkDrive FOLDER names, which no external registry knows about. States used
+    to work this way too; they are synced from LGD now, so these three operations
+    answer 403 there (see test_the_synced_vocabularies_refuse_every_write)."""
     from dashboard.models import COLL_DOCUMENTS
 
     _doc, rows = scratch
-    state_id = client.get(f"/dashboard/documents/{rows[0]['_id']}").json()["state_id"]
-    other = client.post("/dashboard/states", json={"name": "Zz Scratch Region"}).json()
-    assert client.delete(f"/dashboard/states/{state_id}").status_code == 409
+    org_id = client.get(f"/dashboard/documents/{rows[0]['_id']}").json()["organization_id"]
+    other = client.post("/dashboard/organizations", json={"name": "Zz Scratch Folder"}).json()
+    assert client.delete(f"/dashboard/organizations/{org_id}").status_code == 409
 
-    renamed = client.patch(f"/dashboard/states/{state_id}", json={"name": "Scratchland Renamed"}).json()
-    assert renamed["name"] == "Scratchland Renamed"
-    assert client.get(f"/dashboard/documents/{rows[1]['_id']}").json()["state"] == "Scratchland Renamed"
+    renamed = client.patch(f"/dashboard/organizations/{org_id}",
+                           json={"name": "Scratch Alpha Renamed"}).json()
+    assert renamed["name"] == "Scratch Alpha Renamed"
+    assert client.get(f"/dashboard/documents/{rows[0]['_id']}").json()["crop"] == "Scratch Alpha Renamed"
 
-    merged = client.post(f"/dashboard/states/{other['id']}/merge", json={"absorb": [state_id]}).json()
-    assert merged["placements_repointed"] == 2 and merged["name"] == "Zz Scratch Region"
-    assert {str(r["state_id"]) for r in db[COLL_DOCUMENTS].find(
-        {"_id": {"$in": [r["_id"] for r in rows]}})} == {other["id"]}
+    merged = client.post(f"/dashboard/organizations/{other['id']}/merge",
+                         json={"absorb": [org_id]}).json()
+    assert merged["placements_repointed"] == 1 and merged["name"] == "Zz Scratch Folder"
+    assert str(db[COLL_DOCUMENTS].find_one({"_id": rows[0]["_id"]})["organization_id"]) == other["id"]
 
 
 def test_lookup_lists_carry_ids_and_live_counts(client, scratch):
@@ -1166,6 +1196,16 @@ def _await_review(client, item_id, timeout=30.0):
     pytest.fail(f"upload {item_id} never left {item['status']}")
 
 
+def _state_name(client, typed: str) -> str:
+    """What the catalogue calls the state a form typed, whatever spelling the
+    LGD sync has given it. "State Kerala" resolves to "Keralam" today; asserting
+    the literal would break on the next sync, and on nothing that matters."""
+    for state in client.get("/dashboard/states").json():
+        if typed in state["raw_names"] or typed == state["name"]:
+            return state["name"]
+    raise AssertionError(f"no state resolves {typed!r}")
+
+
 def test_upload_takes_per_state_crop_groups(client):
     """A state with its crops, then another state with different crops -- not a
     cross product of one crop list over every state."""
@@ -1175,10 +1215,11 @@ def test_upload_takes_per_state_crop_groups(client):
     ]))
     try:
         item = client.get(f"/dashboard/uploads/{item_id}").json()
+        karnataka, kerala = _state_name(client, "State Karnataka"), _state_name(client, "State Kerala")
         # "Ragi" is one of our older spellings of a master crop, so the form
         # lands on the master's entry rather than on a name the master lacks.
         assert [(p["state"], p["crop"]) for p in item["placements"]] == [
-            ("Karnataka", "Paddy"), ("Karnataka", "Finger Millet"), ("Kerala", "Coconut")]
+            (karnataka, "Paddy"), (karnataka, "Finger Millet"), (kerala, "Coconut")]
     finally:
         client.post(f"/dashboard/uploads/{item_id}/cancel")
 
@@ -1189,7 +1230,8 @@ def test_states_and_crops_still_work_as_a_cross_product(client):
     try:
         item = client.get(f"/dashboard/uploads/{item_id}").json()
         assert [(p["state"], p["crop"]) for p in item["placements"]] == [
-            ("Karnataka", "Paddy"), ("Kerala", "Paddy")]
+            (_state_name(client, "State Karnataka"), "Paddy"),
+            (_state_name(client, "State Kerala"), "Paddy")]
     finally:
         client.post(f"/dashboard/uploads/{item_id}/cancel")
 
@@ -1587,11 +1629,21 @@ def test_name_lists_for_the_audit_filters(client, db, scratch):
 
 
 def test_states_list_every_state_and_union_territory(client):
-    names = {s["name"] for s in client.get("/dashboard/states").json()}
-    assert {"Chandigarh", "Dadra and Nagar Haveli and Daman and Diu", "Ladakh", "Lakshadweep",
-            "Chhattisgarh", "Tamil Nadu", "Andaman and Nicobar Islands", "Delhi",
-            "Jammu and Kashmir", "Puducherry"} <= names
-    assert not {"Chattisgarh", "Tamilnadu", "Andaman and Nicobar"} & names
+    """Every state and UT is present. Matched case-insensitively and across each
+    entry's other spellings, because the names come from the LGD sync and it
+    capitalises "And", prefixes an article, and says Keralam -- none of which
+    changes which places are covered."""
+    entries = client.get("/dashboard/states").json()
+    known = {n.casefold().removeprefix("the ")
+             for s in entries for n in [s["name"], *s["raw_names"]]}
+    for place in ("Chandigarh", "Dadra and Nagar Haveli and Daman and Diu", "Ladakh",
+                  "Lakshadweep", "Chhattisgarh", "Tamil Nadu", "Andaman and Nicobar Islands",
+                  "Delhi", "Jammu and Kashmir", "Puducherry", "Kerala"):
+        assert place.casefold() in known, place
+    # The old misspellings survive only as alternative spellings, so a stale
+    # filter still resolves -- but none of them is any entry's current name.
+    current = {s["name"] for s in entries}
+    assert not {"Chattisgarh", "Tamilnadu", "Andaman and Nicobar"} & current
 
 
 def test_audit_fields_are_served_filtered_and_sorted(client, db, scratch):
@@ -1627,7 +1679,10 @@ def test_audit_fields_are_served_filtered_and_sorted(client, db, scratch):
                                           "filter[shareable_name]": "scratch-test"}).json()["items"]
         assert oldest and oldest[0]["translated_by"] == "Scratch Translator"
 
-    assert client.get("/dashboard/unique-documents", params={"sort": "shareable_name"}).status_code == 400
+    # Sorting is no longer limited to the audit timestamps -- any filterable
+    # column goes (see test_every_filterable_column_can_be_sorted). Only a
+    # column that does not exist is refused.
+    assert client.get("/dashboard/unique-documents", params={"sort": "shareable_name"}).status_code == 200
     assert client.get("/dashboard/documents", params={"sort": "-nope"}).status_code == 400
 
 
@@ -1653,10 +1708,34 @@ def test_download_names_follow_the_shareable_name(client, scratch):
 
     assert download_name("Paddy_KA_2021.pdf", "x_translated.docx", "_translation") == "Paddy_KA_2021_translation.docx"
     assert download_name("Rice v1.2 guide.pdf", "r.pdf", "_reviewed") == "Rice v1.2 guide_reviewed.pdf"
+    assert download_name("Paddy_KA_2021.pdf", "scan.pdf", "") == "Paddy_KA_2021.pdf"
     doc, _ = scratch
-    for kind in ("translation", "review"):
-        assert client.get(f"/dashboard/unique-documents/{doc['_id']}/{kind}/download").status_code == 404
-    assert client.get(f"/dashboard/unique-documents/{doc['_id']}/original/download").status_code == 404
+    # The scratch document has no file of any of the three kinds, so each says
+    # so rather than 404ing because the kind itself is unknown.
+    for kind in ("translation", "review", "original"):
+        resp = client.get(f"/dashboard/unique-documents/{doc['_id']}/{kind}/download")
+        assert resp.status_code == 404 and kind in resp.json()["detail"], (kind, resp.text)
+    assert client.get(f"/dashboard/unique-documents/{doc['_id']}/nonsense/download").status_code == 404
+
+
+def test_the_original_downloads_under_the_documents_own_name(client):
+    """The original was the odd one out: it could only be fetched through the
+    by-file-id proxy, which names the download after the WorkDrive file. Now it
+    has the same named endpoint the translation and review have."""
+    doc = next(d for d in client.get("/dashboard/unique-documents").json()["items"]
+               if d["representative_file_id"] and d["shareable_name"])
+    # Range request: the headers are the point, the bytes are not.
+    resp = client.get(f"/dashboard/unique-documents/{doc['id']}/original/download",
+                      headers={"Range": "bytes=0-99"})
+    assert resp.status_code == 206, resp.text
+    stem = doc["shareable_name"].rsplit(".", 1)[0][:20]
+    assert stem in resp.headers["content-disposition"]
+    assert resp.headers["content-disposition"].startswith("attachment;")
+    assert resp.headers["accept-ranges"] == "bytes"
+    # ?inline=1 is the eye icon: same file, shown instead of saved.
+    inline = client.get(f"/dashboard/unique-documents/{doc['id']}/original/download?inline=1",
+                        headers={"Range": "bytes=0-99"})
+    assert inline.headers["content-disposition"].startswith("inline;")
 
 
 def test_translation_jobs_carry_the_unique_document_id(client, db, scratch):
@@ -1720,3 +1799,314 @@ def test_row_routes_pass_the_audit_fields_through(client, db, scratch):
         "translation_status": "done", "translated_by": "Scratch Translator"}})
     assert client.delete(f"/dashboard/documents/{rows[0]['_id']}/translation").status_code == 204
     assert client.get(f"/dashboard/unique-documents/{doc['_id']}").json()["translated_by"] is None
+
+
+# -- sorting, and the two placement columns that are not folders ---------------
+
+
+def test_every_filterable_column_can_be_sorted(client):
+    """The sort whitelist is derived from the filter tables, so the promise is
+    exactly "a column you can filter, you can sort" -- checked here against the
+    real tables rather than a copy of the list."""
+    from dashboard.routes_documents import _JOINED_FILTERS
+
+    for key in _JOINED_FILTERS:
+        resp = client.get(f"/dashboard/unique-documents?sort={key}")
+        assert resp.status_code == 200, (key, resp.text)
+        assert resp.json()["total"] > 0, key
+    # A placement column belongs to the main table only: the documents listing
+    # has no row_id to sort by, and says so rather than ignoring the parameter.
+    assert client.get("/dashboard/documents?sort=row_id").status_code == 200
+    bad = client.get("/dashboard/unique-documents?sort=row_id")
+    assert bad.status_code == 400 and "sort must be one of" in bad.json()["detail"]
+    assert client.get("/dashboard/unique-documents?sort=nonsense").status_code == 400
+
+
+def test_sorting_puts_blanks_last_but_keeps_zero(client, db, scratch):
+    """`0` is a value, not a blank. POP_00000 and a 0-page document must sort at
+    the TOP ascending -- the obvious `$ifNull` test reads both as missing and
+    buries them with the genuinely empty rows."""
+    from datetime import datetime, timezone
+
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    first = client.get("/dashboard/documents?sort=row_id").json()["items"][0]
+    assert first["row_id"] == "POP_00000"
+    assert client.get("/dashboard/documents?sort=-row_id").json()["items"][0]["row_id"] != "POP_00000"
+
+    # A 0-page document sorts at the very top, ahead of every 1-page one.
+    doc, _rows = scratch
+    db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": doc["_id"]}, {"$set": {"num_pages": 0}})
+    pages = [d["num_pages"] for d in client.get("/dashboard/unique-documents?sort=num_pages").json()["items"]]
+    assert pages[0] == 0
+
+    # Blanks last in BOTH directions. No document in the corpus has ever been
+    # translated, so the scratch document is the only one with a timestamp --
+    # which is exactly what makes this worth asserting.
+    db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": doc["_id"]}, {"$set": {"translated_at": datetime.now(timezone.utc)}})
+    for direction in ("translated_at", "-translated_at"):
+        items = client.get(f"/dashboard/unique-documents?sort={direction}").json()["items"]
+        assert items[0]["translated_at"] is not None, direction
+
+
+def test_state_and_folder_sort_by_the_name_the_table_shows(client):
+    """Both are stored as ids, and the crop master is in another DATABASE in
+    production, so this cannot be a $lookup. Whatever it is, the order has to be
+    the displayed names' order."""
+    for column in ("state", "crop"):
+        names = [row[column] for row in client.get(f"/dashboard/documents?sort={column}").json()["items"]]
+        assert names == sorted(names, key=str.lower), column
+        reverse = [row[column] for row in client.get(f"/dashboard/documents?sort=-{column}").json()["items"]]
+        assert reverse == sorted(reverse, key=str.lower, reverse=True), column
+    # The documents listing sorts by its ANCHOR placement's state -- the one
+    # whose state/crop the row already reports in duplicate_links.
+    rows = client.get("/dashboard/unique-documents?sort=state").json()["items"]
+    anchors = [next((c["state"] for c in r["duplicate_links"] if c["row_id"] == r["representative_row_id"]), None)
+               for r in rows]
+    assert [a for a in anchors if a] == sorted((a for a in anchors if a), key=str.lower)
+
+
+def _a_district(client, *, with_kvk: bool = False):
+    """A real synced district, and optionally one of its KVKs.
+
+    Tests cannot invent one: districts and KVKs come from the LGD sync and the
+    API answers 403 to a create. So they use what is actually there, which also
+    means these tests fail loudly if the sync has never been run.
+    """
+    districts = client.get("/dashboard/districts").json()
+    assert districts, "no districts -- run scripts/sync_lgd.py against this database"
+    for d in districts:
+        if d["code"] is None:       # skip our own "All" entries
+            continue
+        if not with_kvk:
+            return d, None
+        kvks = [k for k in client.get(f"/dashboard/kvks?district_id={d['id']}").json() if k["code"]]
+        if kvks:
+            return d, kvks[0]
+    raise AssertionError("no synced district with a KVK")
+
+
+def test_district_and_kvk_live_on_the_placement(client, db, scratch):
+    """Set on one placement, absent on its sibling -- the same document filed in
+    two places can name a different district in each. That is what makes them
+    placement columns rather than document metadata."""
+    from dashboard.models import COLL_DOCUMENTS
+
+    _doc, rows = scratch
+    first, second = rows[0]["_id"], rows[1]["_id"]
+    district, kvk = _a_district(client, with_kvk=True)
+    assert client.get(f"/dashboard/documents/{first}").json()["district"] is None
+
+    out = client.patch(f"/dashboard/documents/{first}",
+                       json={"district_id": district["id"], "kvk_id": kvk["id"]}).json()
+    assert (out["district"], out["kvk"]) == (district["name"], kvk["name"])
+    assert (out["district_id"], out["kvk_id"]) == (district["id"], kvk["id"])
+    assert client.get(f"/dashboard/documents/{second}").json()["district"] is None
+
+    # By NAME works too, but only for a name the sync knows -- nothing is
+    # invented here any more.
+    assert client.patch(f"/dashboard/documents/{second}",
+                        json={"district": district["name"]}).json()["district"] == district["name"]
+    unknown = client.patch(f"/dashboard/documents/{second}", json={"district": "Nowhereshire"})
+    assert unknown.status_code == 400 and "not a known district" in unknown.json()["detail"]
+
+    # An id names an existing entry; anything else is refused, not invented.
+    bad = client.patch(f"/dashboard/documents/{second}", json={"district_id": "0" * 24})
+    assert bad.status_code == 400 and "district" in bad.json()["detail"]
+
+    # "" clears it. A cleared reference and one that was never set look alike --
+    # the field is gone, not stored as null.
+    assert client.patch(f"/dashboard/documents/{first}", json={"district": ""}).json()["district"] is None
+    assert "district_id" not in db[COLL_DOCUMENTS].find_one({"_id": first})
+    assert client.get(f"/dashboard/documents/{first}").json()["kvk"] == kvk["name"]
+    client.patch(f"/dashboard/documents/{second}", json={"district": ""})
+
+
+def test_district_and_kvk_filter_and_sort_like_the_other_columns(client, scratch):
+    _doc, rows = scratch
+    row = rows[0]["_id"]
+    district, kvk = _a_district(client, with_kvk=True)
+    before = client.get(f"/dashboard/documents?filter[district_id]={district['id']}").json()["total"]
+    client.patch(f"/dashboard/documents/{row}", json={"district_id": district["id"], "kvk_id": kvk["id"]})
+    try:
+        # Substring, case-insensitive, and combinable with the other filters --
+        # the same contract as filter[state].
+        by_name = client.get("/dashboard/documents",
+                             params={"filter[district]": district["name"].lower()}).json()["total"]
+        assert by_name == before + 1
+        assert client.get("/dashboard/documents",
+                          params={"filter[kvk]": kvk["name"]}).json()["total"] >= 1
+        assert client.get("/dashboard/documents?filter[district]=nowhere-at-all").json()["total"] == 0
+        both = client.get("/dashboard/documents", params={"filter[district]": district["name"],
+                                                         "filter[kvk]": kvk["name"]})
+        assert both.json()["total"] >= 1
+        assert client.get(f"/dashboard/documents?filter[district_id]={district['id']}"
+                          ).json()["total"] == before + 1
+
+        entry = next(d for d in client.get("/dashboard/districts").json() if d["id"] == district["id"])
+        assert entry["document_count"] >= 1
+        # Synced, so it cannot be deleted at all -- in use or not.
+        assert client.delete(f"/dashboard/districts/{district['id']}").status_code == 403
+
+        names = [r["district"] for r in client.get("/dashboard/documents?sort=district").json()["items"]]
+        assert names[0] is not None  # rows with no district sort last, as everywhere else
+    finally:
+        client.patch(f"/dashboard/documents/{row}", json={"district": "", "kvk": ""})
+
+
+def test_kvk_is_its_own_vocabulary_not_an_organisation(client):
+    """`pop_organizations` holds FOLDER names, one of which IS called "KVK
+    Files". Which KVK a document came from is a different question, so the two
+    vocabularies must not leak into each other's dropdowns."""
+    kvks = {k["name"] for k in client.get("/dashboard/kvks").json()}
+    folders = {f["name"] for f in client.get("/dashboard/folders").json()}
+    organizations = {o["name"] for o in client.get("/dashboard/organizations").json()}
+    assert kvks, "no KVKs -- run scripts/sync_lgd.py against this database"
+    # The folder entry and the KVK vocabulary are separate things.
+    assert "KVK Files" in organizations and "KVK Files" not in kvks
+    # No synced KVK is offered as a folder.
+    assert not (kvks - {"All"}) & folders
+
+
+def test_the_synced_vocabularies_refuse_every_write(client, vocab_guard):
+    """States, districts and KVKs come from the LGD sync. An edit here would be
+    silently undone by the next run, so each write answers 403 and says why --
+    rather than appearing to work."""
+    for path in ("states", "districts", "kvks"):
+        entries = client.get(f"/dashboard/{path}").json()
+        assert entries, f"no {path} -- run scripts/sync_lgd.py against this database"
+        entry_id = entries[0]["id"]
+        created = client.post(f"/dashboard/{path}", json={"name": "Nowhereshire"})
+        assert created.status_code == 403, path
+        assert "synced from the LGD tables" in created.json()["detail"]
+        assert client.patch(f"/dashboard/{path}/{entry_id}",
+                            json={"name": "Nowhereshire"}).status_code == 403, path
+        assert client.post(f"/dashboard/{path}/{entry_id}/merge",
+                           json={"absorb": [entries[1]["id"]]}).status_code == 403, path
+        assert client.delete(f"/dashboard/{path}/{entry_id}").status_code == 403, path
+    # Organisations are still ours, so they stay editable -- the 403 above is
+    # about where the data comes from, not a blanket freeze.
+    assert client.post("/dashboard/organizations",
+                       json={"name": "Scratch Vocabulary Check"}).status_code == 201
+
+
+def test_copy_entries_carry_the_whole_placement(client, db, scratch):
+    """The documents listing has no state, folder, district or KVK of its own --
+    a document can be filed in several places. It reports each COPY's, read from
+    that copy's placement, so the frontend can show the anchor's without a
+    second request per row."""
+    doc, rows = scratch
+    district, kvk = _a_district(client, with_kvk=True)
+    client.patch(f"/dashboard/documents/{rows[0]['_id']}",
+                 json={"district_id": district["id"], "kvk_id": kvk["id"]})
+    try:
+        out = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()
+        by_row = {c["row_id"]: c for c in out["duplicate_links"]}
+        assert by_row[rows[0]["row_id"]]["district"] == district["name"]
+        assert by_row[rows[0]["row_id"]]["kvk"] == kvk["name"]
+        assert by_row[rows[0]["row_id"]]["state"] == "Scratchland"
+        # The sibling copy is a different placement and says so.
+        assert by_row[rows[1]["row_id"]]["district"] is None
+        assert by_row[rows[1]["row_id"]]["crop"] != by_row[rows[0]["row_id"]]["crop"]
+    finally:
+        client.patch(f"/dashboard/documents/{rows[0]['_id']}", json={"district": "", "kvk": ""})
+
+
+def test_the_documents_listing_filters_on_placements_too(client, scratch):
+    """state/crop/district/kvk live on the placement, so they used to be
+    main-table-only. The documents listing now lifts them: "documents filed in
+    Kerala" is every document with a Kerala placement."""
+    doc, rows = scratch
+    docs = client.get("/dashboard/unique-documents", params={"filter[state]": "Scratchland"}).json()
+    assert docs["total"] == 1 and docs["items"][0]["id"] == str(doc["_id"])
+
+    # One document, two placements -- counted once here and twice on the main
+    # table. That is the whole distinction between the two listings.
+    placements = client.get("/dashboard/documents", params={"filter[state]": "Scratchland"}).json()
+    assert placements["total"] == 2
+
+    # Combines with the document-level filters rather than replacing them.
+    both = client.get("/dashboard/unique-documents",
+                      params={"filter[state]": "Scratchland", "filter[shareable_name]": "scratch-test"})
+    assert both.json()["total"] == 1
+    assert client.get("/dashboard/unique-documents",
+                      params={"filter[state]": "Scratchland",
+                              "filter[shareable_name]": "no-such-document"}).json()["total"] == 0
+    assert client.get("/dashboard/unique-documents",
+                      params={"filter[state]": "Nowhere At All"}).json()["total"] == 0
+
+    # Every filtered document is a real subset, and never more than the
+    # placements that matched.
+    for name in ("Kerala", "Punjab"):
+        d = client.get("/dashboard/unique-documents", params={"filter[state]": name}).json()["total"]
+        p = client.get("/dashboard/documents", params={"filter[state]": name}).json()["total"]
+        assert 0 < d <= p, name
+
+
+def test_the_document_patch_writes_district_to_the_anchor_placement(client, db, scratch):
+    """district/kvk are PLACEMENT fields, so the document-level edit modal puts
+    them on the document's ANCHOR placement -- the one the documents listing
+    already displays -- and leaves its other placements alone. A document filed
+    in two states cannot sensibly have one district."""
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    doc, rows = scratch
+    db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": doc["_id"]},
+                                         {"$set": {"representative_row_id": rows[0]["row_id"]}})
+    try:
+        district, kvk = _a_district(client, with_kvk=True)
+        out = client.patch(f"/dashboard/unique-documents/{doc['_id']}",
+                           json={"district_id": district["id"], "kvk_id": kvk["id"],
+                                 "num_pages": 11}).json()
+        assert out["representative_row_id"] == rows[0]["row_id"]
+        by_row = {c["row_id"]: c for c in out["duplicate_links"]}
+        assert by_row[rows[0]["row_id"]]["district"] == district["name"]
+        assert by_row[rows[1]["row_id"]]["district"] is None  # the sibling is untouched
+        # A document-level field in the same request still goes to the document.
+        assert out["num_pages"] == 11
+        # And the main table sees exactly the same thing on that one row.
+        assert client.get(f"/dashboard/documents/{rows[0]['_id']}").json()["kvk"] == kvk["name"]
+        assert client.get(f"/dashboard/documents/{rows[1]['_id']}").json()["kvk"] is None
+
+        # "" clears, and clears only what was named.
+        cleared = client.patch(f"/dashboard/unique-documents/{doc['_id']}",
+                               json={"district": ""}).json()
+        anchor = {c["row_id"]: c for c in cleared["duplicate_links"]}[rows[0]["row_id"]]
+        assert anchor["district"] is None and anchor["kvk"] == kvk["name"]
+        assert client.patch(f"/dashboard/unique-documents/{doc['_id']}",
+                            json={"district_id": "0" * 24}).status_code == 400
+    finally:
+        client.patch(f"/dashboard/documents/{rows[0]['_id']}", json={"district": "", "kvk": ""})
+
+
+def test_an_upload_can_name_a_district_and_kvk_per_placement_group(client, db):
+    """The Add Document form sends them alongside crop_ids/organization_ids, by
+    id or by name, and they apply to every folder in that state group. Optional:
+    a form that sends neither behaves exactly as before."""
+    from bson import ObjectId
+
+    from dashboard.queue_worker import _optional_ref
+    from dashboard.routes_uploads import _parse_placements
+
+    district, kvk = _a_district(client, with_kvk=True)
+    groups = json.dumps([{"state": "Kerala", "crops": ["Paddy"],
+                          "district_id": district["id"], "kvk": kvk["name"]}])
+    pairs = _parse_placements(db, groups, None, None)
+    assert len(pairs) == 1
+    assert pairs[0]["district_id"] == district["id"] and pairs[0]["kvk"] == kvk["name"]
+
+    # What the worker does with them when the person approves the upload: the id
+    # is honoured, and a name is looked up in the synced list.
+    assert _optional_ref(db, pairs[0], "district") == ObjectId(district["id"])
+    assert _optional_ref(db, pairs[0], "kvk") == ObjectId(kvk["id"])
+
+    # A name the sync does not have fails the upload rather than being dropped.
+    unknown = _parse_placements(db, json.dumps(
+        [{"state": "Kerala", "crops": ["Paddy"], "district": "Nowhereshire"}]), None, None)
+    with pytest.raises(ValueError, match="not a known district"):
+        _optional_ref(db, unknown[0], "district")
+
+    # Neither sent -> nothing stored, which is every upload before this landed.
+    plain = _parse_placements(db, json.dumps([{"state": "Kerala", "crops": ["Paddy"]}]), None, None)
+    assert plain[0]["district_id"] is None and plain[0]["kvk"] is None
+    assert _optional_ref(db, plain[0], "district") is None

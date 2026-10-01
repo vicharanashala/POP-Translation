@@ -92,9 +92,11 @@ def download_file(zoho_file_id: str, request: Request, inline: bool = False):
     return _serve(zoho_file_id, request, inline)
 
 
-# The name a translation / review downloads as: the document's shareable name
-# plus this suffix, keeping the stored file's own extension.
+# The name an original / translation / review downloads as: the document's
+# shareable name plus this suffix, keeping the stored file's own extension.
+# The original takes no suffix -- it is the document, not a derived copy of it.
 _NAMED_KINDS = {
+    "original": ("representative_file_id", ""),
     "translation": ("translation_zoho_file_id", "_translation"),
     "review": ("review_zoho_file_id", "_reviewed"),
 }
@@ -113,8 +115,15 @@ def download_name(shareable_name: str | None, stored_name: str | None, suffix: s
 
 @router.get("/unique-documents/{document_id}/{kind}/download")
 def download_named(document_id: str, kind: str, request: Request, inline: bool = False, db=Depends(get_db)):
-    """The document's translation or review, named after the document:
-    `<shareable name>_translation.<ext>` / `<shareable name>_reviewed.<ext>`."""
+    """The document's own file, its translation or its review, named after the
+    document: `<shareable name>.<ext>`, `<shareable name>_translation.<ext>`,
+    `<shareable name>_reviewed.<ext>`.
+
+    `original` is the same file as `/files/{representative_file_id}/download`
+    and streams through the same code; the only difference is the name it
+    arrives under -- that proxy uses the file's WorkDrive name, which is often
+    not what the catalogue calls the document.
+    """
     if kind not in _NAMED_KINDS:
         raise HTTPException(404, "not found")
     field, suffix = _NAMED_KINDS[kind]

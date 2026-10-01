@@ -40,7 +40,9 @@ from pymongo.errors import DuplicateKeyError
 from dashboard.db import CI_COLLATION, crops_collection
 from dashboard.models import (
     COLL_CROP_ALIASES,
+    COLL_DISTRICTS,
     COLL_DOCUMENTS,
+    COLL_KVKS,
     COLL_ORGANIZATIONS,
     COLL_STATES,
     COLL_UPLOAD_QUEUE_ITEMS,
@@ -51,15 +53,53 @@ from dashboard.models import (
 
 # kind -> (our collection or None for the crop master, normaliser for NEW
 # names, placement field, editable here)
+#
+# NOT EDITABLE means rename/merge/delete answer 403 and nothing is ever created
+# by a form or an upload -- the entries come from somewhere else and this
+# dashboard only references them. That is true of crops (the crop master) and of
+# states, districts and KVKs, which are synced from the LGD tables in `agriai`
+# by scripts/sync_lgd.py. Editing a synced name here would be silently undone by
+# the next sync, so it is refused instead.
+#
+# Only organisations stay ours: they are WorkDrive FOLDER names, which no
+# external registry knows about.
 KINDS = {
-    "state": (COLL_STATES, normalize_state_name, "state_id", True),
+    "state": (COLL_STATES, normalize_state_name, "state_id", False),
     "organization": (COLL_ORGANIZATIONS, normalize_crop_name, "organization_id", True),
     "crop": (None, None, "crop_id", False),
+    "district": (COLL_DISTRICTS, normalize_crop_name, "district_id", False),
+    "kvk": (COLL_KVKS, normalize_crop_name, "kvk_id", False),
 }
+
+# kind -> (parent kind, the field on THIS entry naming its parent).
+#
+# A district belongs to a state and a KVK to a district, which is how the Add
+# Document and Edit forms narrow their dropdowns: pick a state, get that state's
+# districts. The parent is stored on the CHILD -- one indexed field -- rather
+# than as a list on the parent, so there is no second copy of the relationship
+# to drift. GET /dashboard/locations serves the nested view built from it.
+PARENT = {"district": ("state", "state_id"), "kvk": ("district", "district_id")}
+
+# kind -> the LGD code field on our entry. The code, not the name, is what a
+# re-sync matches on: LGD renames districts (Keralam, "The Dadra And Nagar
+# Haveli And Daman And Diu") and a name match would create a duplicate.
+CODE = {"state": "state_code", "district": "district_code", "kvk": "kvk_code"}
+
+# The name of the "not specific to one of these" entry that the sync adds under
+# every parent -- one per state for districts, one per district for KVKs. A
+# document filed against a whole state still needs something to select.
+ALL = "All"
 # What a crop dropdown may offer. The master also lists pesticides.
 _CROP_VISIBLE = {"type": {"$ne": "chemical"}}
 READ_ONLY_CROPS = ("crops come from the crop master, which is maintained elsewhere -- "
                    "this dashboard can only reference them")
+READ_ONLY_LGD = ("{kind}s are synced from the LGD tables in `agriai` "
+                 "(scripts/sync_lgd.py) -- this dashboard can only reference them, and an "
+                 "edit here would be undone by the next sync")
+
+
+def read_only_reason(kind: str) -> str:
+    return READ_ONLY_CROPS if kind == "crop" else READ_ONLY_LGD.format(kind=kind)
 
 
 class VocabularyError(ValueError):
@@ -107,7 +147,8 @@ def find(db, kind: str, raw) -> dict | None:
     if not raw:
         # Files sitting directly in a state folder have a folder whose name is
         # "". It is a real organisation entry; matched exactly, never created.
-        return None if kind == "crop" else c.find_one({"name": ""})
+        # A district or a KVK has no such entry -- blank means "not set".
+        return None if kind in ("crop", "district", "kvk") else c.find_one({"name": ""})
     if kind == "crop":
         entry = c.find_one({"name": raw, **_CROP_VISIBLE}, collation=CI_COLLATION)
         if entry is None:
@@ -127,6 +168,26 @@ def find(db, kind: str, raw) -> dict | None:
     return None
 
 
+def parent_field(kind: str) -> str | None:
+    """The field naming this kind's parent, or None for a kind with no parent."""
+    return PARENT[kind][1] if kind in PARENT else None
+
+
+def children_of(db, kind: str, parent_id) -> list[dict]:
+    """Every entry of `kind` under one parent, A-Z, with the "All" entry first.
+
+    This is what a form dropdown shows. Read by PARENT REFERENCE, not by which
+    entries some placement happens to use already -- a form needs the whole
+    official list, and until people start tagging documents the "used" set is
+    empty, which is why these dropdowns were empty before the LGD sync.
+    """
+    f = parent_field(kind)
+    if f is None:
+        raise VocabularyError(400, f"{kind} has no parent to list by")
+    rows = list(coll(db, kind).find({f: parent_id}))
+    return sorted(rows, key=lambda e: (e["name"] != ALL, (e.get("name") or "").lower()))
+
+
 def resolve(db, kind: str, raw, *, create: bool = True) -> dict | None:
     """The entry for a typed name, creating it if nobody has used it before --
     for states and organisations only. A crop is looked up, never created.
@@ -138,7 +199,10 @@ def resolve(db, kind: str, raw, *, create: bool = True) -> dict | None:
     if not raw:
         return None
     entry = find(db, kind, raw)
-    if kind == "crop":
+    if not KINDS[kind][3]:
+        # Not ours: looked up, never invented. A form or an upload naming a
+        # state, district, KVK or crop we do not have is an error to surface,
+        # not a new entry to create -- see KINDS.
         return entry
     c, normalize = coll(db, kind), KINDS[kind][1]
     now = utcnow()
@@ -216,7 +280,7 @@ def crop_spellings(db) -> dict[ObjectId, list[str]]:
 
 def _editable(kind: str) -> None:
     if not KINDS[kind][3]:
-        raise VocabularyError(403, READ_ONLY_CROPS)
+        raise VocabularyError(403, read_only_reason(kind))
 
 
 def rename(db, kind: str, entry_id, new_name: str) -> dict:
@@ -352,13 +416,16 @@ def folder_kinds_for_advisory(advisory_type: str | None) -> tuple[str, ...]:
 
 
 def _path(kind: str) -> str:
-    return {"state": "states", "crop": "crops", "organization": "organizations"}[kind]
+    return {"state": "states", "crop": "crops", "organization": "organizations",
+            "district": "districts", "kvk": "kvks"}[kind]
 
 
 def _refresh_queue_names(db, kind: str, ids: list[ObjectId], name: str) -> None:
     """Pending uploads show the name next to the id; keep it current so the
     queue's "files it under ..." note does not name something that is gone."""
-    label = "state" if kind == "state" else "crop"
+    # The queue shows the name beside the id. The folder is called "crop"
+    # there whichever vocabulary it came from; the rest are called what they are.
+    label = "crop" if kind in ("crop", "organization") else kind
     db[COLL_UPLOAD_QUEUE_ITEMS].update_many(
         {f"placements.{field(kind)}": {"$in": ids}},
         {"$set": {f"placements.$[p].{label}": name}},
