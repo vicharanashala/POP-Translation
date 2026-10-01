@@ -173,22 +173,27 @@ _INDEXES: dict[str, list[dict]] = {
                           "collation": CI_COLLATION}],
     # Synced from LGD, so the CODE is the identity -- not the name. District
     # names are NOT unique across India: Bilaspur is in both Chhattisgarh and
-    # Himachal Pradesh, Hamirpur in both Himachal Pradesh and Uttar Pradesh. A
-    # unique index on `name` alone would reject the real list, so the name is
-    # unique only WITHIN its parent (and that pair is also the dropdown's query).
+    # Himachal Pradesh, Hamirpur in both Himachal Pradesh and Uttar Pradesh.
+    #
+    # Nor are they unique WITHIN a state, which is the tempting next guess and is
+    # also wrong: LGD keeps both halves of a split under one English name, so
+    # Rajasthan really does list `Jaipur` twice (codes 102 and 783) and `Jodhpur`
+    # twice (107 and 778), and one district lists two KVKs both called
+    # `Balrampur`. So (parent, name) is indexed for the dropdown's query but NOT
+    # unique -- the code carries uniqueness, and only the code.
     COLL_DISTRICTS: [
         {"keys": [("district_code", ASCENDING)], "unique": True, "name": "uq_district_code",
          "partialFilterExpression": {"district_code": {"$type": "number"}}},
-        {"keys": [("state_id", ASCENDING), ("name", ASCENDING)], "unique": True,
-         "name": "uq_state_name_ci", "collation": CI_COLLATION},
+        {"keys": [("state_id", ASCENDING), ("name", ASCENDING)],
+         "name": "state_name_ci", "collation": CI_COLLATION},
     ],
     COLL_KVKS: [
         # kvk_code is LGD's "K0001" -- a string, unlike the numeric district and
         # state codes.
         {"keys": [("kvk_code", ASCENDING)], "unique": True, "name": "uq_kvk_code",
          "partialFilterExpression": {"kvk_code": {"$type": "string"}}},
-        {"keys": [("district_id", ASCENDING), ("name", ASCENDING)], "unique": True,
-         "name": "uq_district_name_ci", "collation": CI_COLLATION},
+        {"keys": [("district_id", ASCENDING), ("name", ASCENDING)],
+         "name": "district_name_ci", "collation": CI_COLLATION},
         # Only for the sync and for stats; the dropdown narrows by district.
         {"keys": [("state_id", ASCENDING)], "name": "state_id"},
     ],
