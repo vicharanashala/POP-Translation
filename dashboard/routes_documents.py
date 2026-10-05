@@ -778,9 +778,10 @@ def _placement_refs(db, submitted: dict) -> tuple[dict, dict]:
     """($set, $unset) for the district/kvk references in a PATCH body.
 
     Each may arrive as an id (must name an existing entry) or as a NAME, which
-    is created if nobody has used it, like a state. An EMPTY STRING clears the
-    reference -- the only way to say "no district after all", since a null here
-    means "not sent", as it does for every other field.
+    must already exist, since these are synced. An EMPTY STRING clears the
+    reference -- on EITHER form, `{"district_id": ""}` and `{"district": ""}`
+    alike -- and is the only way to say "no district after all", since a null
+    here means "not sent", as it does for every other field.
 
     Shared by PATCH /documents/{row_id} and PATCH /unique-documents/{id} so the
     two cannot come to disagree about what clears a field.
@@ -789,8 +790,15 @@ def _placement_refs(db, submitted: dict) -> tuple[dict, dict]:
     unset: dict = {}
     for kind in ("district", "kvk"):
         f = vocabulary.field(kind)
-        if submitted.get(f"{kind}_id") is not None:
-            entry = vocabulary.get(db, kind, submitted[f"{kind}_id"])
+        sent_id = submitted.get(f"{kind}_id")
+        if sent_id is not None and not str(sent_id).strip():
+            # An EMPTY id clears, exactly as an empty name does. Checked before
+            # the lookup below, which would otherwise try to read "" as an
+            # ObjectId and answer 400 -- the form sends the field it edits, and
+            # "the user picked nothing" is the one thing it cannot say with an id.
+            unset[f] = ""
+        elif sent_id is not None:
+            entry = vocabulary.get(db, kind, sent_id)
             if entry is None:
                 raise HTTPException(400, f"{kind}_id does not name an existing {kind}")
             move[f] = entry["_id"]
@@ -1334,28 +1342,42 @@ def list_locations(db=Depends(get_db)):
     Stored flat (a district holds its state_id, a KVK its district_id) and
     assembled here, so there is one copy of the relationship rather than a
     nested one that can drift out of step with the references placements use.
-    Three queries whatever the size: 37 states, ~790 districts, 727 KVKs.
+    Five queries whatever the size: 37 states, ~790 districts, 727 KVKs, plus
+    the two shared "All" rows, which hang under no parent and are added to every
+    node here.
     """
+    # The shared "All" rows are parentless, so they group under no key and have
+    # to be added to every node by hand. Held out of the grouping first, or they
+    # would land under a `None` parent and be lost.
+    all_district = vocabulary.all_entry(db, "district")
+    all_kvk = vocabulary.all_entry(db, "kvk")
     kvks_by_district: dict = {}
     for k in vocabulary.entries(db, "kvk", None):
+        if k.get(vocabulary.IS_ALL):
+            continue
         kvks_by_district.setdefault(k.get("district_id"), []).append(k)
     districts_by_state: dict = {}
     for d in vocabulary.entries(db, "district", None):
+        if d.get(vocabulary.IS_ALL):
+            continue
         districts_by_state.setdefault(d.get("state_id"), []).append(d)
 
     def ordered(rows):
         # "All" first, then A-Z -- the order a dropdown wants.
         return sorted(rows, key=lambda e: (e["name"] != vocabulary.ALL, (e.get("name") or "").lower()))
 
+    def with_all(rows, shared):
+        return ordered(rows + ([shared] if shared is not None else []))
+
     out = []
     for state in ordered(db[COLL_STATES].find()):
         districts = []
-        for d in ordered(districts_by_state.get(state["_id"], [])):
+        for d in with_all(districts_by_state.get(state["_id"], []), all_district):
             districts.append(LocationDistrict(
                 id=str(d["_id"]), name=d["name"], code=d.get("district_code"),
                 kvks=[LocationKvk(id=str(k["_id"]), name=k["name"], code=k.get("kvk_code"),
                                   address=k.get("address"))
-                      for k in ordered(kvks_by_district.get(d["_id"], []))]))
+                      for k in with_all(kvks_by_district.get(d["_id"], []), all_kvk)]))
         out.append(LocationState(id=str(state["_id"]), name=state["name"],
                                  code=state.get("state_code"), districts=districts))
     return out

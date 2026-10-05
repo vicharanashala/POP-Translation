@@ -186,6 +186,11 @@ _INDEXES: dict[str, list[dict]] = {
          "partialFilterExpression": {"district_code": {"$type": "number"}}},
         {"keys": [("state_id", ASCENDING), ("name", ASCENDING)],
          "name": "state_name_ci", "collation": CI_COLLATION},
+        # Exactly ONE shared "All" row per collection. Partial on the flag being
+        # true, so the 786 synced rows (which have no such field) do not all
+        # collide on its absence.
+        {"keys": [("is_all", ASCENDING)], "unique": True, "name": "uq_is_all",
+         "partialFilterExpression": {"is_all": True}},
     ],
     COLL_KVKS: [
         # kvk_code is LGD's "K0001" -- a string, unlike the numeric district and
@@ -194,6 +199,8 @@ _INDEXES: dict[str, list[dict]] = {
          "partialFilterExpression": {"kvk_code": {"$type": "string"}}},
         {"keys": [("district_id", ASCENDING), ("name", ASCENDING)],
          "name": "district_name_ci", "collation": CI_COLLATION},
+        {"keys": [("is_all", ASCENDING)], "unique": True, "name": "uq_is_all",
+         "partialFilterExpression": {"is_all": True}},
         # Only for the sync and for stats; the dropdown narrows by district.
         {"keys": [("state_id", ASCENDING)], "name": "state_id"},
     ],

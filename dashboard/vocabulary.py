@@ -85,10 +85,20 @@ PARENT = {"district": ("state", "state_id"), "kvk": ("district", "district_id")}
 # Haveli And Daman And Diu") and a name match would create a duplicate.
 CODE = {"state": "state_code", "district": "district_code", "kvk": "kvk_code"}
 
-# The name of the "not specific to one of these" entry that the sync adds under
-# every parent -- one per state for districts, one per district for KVKs. A
-# document filed against a whole state still needs something to select.
+# The name of the "not specific to one of these" entry. ONE row per collection,
+# shared by every parent -- not one per state and one per district, which is
+# what this was first built as. 860 rows all meaning the same thing gave the
+# idea two representations (an "All" id or no id at all) and no way to keep them
+# in step; a single parentless row has one id, and `all_entry()` finds it.
+#
+# It carries NO parent reference and NO LGD code, so a child query by parent
+# cannot see it -- every reader that lists children has to add it back, which
+# `children_of()` does and `GET /locations` does by hand.
 ALL = "All"
+# Marks that one row. Preferred over matching on the name or on a missing code:
+# it is what the unique index in db.py keys on, so the collection cannot end up
+# with two of them.
+IS_ALL = "is_all"
 # What a crop dropdown may offer. The master also lists pesticides.
 _CROP_VISIBLE = {"type": {"$ne": "chemical"}}
 READ_ONLY_CROPS = ("crops come from the crop master, which is maintained elsewhere -- "
@@ -173,6 +183,19 @@ def parent_field(kind: str) -> str | None:
     return PARENT[kind][1] if kind in PARENT else None
 
 
+def all_entry(db, kind: str) -> dict | None:
+    """The one shared "All" row of this kind, or None for a kind without one.
+
+    Parentless by design, so every narrowed list has to union it in rather than
+    find it by query. Returned for ANY parent -- the same id comes back whichever
+    state or district was asked for, because "no particular district" is one
+    fact, not 37 of them.
+    """
+    if kind not in PARENT:
+        return None
+    return coll(db, kind).find_one({IS_ALL: True})
+
+
 def children_of(db, kind: str, parent_id) -> list[dict]:
     """Every entry of `kind` under one parent, A-Z, with the "All" entry first.
 
@@ -180,11 +203,19 @@ def children_of(db, kind: str, parent_id) -> list[dict]:
     entries some placement happens to use already -- a form needs the whole
     official list, and until people start tagging documents the "used" set is
     empty, which is why these dropdowns were empty before the LGD sync.
+
+    The shared "All" row has no parent, so the query cannot return it and it is
+    appended here. That is also why a parent with no real children of its own --
+    `Central` has no districts, and 152 districts have no KVK -- still offers
+    something to pick instead of an empty dropdown.
     """
     f = parent_field(kind)
     if f is None:
         raise VocabularyError(400, f"{kind} has no parent to list by")
-    rows = list(coll(db, kind).find({f: parent_id}))
+    rows = [r for r in coll(db, kind).find({f: parent_id}) if not r.get(IS_ALL)]
+    shared = all_entry(db, kind)
+    if shared is not None:
+        rows.append(shared)
     return sorted(rows, key=lambda e: (e["name"] != ALL, (e.get("name") or "").lower()))
 
 

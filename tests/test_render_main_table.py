@@ -56,9 +56,10 @@ def db():
 
 @pytest.fixture
 def vocab_guard(db):
-    """Deletes any state or organisation a test seeded and left unused, so runs
-    do not accumulate "Scratchland" entries in the real dropdowns. Entries that
-    existed before the test are never touched.
+    """Undoes what a test did to the state and organisation vocabularies: any
+    entry it seeded and left unused is deleted, and any entry it RENAMED is put
+    back, so runs do not accumulate "Scratchland" entries in the real dropdowns
+    or leave a real one under a test's spelling.
 
     Districts and KVKs are deliberately NOT watched: they are synced from LGD
     (scripts/sync_lgd.py), no test creates one -- the API answers 403 -- and
@@ -67,12 +68,22 @@ def vocab_guard(db):
     from dashboard.models import COLL_DOCUMENTS, COLL_ORGANIZATIONS, COLL_STATES
 
     watched = (COLL_STATES, COLL_ORGANIZATIONS)
-    before = {c: {e["_id"] for e in db[c].find({}, {"_id": 1})} for c in watched}
+    # NAMES, not just ids: a rename test leaves the entry renamed, and deleting
+    # only the unused new ones left it behind whenever something still pointed
+    # at it. The next test's fixture then resolved "Scratch Alpha" onto the
+    # renamed row and read back "scratch ALPHA" -- a failure that only appeared
+    # in a full run, never when the test was run on its own.
+    before = {c: {e["_id"]: e["name"] for e in db[c].find({}, {"_id": 1, "name": 1})}
+              for c in watched}
     yield
     for coll, field in ((COLL_STATES, "state_id"), (COLL_ORGANIZATIONS, "organization_id")):
-        for e in db[coll].find({"_id": {"$nin": list(before[coll])}}, {"_id": 1}):
-            if db[COLL_DOCUMENTS].count_documents({field: e["_id"]}, limit=1) == 0:
-                db[coll].delete_one({"_id": e["_id"]})
+        for e in db[coll].find({}, {"_id": 1, "name": 1}):
+            was = before[coll].get(e["_id"])
+            if was is None:
+                if db[COLL_DOCUMENTS].count_documents({field: e["_id"]}, limit=1) == 0:
+                    db[coll].delete_one({"_id": e["_id"]})
+            elif e["name"] != was:
+                db[coll].update_one({"_id": e["_id"]}, {"$set": {"name": was}})
 
 
 def _scratch_state(db, raw: str) -> dict:
@@ -1952,6 +1963,101 @@ def test_district_and_kvk_filter_and_sort_like_the_other_columns(client, scratch
         assert names[0] is not None  # rows with no district sort last, as everywhere else
     finally:
         client.patch(f"/dashboard/documents/{row}", json={"district": "", "kvk": ""})
+
+
+def test_one_shared_all_entry_serves_every_parent(client, db):
+    """"Not specific to a district" is ONE fact, so it is ONE row.
+
+    It was first built the other way -- an "All" under each of the 37 states and
+    each of the 823 districts -- which gave the same meaning 860 different ids
+    and no way to keep them in step with the "no id at all" that the form sends.
+    The row carries no parent and no LGD code, so no query by parent can reach
+    it and every list has to add it back.
+    """
+    from dashboard.models import COLL_DISTRICTS, COLL_KVKS
+
+    for coll in (COLL_DISTRICTS, COLL_KVKS):
+        rows = list(db[coll].find({"is_all": True}))
+        assert len(rows) == 1, f"{coll} should hold exactly one shared All row"
+        assert rows[0]["name"] == "All"
+        # Parentless, so it belongs to no state and to no district.
+        assert rows[0].get("state_id") is None and rows[0].get("district_id") is None
+        assert rows[0].get("district_code") is None and rows[0].get("kvk_code") is None
+
+    states = client.get("/dashboard/states").json()
+    seen = set()
+    for state in states[:6]:
+        listed = client.get(f"/dashboard/districts?state_id={state['id']}").json()
+        alls = [d for d in listed if d["name"] == "All"]
+        assert len(alls) == 1, f"{state['name']} should offer All exactly once"
+        assert listed[0]["name"] == "All", "All comes first -- the order a dropdown wants"
+        seen.add(alls[0]["id"])
+    assert len(seen) == 1, "every state must be offered the SAME All id"
+
+    # Unnarrowed -- what the column filter dropdown reads -- lists it once too.
+    assert sum(1 for d in client.get("/dashboard/districts").json() if d["name"] == "All") == 1
+    assert sum(1 for k in client.get("/dashboard/kvks").json() if k["name"] == "All") == 1
+
+
+def test_a_parent_with_no_children_of_its_own_still_offers_all(client, db):
+    """The reason the shared row is unioned in rather than queried for: Central
+    has no districts at all, and 152 real districts have no KVK. Before this
+    their dropdowns came back empty, which reads as broken rather than as
+    "nothing specific to pick"."""
+    from dashboard.models import COLL_DISTRICTS, COLL_KVKS
+
+    central = next((s for s in client.get("/dashboard/states").json()
+                    if s["name"] == "Central"), None)
+    if central is not None:
+        offered = client.get(f"/dashboard/districts?state_id={central['id']}").json()
+        assert [d["name"] for d in offered] == ["All"]
+
+    with_kvk = {k["district_id"] for k in db[COLL_KVKS].find(
+        {"kvk_code": {"$exists": True}}, {"district_id": 1})}
+    bare = db[COLL_DISTRICTS].find_one(
+        {"district_code": {"$exists": True}, "_id": {"$nin": list(with_kvk)}})
+    if bare is not None:
+        offered = client.get(f"/dashboard/kvks?district_id={bare['_id']}").json()
+        assert [k["name"] for k in offered] == ["All"], bare["name"]
+
+    # And the nested tree says the same thing, since the frontend reads it once
+    # at load instead of narrowing per dropdown.
+    for state in client.get("/dashboard/locations").json():
+        assert any(d["name"] == "All" for d in state["districts"]), state["name"]
+        for d in state["districts"]:
+            assert any(k["name"] == "All" for k in d["kvks"]), (state["name"], d["name"])
+
+
+def test_an_empty_value_clears_a_district_whichever_field_carries_it(client, scratch):
+    """The edit form sends only the fields it changed, so it needs a way to say
+    "the user picked nothing". A null cannot say it -- null means "not sent", as
+    for every other field -- so an EMPTY value clears, on the id as well as on
+    the name. The id form used to answer 400, having tried to read "" as an
+    ObjectId."""
+    _doc, rows = scratch
+    district, _kvk = _a_district(client)
+    row_url = f"/dashboard/documents/{rows[0]['_id']}"
+
+    for field, value in (("district_id", district["id"]), ("district", district["name"])):
+        assert client.patch(row_url, json={field: value}).status_code == 200
+        assert client.get(row_url).json()["district"] == district["name"]
+        # ... and the empty form of that same field clears it again.
+        assert client.patch(row_url, json={field: ""}).status_code == 200
+        cleared = client.get(row_url).json()
+        assert cleared["district"] is None and cleared["district_id"] is None
+
+    # A null is still "unchanged", not "clear".
+    assert client.patch(row_url, json={"district_id": district["id"]}).status_code == 200
+    assert client.patch(row_url, json={"district_id": None}).status_code == 200
+    assert client.get(row_url).json()["district"] == district["name"]
+
+    # The shared All row is a real, selectable value -- not a synonym for empty.
+    all_district = next(d for d in client.get("/dashboard/districts").json()
+                        if d["name"] == "All")
+    assert client.patch(row_url, json={"district_id": all_district["id"]}).status_code == 200
+    assert client.get(row_url).json()["district"] == "All"
+    assert client.patch(row_url, json={"district_id": ""}).status_code == 200
+    assert client.get(row_url).json()["district"] is None
 
 
 def test_kvk_is_its_own_vocabulary_not_an_organisation(client):
