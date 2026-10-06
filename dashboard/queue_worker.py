@@ -124,61 +124,50 @@ def enqueue_decision(item_id: ObjectId, document_id: ObjectId | None) -> None:
     _executor.submit(_finish, item_id, document_id)
 
 
-def _optional_ref(db, placement: dict, kind: str):
-    """The district or KVK id a queued placement names, or None.
+def _optional_ref(db, source: dict, kind: str):
+    """The district or KVK id a queued item holds, or None.
 
-    Optional: a form that sends neither files the row without them, which is
-    every corpus row. But a name or id that IS sent and does not resolve fails
-    the upload -- districts and KVKs come from the LGD sync and are never
-    created here (see dashboard/vocabulary.py).
+    Read from the item's METADATA, not from a placement: both are fields of the
+    document, so one upload carries one of each however many folders it is filed
+    in. They used to be per placement group.
+
+    Optional: a form that sends neither files the document without them, which
+    is every corpus row. An id that IS stored and no longer resolves fails the
+    upload rather than being silently dropped and leaving it untagged -- the
+    entry could have gone in the time the item sat in the queue.
     """
-    stored = placement.get(vocabulary.field(kind))
-    if stored:
-        entry = vocabulary.get(db, kind, stored)
-        if entry is None:
-            raise ValueError(f"{kind}_id {stored!r} does not name an existing {kind}")
-        return entry["_id"]
-    raw = " ".join(str(placement.get(kind) or "").split())
-    if not raw:
+    stored = source.get(vocabulary.field(kind))
+    if not stored:
         return None
-    # Synced from LGD, never created here: an unknown name fails the upload
-    # rather than being silently dropped and leaving the row untagged.
-    entry = vocabulary.find(db, kind, raw)
+    entry = vocabulary.get(db, kind, stored)
     if entry is None:
-        raise ValueError(f"{raw!r} is not a known {kind}")
+        raise ValueError(f"{kind}_id {stored!r} does not name an existing {kind}")
     return entry["_id"]
 
 
-def _placement_ids(db, placement: dict, *, create: bool = False) -> tuple:
+def _placement_ids(db, placement: dict) -> tuple:
     """(state_id, folder kind, folder id) for a queued placement, the folder
     being a crop ("crop") or an organisation ("organization").
 
-    A stored id wins while its entry still exists; otherwise the name is looked
-    up -- case-insensitively and through the other known spellings. With
-    create=True a state or organisation nobody has used yet is created; a crop
-    never is. Anything that cannot be resolved comes back as None.
+    Read from the IDS the item stored at submit, which _parse_placements already
+    verified. Re-read here rather than trusted, because an item can sit in the
+    queue while a vocabulary is re-synced; anything that no longer resolves
+    comes back as None and fails the decision.
+
+    Nothing is looked up by name and nothing is created. The queued `state` and
+    `crop` strings are labels for the queue UI, not a fallback -- when they were
+    a fallback, a stored id that had gone silently re-resolved to whatever the
+    label now matched.
     """
     state = vocabulary.get(db, "state", placement["state_id"]) if placement.get("state_id") else None
-    if state is None:
-        state = (vocabulary.resolve if create else vocabulary.find)(db, "state", placement.get("state"))
-
     folder = None
     for kind in ("crop", "organization"):
-        if placement.get(vocabulary.field(kind)):
-            entry = vocabulary.get(db, kind, placement[vocabulary.field(kind)])
+        stored = placement.get(vocabulary.field(kind))
+        if stored:
+            entry = vocabulary.get(db, kind, stored)
             if entry is not None:
                 folder = (kind, entry)
-                break
-    if folder is None:
-        name, kind = placement.get("crop"), placement.get("crop_kind")
-        if kind == "crop":
-            entry = vocabulary.find(db, "crop", name)
-            folder = ("crop", entry) if entry else None
-        elif kind == "organization":
-            entry = (vocabulary.resolve if create else vocabulary.find)(db, "organization", name)
-            folder = ("organization", entry) if entry else None
-        else:
-            folder = vocabulary.folder(db, name, create=create)
+            break
     return (state["_id"] if state else None,
             folder[0] if folder else None,
             folder[1]["_id"] if folder else None)
@@ -293,17 +282,19 @@ def create_placements(db, *, document, placements: list[dict], copy: dict) -> li
     dashboard uploads -- unlike the crawled corpus, where WorkDrive really does
     hold a separate file per folder.
     """
-    # Resolved to ids first -- creating any state or organisation the form
-    # introduced -- and deduped on the ids, so two spellings of one crop in the
-    # same form cannot become two rows for one folder. A crop the master does
-    # not have fails the upload loudly rather than being filed as something else.
+    # Re-read from the stored ids and deduped on them, so the same folder
+    # arriving twice cannot become two rows. Nothing is created and nothing is
+    # matched by name: an id that no longer resolves fails the decision loudly
+    # rather than being invented or filed as something else.
     resolved, seen = [], set()
     for placement in placements:
-        ids = _placement_ids(db, placement, create=True)
+        ids = _placement_ids(db, placement)
         if ids[0] is None:
-            raise ValueError(f"state {placement.get('state')!r} could not be resolved")
+            raise ValueError(f"state_id {placement.get('state_id')!r} no longer names a state")
         if ids[2] is None:
-            raise ValueError(f"{placement.get('crop')!r} is not a crop in the crop master")
+            raise ValueError(
+                f"the folder this upload was filed under ({placement.get('crop')!r}) no longer "
+                f"names a crop or an organization")
         if ids in seen:
             continue
         seen.add(ids)
@@ -315,9 +306,9 @@ def create_placements(db, *, document, placements: list[dict], copy: dict) -> li
     for (placement, (state_id, kind, folder_id)), row_id in zip(resolved, row_ids):
         rows.append(new_document(
             row_id=row_id, unique_document_id=document["_id"], state_id=state_id,
+            # Provenance only: the names as the queue recorded them. Nothing
+            # reads these -- the OCR language keys off the state's LGD code.
             state_raw=placement.get("state") or "", crop_raw=placement.get("crop") or "",
-            district_id=_optional_ref(db, placement, "district"),
-            kvk_id=_optional_ref(db, placement, "kvk"),
             **{vocabulary.field(kind): folder_id},
         ))
     result = db[COLL_DOCUMENTS].insert_many(rows)
@@ -433,6 +424,12 @@ def _finish(item_id: ObjectId, document_id: ObjectId | None) -> None:
                         "language": metadata.get("language"),
                         "language_source": "manual",
                         **{k: metadata.get(k) for k in _METADATA_FIELDS},
+                        # Where the document applies, re-read from the ids the
+                        # submit verified. Omitted when unset, like every other
+                        # optional reference.
+                        **{vocabulary.field(kind): ref
+                           for kind in ("district", "kvk")
+                           if (ref := _optional_ref(db, metadata, kind)) is not None},
                     },
                 )
                 copy = {

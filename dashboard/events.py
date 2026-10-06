@@ -7,6 +7,10 @@ is published here and pushed to every open stream:
     event: upload        data: UploadQueueItemOut JSON, or {"id", "deleted": true, ...}
     event: translation   data: TranslationJobOut JSON, or {"id", "deleted": true}
     event: document      data: {"unique_document_id": "<hex>"}
+    event: ping          data: {} -- every KEEPALIVE_SECONDS, carries nothing
+
+`ping` exists to be OBSERVABLE: it is how a client tells a quiet stream from a
+dead one. Ignore it for anything else.
 
 In-process only. That is correct for how this runs -- one uvicorn process, and
 the workers that change state are threads inside it -- but a second process
@@ -125,7 +129,16 @@ async def _stream(request: Request) -> AsyncIterator[str]:
             except asyncio.TimeoutError:
                 if await request.is_disconnected():
                     break
-                yield ": keep-alive\n\n"
+                # A NAMED EVENT, not an SSE comment. A comment (": keep-alive")
+                # keeps the socket warm but is invisible to the browser --
+                # EventSource raises nothing for it -- so a client could not
+                # tell a live-but-quiet stream from a dead one. EventSource's
+                # own retry only fires when the connection ERRORS or CLOSES,
+                # and the failure this guards is the opposite: a socket a proxy
+                # or NAT has silently stopped forwarding, which stays "open"
+                # forever and delivers nothing. A client resets a watchdog on
+                # this and reconnects when two in a row are missed.
+                yield "event: ping\ndata: {}\n\n"
     finally:
         with _lock:
             _subscribers.discard(entry)

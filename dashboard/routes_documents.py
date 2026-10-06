@@ -34,7 +34,13 @@ from pymongo import ASCENDING, DESCENDING
 from dashboard import vocabulary
 from dashboard.config import PAGE_SIZE
 from dashboard.db import get_db
-from dashboard.display_id import format_display_id, format_row_id, parse_display_id, parse_row_id
+from dashboard.display_id import (
+    format_display_id,
+    format_row_id,
+    free_row_ids,
+    parse_display_id,
+    parse_row_id,
+)
 from dashboard.languages import LANGUAGES, TESSDATA_BEST
 from dashboard.models import (
     COLL_DISTRICTS,
@@ -45,6 +51,9 @@ from dashboard.models import (
     COLL_STATES,
     COLL_TRANSLATION_JOBS,
     COLL_UNIQUE_DOCUMENTS,
+    link_placement,
+    new_copy_link,
+    new_document,
     normalize_format,
     unlink_placement,
     utcnow,
@@ -62,12 +71,10 @@ from dashboard.schemas import (
     LocationState,
     OrganizationOut,
     Paginated,
+    PlacementCreate,
     StateOut,
     UniqueDocumentOut,
     UniqueDocumentUpdate,
-    VocabularyMerge,
-    VocabularyMergeResult,
-    VocabularyRename,
 )
 
 router = APIRouter()
@@ -281,27 +288,74 @@ _DOCUMENT_FILTERS = {
 }
 
 
+# Every filter key the API accepts, across both tables. A `filter[...]` outside
+# this set is a 400 rather than something ignored.
+#
+# Ignoring one is how a caller gets a WRONG ANSWER instead of an error: the name
+# filters (`filter[state]`, `filter[crop]`, `filter[district]`, `filter[kvk]`)
+# were removed in favour of their _id forms, and a frontend still sending
+# `filter[state]=Kerala` would otherwise be handed all 9,811 placements as
+# though it had asked for no filter at all.
+_VOCABULARY_FILTER_KEYS = frozenset({
+    "state_id", "crop_id", "organization_id", "crop_kind", "district_id", "kvk_id",
+})
+# Accepted by GET /unique-documents only; harmless to allow on both.
+_EXTRA_FILTER_KEYS = frozenset({"multi_placement"})
+
+
+def _reject_unknown_filters(request: Request) -> None:
+    plain = (_VOCABULARY_FILTER_KEYS | _EXTRA_FILTER_KEYS
+             | set(_DOCUMENT_FILTERS) | set(_JOINED_FILTERS))
+    # A range end only exists where the column has an order: _min/_max on
+    # numbers, _from/_to on dates. `filter[state_id_from]` is not a filter, and
+    # saying so beats answering it with the unfiltered table.
+    known = set(plain)
+    for table in (_DOCUMENT_FILTERS, _JOINED_FILTERS):
+        for key, (_field, kind) in table.items():
+            if kind == INT:
+                known |= {f"{key}_min", f"{key}_max"}
+            elif kind in (DATE, DATETIME):
+                known |= {f"{key}_from", f"{key}_to"}
+    for param in request.query_params:
+        if not (param.startswith("filter[") and param.endswith("]")):
+            continue
+        key = param[len("filter["):-1]
+        if key in known:
+            continue
+        removed = {"state": "state_id", "crop": "crop_id (or organization_id)",
+                   "district": "district_id", "kvk": "kvk_id"}
+        if key in removed:
+            raise HTTPException(
+                400, f"filter[{key}] no longer exists -- send filter[{removed[key]}] with the id "
+                     f"from the dropdown. Vocabularies are matched by id, never by name.")
+        raise HTTPException(400, f"unknown filter: filter[{key}]")
+
+
 def _vocabulary_filter(db, request: Request) -> dict | None:
     """The folder filters, as a clause on the placement's id fields. None when
     nothing can match.
 
-      filter[state]=<names>              case-insensitive substring, comma = any of
       filter[state_id]=<ids>             exact, comma = any of
-      filter[crop]=<names>               matches crops AND organisations by name --
-                                         it is the one "Crop" column
       filter[crop_id]=<ids>              crop master ids
       filter[organization_id]=<ids>      organisation ids
       filter[crop_kind]=crop|organization
-      filter[district]=<names>           as for state; same for filter[kvk]
-      filter[district_id]=<ids>          exact, comma = any of
-    """
-    for key in ("state", "crop", "district", "kvk"):
-        # A range on a name column is a caller error; answered with an empty
-        # page, as for every other text column, rather than silently ignored.
-        if any(request.query_params.get(f"filter[{key}{suffix}]")
-               for suffix in ("_min", "_max", "_from", "_to")):
-            return None
 
+    district and kvk are NOT here. They belong to the document, so they are
+    filtered with the other document fields -- see _location_filter.
+
+    IDS, NOT NAMES. `filter[state]=kerala` and its siblings for crop, district
+    and kvk are gone. A column filter is a SELECTION like every other form here:
+    the dropdown lists exactly the entries that can match -- the frontend
+    fetches them from /dashboard/states, /crops, /organizations, /districts,
+    /kvks -- so the caller is choosing a row it already holds the id of. Matching
+    a substring across names and `raw_names` on top of that gave the same
+    question two answers, and the one that guessed was the one that silently
+    picked up Jaipur twice (agriai lists two) or lost Keralam's rows to a filter
+    still saying "Kerala".
+
+    A malformed id is not an error here: it matches nothing, so a filter naming
+    only malformed ids answers an empty page.
+    """
     def ids_param(name: str) -> set | None:
         raw = request.query_params.get(f"filter[{name}]")
         if not raw:
@@ -311,53 +365,33 @@ def _vocabulary_filter(db, request: Request) -> dict | None:
         return ids
 
     clauses: list[dict] = []
-    # -- state
-    wanted = None
-    if request.query_params.get("filter[state]"):
-        wanted = set(vocabulary.ids_matching(db, "state", _split(request.query_params["filter[state]"])))
-    by_id = ids_param("state_id")
-    if by_id is not None:
-        wanted = by_id if wanted is None else wanted & by_id
-    if wanted is not None:
-        if not wanted:
-            return None
-        clauses.append({"state_id": {"$in": sorted(wanted)}})
+    for kind in ("state",):
+        ids = ids_param(f"{kind}_id")
+        if ids is not None:
+            if not ids:
+                return None
+            clauses.append({vocabulary.field(kind): {"$in": sorted(ids)}})
 
-    # -- the folder: crop or organisation
+    # The folder: crop or organisation, the one "Crop" column in the table.
     kind = request.query_params.get("filter[crop_kind]")
     if kind:
         if kind not in ("crop", "organization"):
             return None
         clauses.append({vocabulary.field(kind): {"$exists": True}})
+    folder_clauses = []
     for name in ("crop_id", "organization_id"):
         ids = ids_param(name)
         if ids is not None:
             if not ids:
                 return None
-            clauses.append({name: {"$in": sorted(ids)}})
-    raw_names = request.query_params.get("filter[crop]")
-    if raw_names:
-        values = _split(raw_names)
-        either = [{vocabulary.field(k): {"$in": ids}}
-                  for k in ("crop", "organization")
-                  if (ids := vocabulary.ids_matching(db, k, values))]
-        if not either:
-            return None
-        clauses.append({"$or": either})
-
-    # -- district and KVK: optional references, matched by name or by id just
-    # like the state. A row that has neither simply never matches one of these.
-    for kind in ("district", "kvk"):
-        wanted = None
-        if request.query_params.get(f"filter[{kind}]"):
-            wanted = set(vocabulary.ids_matching(db, kind, _split(request.query_params[f"filter[{kind}]"])))
-        by_id = ids_param(f"{kind}_id")
-        if by_id is not None:
-            wanted = by_id if wanted is None else wanted & by_id
-        if wanted is not None:
-            if not wanted:
-                return None
-            clauses.append({vocabulary.field(kind): {"$in": sorted(wanted)}})
+            folder_clauses.append({name: {"$in": sorted(ids)}})
+    if len(folder_clauses) == 2:
+        # Both sent means "either of these", because they are one column: a
+        # crop and an organisation can never both be set on one placement, so
+        # AND-ing them would match nothing at all.
+        clauses.append({"$or": folder_clauses})
+    else:
+        clauses.extend(folder_clauses)
 
     if not clauses:
         return {}
@@ -411,8 +445,38 @@ _JOINED_FILTERS = {
 
 # Fields a PATCH on a main-table row applies to the ROW; everything else goes to
 # the document.
-_ROW_FIELDS = {"state", "crop", "organization", "state_id", "crop_id", "organization_id",
-               "district", "kvk", "district_id", "kvk_id"}
+_ROW_FIELDS = {"state_id", "crop_id", "organization_id"}
+
+
+# The vocabulary references stored on the DOCUMENT rather than on a placement.
+_LOCATION_FIELDS = ("district_id", "kvk_id")
+
+
+def _location_filter(db, request: Request, prefix: str = "") -> dict | None:
+    """filter[district_id] / filter[kvk_id], as a clause on the DOCUMENT.
+
+    `prefix` is "doc." on the main table, where the document is joined in under
+    that alias, and "" on the documents listing, which IS the document. The two
+    listings therefore filter the same stored field, which is the point: before
+    the move these lived on the placement, so "documents in Wayanad" and
+    "placements in Wayanad" were different questions with no good answer for a
+    document filed in three folders.
+
+    {} when neither is asked for, None when nothing can match.
+    """
+    clauses: list[dict] = []
+    for f in _LOCATION_FIELDS:
+        raw = request.query_params.get(f"filter[{f}]")
+        if not raw:
+            continue
+        ids = {vocabulary.to_object_id(v) for v in _split(raw)}
+        ids.discard(None)
+        if not ids:
+            return None
+        clauses.append({f"{prefix}{f}": {"$in": sorted(ids)}})
+    if not clauses:
+        return {}
+    return clauses[0] if len(clauses) == 1 else {"$and": clauses}
 
 
 # -- ?sort= --------------------------------------------------------------------
@@ -465,16 +529,33 @@ def _vocabulary_sort_stages(db, key: str, scope: str, descending: bool) -> list[
     The folder is one column over two vocabularies -- a crop or an organisation
     -- so both are ranked together and whichever id the row has is used.
 
-    On the documents listing there is no placement to read, so the document's
-    ANCHOR placement (representative_row_id, the copy the document IS) is joined
-    in first. That is the same placement whose state/crop the row already
-    carries in duplicate_links, so the column sorts by what it displays.
+    District and KVK are the document's own fields, so on the documents listing
+    they are read straight off it and on the main table off the joined document.
+
+    State and folder belong to the PLACEMENT, and a document has no single one.
+    The documents listing therefore sorts by the placement holding the copy the
+    document IS -- found by matching `representative_file_id` against the copy
+    entries, each of which names its own placement. That row is DERIVED here
+    rather than read from a stored `representative_row_id`: the stored field said
+    the same thing, had five writers to keep it in step, and drifted into naming
+    a deleted placement. It is also the same placement a reader displays, so the
+    column still sorts by what it shows.
     """
     stages: list[dict] = []
     base = ""
-    if scope == "documents":
+    if scope == "placements" and key in ("district", "kvk"):
+        base = "doc."
+    elif scope == "documents" and key in ("state", "crop"):
+        # The copy entries whose file IS the document -- one of them, unless the
+        # document has no copies left, in which case the row sorts as a blank.
+        anchor_copies = {"$filter": {
+            "input": {"$ifNull": ["$duplicate_links", []]},
+            "as": "l",
+            "cond": {"$eq": ["$$l.zoho_file_id", "$representative_file_id"]},
+        }}
         stages += [
-            {"$lookup": {"from": COLL_DOCUMENTS, "localField": "representative_row_id",
+            {"$addFields": {"_anchor_row": {"$first": anchor_copies}}},
+            {"$lookup": {"from": COLL_DOCUMENTS, "localField": "_anchor_row.row_id",
                          "foreignField": "row_id", "as": "_anchor"}},
             {"$unwind": {"path": "$_anchor", "preserveNullAndEmptyArrays": True}},
         ]
@@ -601,10 +682,12 @@ def _document_out(row: dict, names: dict) -> DocumentOut:
         state_id=str(row["state_id"]) if row.get("state_id") else None,
         crop_id=str(row["crop_id"]) if row.get("crop_id") else None,
         organization_id=str(row["organization_id"]) if row.get("organization_id") else None,
-        district=names["district"].get(row.get("district_id")),
-        kvk=names["kvk"].get(row.get("kvk_id")),
-        district_id=str(row["district_id"]) if row.get("district_id") else None,
-        kvk_id=str(row["kvk_id"]) if row.get("kvk_id") else None,
+        # On the DOCUMENT, not the row: one district per document, shown on
+        # every placement of it.
+        district=names["district"].get(doc.get("district_id")),
+        kvk=names["kvk"].get(doc.get("kvk_id")),
+        district_id=str(doc["district_id"]) if doc.get("district_id") else None,
+        kvk_id=str(doc["kvk_id"]) if doc.get("kvk_id") else None,
         subpath=row.get("subpath"),
         unique_document_id=str(row.get("unique_document_id", "")),
         document_id=format_display_id(doc.get("display_id")) or "",
@@ -633,16 +716,17 @@ def _document_out(row: dict, names: dict) -> DocumentOut:
 
 
 def _copy_places(db, docs: list[dict]) -> dict[int, dict]:
-    """row_id -> where that placement files the copy: state, folder, district
-    and KVK, by name.
+    """row_id -> where that placement files the copy: state and folder, by name.
 
     A copy entry names its placement by row_id and carries none of this itself,
-    so it is all read from the placement. One query for a whole page.
+    so it is read from the placement. One query for a whole page.
+
+    No district or KVK: those belong to the document now, so they are the same
+    for every copy and the document already carries them.
 
     This is how the documents listing shows a state and a folder at all: a
-    document has no single one, so the frontend reads the entry whose row_id is
-    the document's `representative_row_id` -- the anchor, the copy the document
-    IS. District and KVK are here for exactly the same reason.
+    document has no single one, so a reader takes the entry whose `zoho_file_id`
+    is the document's `representative_file_id` -- the copy the document IS.
     """
     row_ids = {c.get("row_id") for d in docs for c in (d.get("duplicate_links") or [])}
     row_ids.discard(None)
@@ -653,19 +737,24 @@ def _copy_places(db, docs: list[dict]) -> dict[int, dict]:
         r["row_id"]: {
             "state": names["state"].get(r.get("state_id"), ""),
             "crop": _folder_of(r, names)[0],
-            "district": names["district"].get(r.get("district_id")),
-            "kvk": names["kvk"].get(r.get("kvk_id")),
         }
         for r in db[COLL_DOCUMENTS].find(
             {"row_id": {"$in": list(row_ids)}},
-            {"row_id": 1, "state_id": 1, "crop_id": 1, "organization_id": 1,
-             "district_id": 1, "kvk_id": 1})
+            {"row_id": 1, "state_id": 1, "crop_id": 1, "organization_id": 1})
     }
 
 
-def _unique_out(doc: dict, places: dict[int, tuple[str, str]]) -> UniqueDocumentOut:
-    """`places` is _copy_places() for a set of documents including this one."""
+def _unique_out(doc: dict, places: dict[int, tuple[str, str]], names: dict) -> UniqueDocumentOut:
+    """`places` is _copy_places() for a set of documents including this one;
+    `names` is _names() for resolving the document's own district and KVK."""
     data = dict(doc)
+    # The document's location, by name and by id. Its own fields since the
+    # anchor placement went, so the modal reads them here rather than off
+    # whichever placement happened to be the anchor.
+    for kind in ("district", "kvk"):
+        f = vocabulary.field(kind)
+        data[kind] = names[kind].get(data.get(f))
+        data[f] = str(data[f]) if data.get(f) else None
     links = []
     for link in data.get("duplicate_links") or []:
         links.append({**link, **places.get(link.get("row_id"), {})})
@@ -694,7 +783,7 @@ def _joined_one(db, row: dict) -> DocumentOut:
 
 
 def _unique_one(db, doc: dict) -> UniqueDocumentOut:
-    return _unique_out(doc, _copy_places(db, [doc]))
+    return _unique_out(doc, _copy_places(db, [doc]), _names(db))
 
 
 # -- the main table ------------------------------------------------------------
@@ -704,12 +793,15 @@ def _unique_one(db, doc: dict) -> UniqueDocumentOut:
 def list_documents(request: Request, db=Depends(get_db)):
     page, page_size = _pagination(request)
     sort = _sort_stages(db, request, "placements") or [{"$sort": _PAGE_SORT_AGG}]
+    _reject_unknown_filters(request)
     row_query = _build_filter(request, _DOCUMENT_FILTERS)
     names_query = _vocabulary_filter(db, request)
     doc_query = _build_filter(request, _JOINED_FILTERS, prefix="doc.")
-    if row_query is None or names_query is None or doc_query is None:
+    where = _location_filter(db, request, prefix="doc.")
+    if row_query is None or names_query is None or doc_query is None or where is None:
         return _empty_page(page, page_size)
     row_query.update(names_query)
+    doc_query.update(where)
 
     # Placement filters first so the (state_id, crop_id) index narrows the set
     # before the join runs; document filters after, because they need the
@@ -771,51 +863,40 @@ def list_siblings(row_id: str, db=Depends(get_db)):
 
 # The placement references a PATCH may set on either endpoint -- on the row
 # directly, or on a document's anchor row.
-_PLACEMENT_REF_FIELDS = ("district", "kvk", "district_id", "kvk_id")
 
 
-def _placement_refs(db, submitted: dict) -> tuple[dict, dict]:
+
+def _location_refs(db, submitted: dict) -> tuple[dict, dict]:
     """($set, $unset) for the district/kvk references in a PATCH body.
 
-    Each may arrive as an id (must name an existing entry) or as a NAME, which
-    must already exist, since these are synced. An EMPTY STRING clears the
-    reference -- on EITHER form, `{"district_id": ""}` and `{"district": ""}`
-    alike -- and is the only way to say "no district after all", since a null
-    here means "not sent", as it does for every other field.
+    Each arrives as an ID and must name an existing entry. An EMPTY STRING
+    clears the reference, and is the only way to say "no district after all",
+    since a null here means "not sent", as it does for every other field.
 
-    Shared by PATCH /documents/{row_id} and PATCH /unique-documents/{id} so the
-    two cannot come to disagree about what clears a field.
+    The name forms (`{"district": "Wayanad"}`) are gone with every other name
+    field: these are synced vocabularies picked from a dropdown, so the caller
+    has the id. "" is checked before the lookup, which would otherwise try to
+    read it as an ObjectId and answer 400 -- the form sends the field it edits,
+    and "the user picked nothing" is the one thing it cannot say with an id.
+
+    Both are fields of the DOCUMENT, so only PATCH /unique-documents/{id}
+    carries them. PATCH /documents/{row_id} edits a placement, and a placement
+    has no district of its own to edit.
     """
     move: dict = {}
     unset: dict = {}
     for kind in ("district", "kvk"):
         f = vocabulary.field(kind)
-        sent_id = submitted.get(f"{kind}_id")
-        if sent_id is not None and not str(sent_id).strip():
-            # An EMPTY id clears, exactly as an empty name does. Checked before
-            # the lookup below, which would otherwise try to read "" as an
-            # ObjectId and answer 400 -- the form sends the field it edits, and
-            # "the user picked nothing" is the one thing it cannot say with an id.
+        sent = submitted.get(f)
+        if sent is None:
+            continue
+        if not str(sent).strip():
             unset[f] = ""
-        elif sent_id is not None:
-            entry = vocabulary.get(db, kind, sent_id)
-            if entry is None:
-                raise HTTPException(400, f"{kind}_id does not name an existing {kind}")
-            move[f] = entry["_id"]
-        elif submitted.get(kind) is not None:
-            raw = " ".join(str(submitted[kind]).split())
-            if not raw:
-                unset[f] = ""          # "" is the one way to clear it
-                continue
-            # Synced from LGD and never created here, so an unrecognised name is
-            # a mistake to report -- NOT something to quietly drop, which is
-            # what returning None used to cause.
-            entry = vocabulary.find(db, kind, raw)
-            if entry is None:
-                raise HTTPException(
-                    400, f"{raw!r} is not a known {kind} -- pick one from "
-                         f"GET /dashboard/{vocabulary._path(kind)}")
-            move[f] = entry["_id"]
+            continue
+        entry = vocabulary.get(db, kind, sent)
+        if entry is None:
+            raise HTTPException(400, f"{f} does not name an existing {kind}")
+        move[f] = entry["_id"]
     return move, unset
 
 
@@ -832,67 +913,45 @@ def update_document(row_id: str, body: DocumentUpdate, db=Depends(get_db)):
     row_updates = {k: v for k, v in submitted.items() if k in _ROW_FIELDS}
     doc_updates = {k: v for k, v in submitted.items() if k not in _ROW_FIELDS}
 
-    # Moving a row: an id must name an existing entry; a state or organisation
-    # name is resolved, and created if nobody has used it; a crop name must be
-    # in the crop master (or be an existing organisation's name). The raw name
-    # moves with it, so the OCR-language lookup and the WorkDrive folder name
-    # don't silently point at the row's previous placement. Nothing on the
-    # document needs touching -- its copy entries read their folder from here.
+    # Moving a row: IDS ONLY. Every vocabulary is read-only and picked from a
+    # dropdown, so the caller holds the id -- `{"state": "State Kerala"}` and
+    # its siblings are gone. `state_raw` / `crop_raw` follow as provenance, so
+    # the row stays traceable to a folder, but nothing reads them. Nothing on
+    # the document needs touching -- its copy entries read their folder here.
     move: dict = {}
     unset: dict = {}
-    if row_updates.get("state_id") is not None or row_updates.get("state") is not None:
-        if row_updates.get("state_id") is not None:
-            state = vocabulary.get(db, "state", row_updates["state_id"])
-            if state is None:
-                raise HTTPException(400, "state_id does not name an existing state")
-        else:
-            state = vocabulary.resolve(db, "state", row_updates["state"])
-            if state is None:
-                raise HTTPException(400, "state name cannot be empty")
+    if row_updates.get("state_id") is not None:
+        state = vocabulary.get(db, "state", row_updates["state_id"])
+        if state is None:
+            raise HTTPException(400, "state_id does not name an existing state")
         move["state_id"] = state["_id"]
-        move["state_raw"] = row_updates.get("state") if row_updates.get("state_id") is None else state["name"]
+        move["state_raw"] = state["name"]
 
-    folder = None  # (kind, entry, raw)
-    asked = [k for k in ("crop_id", "organization_id", "crop", "organization") if row_updates.get(k) is not None]
+    folder = None  # (kind, entry)
+    asked = [k for k in ("crop_id", "organization_id") if row_updates.get(k) is not None]
     if len(asked) > 1:
-        raise HTTPException(400, "send only one of crop, crop_id, organization, organization_id")
+        raise HTTPException(400, "send only one of crop_id, organization_id")
     if asked:
-        key, value = asked[0], row_updates[asked[0]]
-        if key in ("crop_id", "organization_id"):
-            kind = "crop" if key == "crop_id" else "organization"
-            entry = vocabulary.get(db, kind, value)
-            if entry is None:
-                raise HTTPException(400, f"{key} does not name an existing {kind}")
-            folder = (kind, entry, entry["name"])
-        elif key == "organization":
-            entry = vocabulary.resolve(db, "organization", value)
-            if entry is None:
-                raise HTTPException(400, "organization name cannot be empty")
-            folder = ("organization", entry, value)
-        else:
-            found = vocabulary.folder(db, value, create=False)
-            if found is None:
-                raise HTTPException(
-                    400, f"{value!r} is not a crop in the crop master -- send it as "
-                         f"\"organization\" if it is an organisation or grouping")
-            folder = (found[0], found[1], value)
-    # District and KVK move independently of the folder.
-    refs, ref_unset = _placement_refs(db, row_updates)
-    move.update(refs)
-    unset.update(ref_unset)
+        key = asked[0]
+        kind = "crop" if key == "crop_id" else "organization"
+        entry = vocabulary.get(db, kind, row_updates[key])
+        if entry is None:
+            raise HTTPException(400, f"{key} does not name an existing {kind}")
+        folder = (kind, entry)
 
     if folder is not None:
-        kind, entry, raw = folder
+        kind, entry = folder
         other = "organization" if kind == "crop" else "crop"
         move[vocabulary.field(kind)] = entry["_id"]
-        move["crop_raw"] = raw
+        move["crop_raw"] = entry["name"]
         unset[vocabulary.field(other)] = ""
 
     if doc_updates:
         _apply_document_updates(db, row["unique_document_id"], doc_updates)
     if move or unset:
-        # `unset` alone is a real change -- clearing a district sets nothing --
-        # so this cannot be gated on `move`, which is empty in that case.
+        # `unset` alone is a real change -- moving a placement from a crop to
+        # an organisation clears the other field -- so this cannot be gated on
+        # `move` alone.
         move["updated_at"] = utcnow()
         db[COLL_DOCUMENTS].update_one({"_id": oid}, {"$set": move, **({"$unset": unset} if unset else {})})
     return _joined_one(db, db[COLL_DOCUMENTS].find_one({"_id": oid}))
@@ -987,7 +1046,7 @@ def delete_unique_document(document_id: str, db=Depends(get_db)):
           f"{len(file_ids)} file(s) trashed in WorkDrive", flush=True)
 
 
-def _apply_document_updates(db, unique_document_id, updates: dict) -> None:
+def _apply_document_updates(db, unique_document_id, updates: dict, unset: dict | None = None) -> None:
     """Validate and write document-level fields. Shared by PATCH /documents and
     PATCH /unique-documents so the two cannot validate differently."""
     if "format_original" in updates:
@@ -1013,13 +1072,14 @@ def _apply_document_updates(db, unique_document_id, updates: dict) -> None:
                       if l.get("zoho_file_id") == updates["representative_file_id"]), None)
         if match is None:
             raise HTTPException(400, "representative_file_id must be one of this document's own copies")
-        updates["representative_row_id"] = match.get("row_id")
         # Re-anchoring moves the document's own link with it; leaving the old
         # one would point the document at a copy it no longer claims.
         updates["shareable_link"] = match.get("shareable_link")
         updates.setdefault("shareable_name", match.get("shareable_name"))
     updates["updated_at"] = utcnow()
-    db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": unique_document_id}, {"$set": updates})
+    db[COLL_UNIQUE_DOCUMENTS].update_one(
+        {"_id": unique_document_id},
+        {"$set": updates, **({"$unset": unset} if unset else {})})
 
 
 # filter[<key>] on unique_documents when it is queried directly. Same fields as
@@ -1041,14 +1101,15 @@ def _multi_placement(value: str):
 
 def _documents_placed_like(db, request: Request) -> dict | None:
     """The clause restricting the documents listing to documents PLACED a given
-    way -- filter[state], filter[crop], filter[district], filter[kvk] and the
-    _id forms, which are otherwise main-table-only because they live on the
-    placement rather than on the document.
+    way -- filter[state_id] and the folder ids, which are otherwise
+    main-table-only because they live on the placement rather than on the
+    document. District and kvk are NOT here: the document owns those, so
+    _location_filter matches them directly.
 
     Matches on ANY placement: "the documents filed in Kerala" is every document
     with a Kerala placement, the same set the main table's filter describes,
-    lifted from placements to documents. Note the row still DISPLAYS its anchor
-    placement's state, and 59 of 8,749 documents are filed in more than one
+    lifted from placements to documents. Note the row still DISPLAYS the state
+    of the copy it IS, and 59 of 8,749 documents are filed in more than one
     state -- for those the filter can match on a placement other than the one
     shown.
 
@@ -1079,6 +1140,7 @@ def list_unique_documents(request: Request, db=Depends(get_db)):
     `filter[multi_placement]=true` for the documents filed in more than one
     place.
     """
+    _reject_unknown_filters(request)
     page, page_size = _pagination(request)
     sort = _sort_stages(db, request, "documents")
     query = _build_filter(request, _UNIQUE_FILTERS)
@@ -1086,9 +1148,11 @@ def list_unique_documents(request: Request, db=Depends(get_db)):
         return _empty_page(page, page_size)
 
     placed = _documents_placed_like(db, request)
-    if placed is None:
+    where = _location_filter(db, request)
+    if placed is None or where is None:
         return _empty_page(page, page_size)
     query.update(placed)
+    query.update(where)
 
     raw = request.query_params.get("filter[multi_placement]")
     if raw:
@@ -1111,7 +1175,8 @@ def list_unique_documents(request: Request, db=Depends(get_db)):
             .limit(page_size)
         )
     places = _copy_places(db, rows)
-    return Paginated(items=[_unique_out(row, places) for row in rows], total=total,
+    names = _names(db)
+    return Paginated(items=[_unique_out(row, places, names) for row in rows], total=total,
                      page=page, page_size=page_size)
 
 
@@ -1125,49 +1190,37 @@ def get_unique_document(document_id: str, db=Depends(get_db)):
 
 @router.patch("/unique-documents/{document_id}", response_model=UniqueDocumentOut)
 def update_unique_document(document_id: str, body: UniqueDocumentUpdate, db=Depends(get_db)):
-    """Edit a document. Everything lands on the document and therefore on all of
-    its placements -- EXCEPT district and kvk, which are placement fields and go
-    to this document's ANCHOR placement only. See _apply_anchor_refs.
+    """Edit a document. EVERYTHING lands on the document, and therefore shows on
+    all of its placements -- district and kvk included.
+
+    District and kvk used to be the exception: they were stored on a placement,
+    so a document-level edit had to choose one placement to write to (its anchor)
+    and refused when that placement had gone. They are the document's own fields
+    now, so there is no exception left and nothing to choose.
     """
     oid = _to_object_id(document_id)
-    doc = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": oid}, {"representative_row_id": 1})
-    if doc is None:
+    if db[COLL_UNIQUE_DOCUMENTS].count_documents({"_id": oid}, limit=1) == 0:
         raise HTTPException(404, "unique document not found")
     updates = body.model_dump(exclude_unset=True)
-    anchor = {k: updates.pop(k) for k in _PLACEMENT_REF_FIELDS if k in updates}
-    if updates:
-        _apply_document_updates(db, oid, updates)
-    if anchor:
-        _apply_anchor_refs(db, doc, anchor)
+    # "" clears a reference, which `_apply_document_updates` would otherwise
+    # store as the empty string -- so these two are resolved to ids here and
+    # applied as a $set/$unset pair.
+    refs, unset = _location_refs(db, updates)
+    for f in _LOCATION_FIELDS:
+        updates.pop(f, None)
+    updates.update(refs)
+    if updates or unset:
+        _apply_document_updates(db, oid, updates, unset=unset)
     return _unique_one(db, db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": oid}))
 
 
-def _apply_anchor_refs(db, doc: dict, submitted: dict) -> None:
-    """Write district/kvk to a document's ANCHOR placement -- the copy the
-    document IS (representative_row_id).
-
-    WHY THE ANCHOR AND NOT EVERY PLACEMENT. These are placement fields: a
-    document filed in two states cannot sensibly have one district, and 59 of
-    8,749 documents are filed in more than one state -- writing a Kerala
-    district onto a Karnataka placement would be worse than not writing it. The
-    anchor is also the placement the documents listing already DISPLAYS (its
-    state, folder, district and kvk are what `duplicate_links` reports for
-    `representative_row_id`), so the edit changes exactly what the row shows.
-
-    For the 8,358 single-placement documents there is no distinction to make.
-    To set a district on some other placement, PATCH that row.
-    """
-    row_id = doc.get("representative_row_id")
-    row = db[COLL_DOCUMENTS].find_one({"row_id": row_id}) if row_id is not None else None
-    if row is None:
-        raise HTTPException(
-            409, "this document has no anchor placement, so it has nowhere to keep a "
-                 "district or kvk -- file it somewhere first, or PATCH a placement directly")
-    move, unset = _placement_refs(db, submitted)
-    if move or unset:
-        move["updated_at"] = utcnow()
-        db[COLL_DOCUMENTS].update_one(
-            {"_id": row["_id"]}, {"$set": move, **({"$unset": unset} if unset else {})})
+# NO ANCHOR PLACEMENT. _apply_anchor_refs() used to write a document-level
+# district or kvk onto one chosen placement -- the document's anchor row --
+# because those two fields were stored on the placement while the form that
+# edits them is per document. It needed a stored `representative_row_id`, it
+# refused with a 409 when that row had been deleted, and it wrote a Kerala
+# district onto a Kerala placement while the document's Karnataka placement
+# showed nothing. Moving both fields onto the document removed the question.
 
 
 @router.get("/unique-documents/{document_id}/placements", response_model=list[DocumentOut])
@@ -1183,10 +1236,155 @@ def list_placements(document_id: str, db=Depends(get_db)):
     return [_document_out(row, names) for row in rows]
 
 
+def _document_for_placement(db, raw: str) -> dict:
+    """The unique document an id names, however the caller spells it.
+
+    FOUR FORMS, because the main table and the document modal hold different
+    ids for the same thing and either is a reasonable thing to send: a document
+    by ObjectId or ANNAM id, or a PLACEMENT by ObjectId or POP id, which is
+    resolved to the document it points at. A row id is accepted precisely
+    because the row is what the person clicked.
+
+    ORDER MATTERS, and getting it wrong is not cosmetic. parse_display_id()
+    accepts a BARE number as well as "ANNAM_00042", so the 24-zero ObjectId --
+    the one every test reaches for as "an id that names nothing" -- parses as
+    display id 0 and finds ANNAM_00000, a real corpus document. Trying the
+    ObjectId first is not enough on its own, because that string IS a valid
+    ObjectId that matches nothing; the human forms are therefore accepted only
+    with their prefix, where no digits-only string can collide with them.
+    """
+    oid = vocabulary.to_object_id(raw)
+    if oid is not None:
+        doc = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": oid})
+        if doc is not None:
+            return doc
+        row = db[COLL_DOCUMENTS].find_one({"_id": oid})
+        if row is not None:
+            doc = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": row["unique_document_id"]})
+            if doc is not None:
+                return doc
+    prefixed = str(raw or "").strip().upper()
+    if prefixed.startswith("ANNAM_"):
+        display = parse_display_id(prefixed)
+        if display is not None:
+            doc = db[COLL_UNIQUE_DOCUMENTS].find_one({"display_id": display})
+            if doc is not None:
+                return doc
+    if prefixed.startswith("POP_"):
+        row_number = parse_row_id(prefixed)
+        if row_number is not None:
+            row = db[COLL_DOCUMENTS].find_one({"row_id": row_number})
+            if row is not None:
+                doc = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": row["unique_document_id"]})
+                if doc is not None:
+                    return doc
+    raise HTTPException(404, "unique document not found")
+
+
+@router.post("/unique-documents/{document_id}/placements",
+             response_model=DocumentOut, status_code=201)
+def create_placement(document_id: str, body: PlacementCreate, db=Depends(get_db)):
+    """File a document that already exists under one more state + folder.
+
+    The counterpart to PATCH /documents/{row_id}, which MOVES a placement: this
+    adds one, leaving the others alone. Until now the only way to file an
+    existing document somewhere else was to upload the file again and take the
+    /uploads/{id}/add branch, which needed the bytes in hand for a document the
+    database already had.
+
+    NO SECOND FILE IS CREATED, and that is the whole reason this can exist. A
+    dashboard upload writes one file into one flat WorkDrive folder and files it
+    in several places, so several placements already share one `zoho_file_id`;
+    the new row reuses the document's anchor copy, and link_placement() adds no
+    `duplicate_links` entry because that file is already listed. So the new
+    row's "Original" download serves the same file as the anchor's -- which is
+    the truth, not an approximation.
+
+    A document with NO copy links is still filed, and this used to refuse it. A
+    placement is an association -- (document, state, folder) -- and needs no
+    file of its own to exist; the "Original" download reads
+    `representative_file_id` off the DOCUMENT (routes_files._NAMED_KINDS), not
+    off the row and not off `duplicate_links`. The refusal was reachable too
+    easily: deleting a document's only placement used to empty its
+    `duplicate_links`, so a freshly uploaded document whose placement was
+    removed could never be filed again, while its file sat in WorkDrive the
+    whole time. unlink_placement no longer does that, and this restores the
+    entry from the anchor file id for a document already left in that state.
+
+    Ids only, and exactly one folder. No district or kvk: those are the
+    DOCUMENT's fields, so a new placement neither carries nor changes them --
+    it inherits whatever the document already says. 409 if the document is
+    already filed under this exact state + folder.
+    """
+    doc = _document_for_placement(db, document_id)
+
+    state = vocabulary.get(db, "state", body.state_id)
+    if state is None:
+        raise HTTPException(400, "state_id does not name an existing state")
+
+    sent = [k for k in ("crop_id", "organization_id") if getattr(body, k)]
+    if len(sent) != 1:
+        raise HTTPException(400, "send exactly one of crop_id, organization_id")
+    kind = "crop" if sent[0] == "crop_id" else "organization"
+    folder = vocabulary.get(db, kind, getattr(body, sent[0]))
+    if folder is None:
+        raise HTTPException(400, f"{sent[0]} does not name an existing {kind}")
+
+    clash = db[COLL_DOCUMENTS].find_one({
+        "unique_document_id": doc["_id"],
+        "state_id": state["_id"],
+        vocabulary.field(kind): folder["_id"],
+    })
+    if clash is not None:
+        raise HTTPException(
+            409,
+            f"{format_display_id(doc.get('display_id'))} is already filed under "
+            f"{state['name']} / {folder['name']} as {format_row_id(clash.get('row_id'))}",
+        )
+
+    # The copy the document IS, if it lists one. With no links at all the new
+    # row carries none either -- unless the anchor FILE is still known, in which
+    # case the link is rebuilt from it and the document gets its download and
+    # its translation source back.
+    anchor = next((c for c in (doc.get("duplicate_links") or [])
+                   if c.get("zoho_file_id") == doc.get("representative_file_id")), None)
+    if anchor is None:
+        anchor = next(iter(doc.get("duplicate_links") or []), None)
+    if anchor is None and doc.get("representative_file_id"):
+        anchor = {"zoho_file_id": doc["representative_file_id"],
+                  "shareable_link": doc.get("shareable_link"),
+                  "shareable_name": doc.get("shareable_name")}
+
+    row_id = free_row_ids(db, 1)[0]
+    row = new_document(
+        row_id=row_id,
+        unique_document_id=doc["_id"],
+        state_id=state["_id"],
+        # The folder names as filed. Not read by anything that infers -- the OCR
+        # language keys off the state's LGD code -- but a placement still has to
+        # be findable by the name its folder has.
+        state_raw=state["name"],
+        crop_raw=folder["name"],
+        **{vocabulary.field(kind): folder["_id"]},
+    )
+    row["_id"] = db[COLL_DOCUMENTS].insert_one(row).inserted_id
+    link_placement(
+        db, doc["_id"],
+        row_obj_id=row["_id"],
+        row_id=row_id,
+        copy_link=None if anchor is None else new_copy_link(
+            zoho_file_id=anchor.get("zoho_file_id"),
+            shareable_link=anchor.get("shareable_link"),
+            shareable_name=anchor.get("shareable_name"),
+        ),
+    )
+    return _joined_one(db, db[COLL_DOCUMENTS].find_one({"_id": row["_id"]}))
+
+
 # -- lookups -------------------------------------------------------------------
 
 
-# The extra fields each vocabulary's output model carries beyond name/raw_names:
+# The extra fields each vocabulary's output model carries beyond name and count:
 # the LGD code and the parent reference, read straight off the stored entry.
 _ENTRY_EXTRAS = {
     "DistrictOut": (("code", "district_code"), ("state_id", "state_id")),
@@ -1196,31 +1394,33 @@ _ENTRY_EXTRAS = {
 }
 
 
-def _entry_out(model, row: dict, counts: dict, spellings: dict | None = None):
-    raw = (spellings or {}).get(row["_id"]) if spellings is not None else row.get("raw_names")
+def _entry_out(model, row: dict, counts: dict):
+    """One vocabulary entry as the dropdown needs it: id, name, code, parent,
+    and how many placements use it.
+
+    No `raw_names`. They are still stored -- provenance for the folder spellings
+    the crawl found -- but nothing resolves them any more, so serving them
+    invited a caller to match on one.
+    """
     extras = {}
     for out_name, stored in _ENTRY_EXTRAS.get(model.__name__, ()):
         value = row.get(stored)
         extras[out_name] = str(value) if isinstance(value, ObjectId) else value
-    return model(id=str(row["_id"]), name=row["name"], raw_names=sorted(raw or []),
+    return model(id=str(row["_id"]), name=row["name"],
                  document_count=counts.get(row["_id"], 0), **extras)
 
 
-def _vocabulary_call(fn, *args):
-    try:
-        return fn(*args)
-    except vocabulary.VocabularyError as e:
-        raise HTTPException(e.status, str(e))
-
-
 def _narrowed_by_state(db, request: Request, kind: str) -> dict | None:
-    """`?state=<name>` / `?state_id=<id>`: only entries actually used under
-    that state -- what the upload form needs. {} when not narrowed, None when
-    the state does not exist."""
-    state_id, state_name = request.query_params.get("state_id"), request.query_params.get("state")
-    if not (state_id or state_name):
+    """`?state_id=<id>`: only entries actually used under that state -- what the
+    upload form needs. {} when not narrowed, None when the state does not exist.
+
+    By id. `?state=<name>` is gone: the caller picked the state from
+    /dashboard/states, so it holds the id.
+    """
+    state_id = request.query_params.get("state_id")
+    if not state_id:
         return {}
-    state = vocabulary.get(db, "state", state_id) if state_id else vocabulary.find(db, "state", state_name)
+    state = vocabulary.get(db, "state", state_id)
     if state is None:
         return None
     f = vocabulary.field(kind)
@@ -1263,13 +1463,12 @@ def list_reviewers(db=Depends(get_db)):
 @router.get("/crops", response_model=list[CropOut])
 def list_crops(request: Request, db=Depends(get_db)):
     """The crop master's crops (never its pesticides), for the dropdown.
-    `?state=` / `?state_id=` narrows to the crops filed under that state.
-    `raw_names` are our older spellings that resolve to each crop."""
+    `?state_id=` narrows to the crops filed under that state."""
     query = _narrowed_by_state(db, request, "crop")
     if query is None:
         return []
-    counts, spellings = vocabulary.usage_counts(db, "crop"), vocabulary.crop_spellings(db)
-    return sorted((_entry_out(CropOut, row, counts, spellings)
+    counts = vocabulary.usage_counts(db, "crop")
+    return sorted((_entry_out(CropOut, row, counts)
                    for row in vocabulary.entries(db, "crop", query)),
                   key=lambda c: c.name.lower())
 
@@ -1277,7 +1476,7 @@ def list_crops(request: Request, db=Depends(get_db)):
 @router.get("/organizations", response_model=list[OrganizationOut])
 def list_organizations(request: Request, db=Depends(get_db)):
     """Folders that are not crops: organisations, departments, groupings.
-    `?state=` / `?state_id=` narrows to those filed under that state."""
+    `?state_id=` narrows to those filed under that state."""
     query = _narrowed_by_state(db, request, "organization")
     if query is None:
         return []
@@ -1300,11 +1499,9 @@ def _by_parent(db, request: Request, kind: str) -> list[dict] | None:
     """
     parent_kind, _f = vocabulary.PARENT[kind]
     by_id = request.query_params.get(f"{parent_kind}_id")
-    by_name = request.query_params.get(parent_kind)
-    if not (by_id or by_name):
+    if not by_id:
         return list(vocabulary.entries(db, kind, None))
-    parent = (vocabulary.get(db, parent_kind, by_id) if by_id
-              else vocabulary.find(db, parent_kind, by_name))
+    parent = vocabulary.get(db, parent_kind, by_id)
     if parent is None:
         return None
     return vocabulary.children_of(db, kind, parent["_id"])
@@ -1312,7 +1509,7 @@ def _by_parent(db, request: Request, kind: str) -> list[dict] | None:
 
 @router.get("/districts", response_model=list[DistrictOut])
 def list_districts(request: Request, db=Depends(get_db)):
-    """Districts, synced from LGD. `?state_id=` / `?state=` narrows to that
+    """Districts, synced from LGD. `?state_id=` narrows to that
     state's districts -- what the Add Document and Edit forms use. Unnarrowed
     returns all of them, for the column filter dropdown."""
     rows = _by_parent(db, request, "district")
@@ -1324,7 +1521,7 @@ def list_districts(request: Request, db=Depends(get_db)):
 
 @router.get("/kvks", response_model=list[KvkOut])
 def list_kvks(request: Request, db=Depends(get_db)):
-    """KVKs, synced from LGD. `?district_id=` / `?district=` narrows to that
+    """KVKs, synced from LGD. `?district_id=` narrows to that
     district's KVKs -- what the forms use. Unnarrowed returns all of them, for
     the column filter dropdown."""
     rows = _by_parent(db, request, "kvk")
@@ -1392,7 +1589,7 @@ def list_folders(request: Request, db=Depends(get_db)):
         Non-Crop Advisory              organisations
         General, blank or other        both
 
-    `?advisory_type=` picks the rule; `?state=` / `?state_id=` narrows to
+    `?advisory_type=` picks the rule; `?state_id=` narrows to
     folders actually used under that state, as for /crops.
     """
     out: list[FolderOut] = []
@@ -1401,163 +1598,26 @@ def list_folders(request: Request, db=Depends(get_db)):
         if query is None:
             return []
         counts = vocabulary.usage_counts(db, kind)
-        spellings = vocabulary.crop_spellings(db) if kind == "crop" else None
         for row in vocabulary.entries(db, kind, query):
-            e = _entry_out(CropOut if kind == "crop" else OrganizationOut, row, counts, spellings)
+            e = _entry_out(CropOut if kind == "crop" else OrganizationOut, row, counts)
             out.append(FolderOut(kind=kind, **e.model_dump()))
     return sorted(out, key=lambda f: (f.name.lower(), f.kind))
 
 
-def _create_entry(db, kind: str, body: dict, model):
-    if not vocabulary.KINDS[kind][3]:
-        # resolve() will not invent an entry for a synced kind, so say why
-        # rather than failing on the None it returns.
-        raise HTTPException(403, vocabulary.read_only_reason(kind))
-    raw = (body or {}).get("name")
-    if not raw or not str(raw).strip():
-        raise HTTPException(400, "name is required")
-    entry = vocabulary.resolve(db, kind, raw)
-    return _entry_out(model, entry, vocabulary.usage_counts(db, kind))
-
-
-def _rename_entry(db, kind: str, entry_id: str, body: VocabularyRename, model):
-    entry = _vocabulary_call(vocabulary.rename, db, kind, entry_id, body.name)
-    return _entry_out(model, entry, vocabulary.usage_counts(db, kind))
-
-
-def _merge_entries(db, kind: str, entry_id: str, body: VocabularyMerge) -> VocabularyMergeResult:
-    result = _vocabulary_call(vocabulary.merge, db, kind, entry_id, body.absorb)
-    return VocabularyMergeResult(
-        id=str(result["survivor"]["_id"]), name=result["survivor"]["name"],
-        absorbed=result["absorbed"], placements_repointed=result["placements_repointed"])
-
-
-@router.post("/states", response_model=StateOut, status_code=201)
-def create_state(body: dict, db=Depends(get_db)):
-    """Add a state to the dropdown before anything uses it. Idempotent -- posting
-    an existing name (in any letter case, or a known alternative spelling)
-    returns that entry rather than erroring, because the caller's intent ("make
-    sure this exists") is already satisfied."""
-    return _create_entry(db, "state", body, StateOut)
-
-
-@router.patch("/states/{state_id}", response_model=StateOut)
-def rename_state(state_id: str, body: VocabularyRename, db=Depends(get_db)):
-    """Rename a state. Every placement shows the new name at once. The old name
-    is kept as an alternative spelling. 409 if another state already has the
-    name -- merge into that one instead."""
-    return _rename_entry(db, "state", state_id, body, StateOut)
-
-
-@router.post("/states/{state_id}/merge", response_model=VocabularyMergeResult)
-def merge_states(state_id: str, body: VocabularyMerge, db=Depends(get_db)):
-    """Fold the `absorb` states into this one: their placements move here, their
-    names become alternative spellings of this one, and they are deleted."""
-    return _merge_entries(db, "state", state_id, body)
-
-
-@router.delete("/states/{state_id}", status_code=204)
-def delete_state(state_id: str, db=Depends(get_db)):
-    """Delete a state nothing uses. 409 while any placement or pending upload
-    still references it."""
-    _vocabulary_call(vocabulary.delete, db, "state", state_id)
-
-
-@router.post("/organizations", response_model=OrganizationOut, status_code=201)
-def create_organization(body: dict, db=Depends(get_db)):
-    """Add an organisation or grouping. Idempotent, like POST /states."""
-    return _create_entry(db, "organization", body, OrganizationOut)
-
-
-@router.patch("/organizations/{organization_id}", response_model=OrganizationOut)
-def rename_organization(organization_id: str, body: VocabularyRename, db=Depends(get_db)):
-    """Rename, stored exactly as sent. 409 if another organisation already has
-    the name -- merge into that one instead."""
-    return _rename_entry(db, "organization", organization_id, body, OrganizationOut)
-
-
-@router.post("/organizations/{organization_id}/merge", response_model=VocabularyMergeResult)
-def merge_organizations(organization_id: str, body: VocabularyMerge, db=Depends(get_db)):
-    """Fold the `absorb` organisations into this one."""
-    return _merge_entries(db, "organization", organization_id, body)
-
-
-@router.delete("/organizations/{organization_id}", status_code=204)
-def delete_organization(organization_id: str, db=Depends(get_db)):
-    """Delete an organisation nothing uses. 409 while anything references it."""
-    _vocabulary_call(vocabulary.delete, db, "organization", organization_id)
-
-
-@router.post("/districts", response_model=DistrictOut, status_code=201)
-def create_district(body: dict, db=Depends(get_db)):
-    """Add a district. Idempotent, like POST /states."""
-    return _create_entry(db, "district", body, DistrictOut)
-
-
-@router.patch("/districts/{district_id}", response_model=DistrictOut)
-def rename_district(district_id: str, body: VocabularyRename, db=Depends(get_db)):
-    """Rename a district. Every placement shows the new name at once. 409 if
-    another district already has the name -- merge into that one instead."""
-    return _rename_entry(db, "district", district_id, body, DistrictOut)
-
-
-@router.post("/districts/{district_id}/merge", response_model=VocabularyMergeResult)
-def merge_districts(district_id: str, body: VocabularyMerge, db=Depends(get_db)):
-    """Fold the `absorb` districts into this one -- the fix for "Mysore" and
-    "Mysuru" having become two entries."""
-    return _merge_entries(db, "district", district_id, body)
-
-
-@router.delete("/districts/{district_id}", status_code=204)
-def delete_district(district_id: str, db=Depends(get_db)):
-    """Delete a district nothing uses. 409 while anything references it."""
-    _vocabulary_call(vocabulary.delete, db, "district", district_id)
-
-
-@router.post("/kvks", response_model=KvkOut, status_code=201)
-def create_kvk(body: dict, db=Depends(get_db)):
-    """Add a KVK. Idempotent, like POST /states."""
-    return _create_entry(db, "kvk", body, KvkOut)
-
-
-@router.patch("/kvks/{kvk_id}", response_model=KvkOut)
-def rename_kvk(kvk_id: str, body: VocabularyRename, db=Depends(get_db)):
-    """Rename a KVK. 409 if another already has the name -- merge instead."""
-    return _rename_entry(db, "kvk", kvk_id, body, KvkOut)
-
-
-@router.post("/kvks/{kvk_id}/merge", response_model=VocabularyMergeResult)
-def merge_kvks(kvk_id: str, body: VocabularyMerge, db=Depends(get_db)):
-    """Fold the `absorb` KVKs into this one."""
-    return _merge_entries(db, "kvk", kvk_id, body)
-
-
-@router.delete("/kvks/{kvk_id}", status_code=204)
-def delete_kvk(kvk_id: str, db=Depends(get_db)):
-    """Delete a KVK nothing uses. 409 while anything references it."""
-    _vocabulary_call(vocabulary.delete, db, "kvk", kvk_id)
-
-
-# Crops are read-only here: the crop master is edited from another application.
-# The write routes stay so a caller gets a clear 403 instead of a bare 405.
-@router.post("/crops", status_code=201)
-def create_crop(body: dict | None = None):
-    raise HTTPException(403, vocabulary.READ_ONLY_CROPS)
-
-
-@router.patch("/crops/{crop_id}")
-def rename_crop(crop_id: str, body: dict | None = None):
-    raise HTTPException(403, vocabulary.READ_ONLY_CROPS)
-
-
-@router.post("/crops/{crop_id}/merge")
-def merge_crops(crop_id: str, body: dict | None = None):
-    raise HTTPException(403, vocabulary.READ_ONLY_CROPS)
-
-
-@router.delete("/crops/{crop_id}")
-def delete_crop(crop_id: str):
-    raise HTTPException(403, vocabulary.READ_ONLY_CROPS)
+# NO VOCABULARY WRITE ROUTES. There used to be twenty -- create, rename, merge
+# and delete for states, organisations, districts, KVKs and crops -- and every
+# one of them is gone rather than left to answer 403.
+#
+# Every vocabulary comes from somewhere else: states, districts and KVKs from
+# the LGD tables in `agriai` (scripts/sync_lgd.py), crops from the crop master,
+# organisations from the WorkDrive crawl. An edit here would be undone by the
+# next sync, and a create turned every typo into a new folder. A request names
+# an entry by ID and nothing else, so there is no name for a form to invent.
+#
+# The mechanism survives in vocabulary.rename()/merge()/delete() for a future
+# admin tool; it refuses every kind while the fourth column of KINDS is False,
+# which is the seam to reopen if folder standardisation needs organisation
+# merges back.
 
 
 @router.get("/languages", response_model=list[LanguageOut])

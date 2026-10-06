@@ -65,64 +65,129 @@ TESSDATA_BEST = frozenset({
 })
 
 
-# The tessdata model to use for a document in each state, keyed by the state's
-# ORIGINAL folder name -- "State Karnataka", not "Karnataka". That coupling is
-# load-bearing: normalising the name breaks the lookup, and with it every
-# non-English OCR pass.
+# The tessdata model to TRY for a document filed under each state, keyed by the
+# state's LGD CODE.
 #
-# DUPLICATED from scripts/hash_and_embed_report_true.py, deliberately. That
-# script is the original and still authoritative, but importing it pulls in
-# fitz, pytesseract and tesserocr at module scope, and pop_server.py imports
-# this module chain at startup. The two must stay in step; there are only 33
-# entries and the set of Indian states does not change often.
+# Keyed by code and not by name, which is the whole point. This table used to be
+# keyed by the ORIGINAL WorkDrive folder name ("State Karnataka", "Central
+# Advisories"), which made every non-English OCR pass depend on a spelling: the
+# LGD sync renamed Kerala to Keralam and Tamilnadu to Tamil Nadu, and a lookup by
+# name would have silently started returning None for 2,380 placements. An LGD
+# code never changes, so a rename cannot reach this table at all.
+#
+# 33 of the 37 states have an entry. Chandigarh, Ladakh, Lakshadweep and Dadra
+# and Nagar Haveli are absent on purpose -- the corpus has no documents under
+# them, and guessing a model for a state nobody has filed anything under would
+# be the exact mistake this table exists to avoid.
+#
+# Still DUPLICATED from scripts/hash_and_embed_report_true.py, deliberately:
+# that script is the original, but importing it pulls in fitz, pytesseract and
+# tesserocr at module scope, and pop_server.py imports this chain at startup.
+# The script still keys on folder names, which is correct THERE -- it reads
+# report_true.csv, whose state column IS the folder name.
 STATE_LANG = {
-    "Central Advisories": "hin",
-    "State  Jammu and Kashmir": "urd",  # note the double space, as in the source data
-    "State Andaman and Nicobar": "hin",
-    "State Andhra Pradesh": "tel",
-    "State Arunachal Pradesh": "eng",
-    "State Assam": "asm",
-    "State Bihar": "hin",
-    "State Chattisgarh": "hin",
-    "State Delhi": "hin",
-    "State Goa": "mar",
-    "State Gujarat": "guj",
-    "State Haryana": "hin",
-    "State Himachal Pradesh": "hin",
-    "State Jharkhand": "hin",
-    "State Karnataka": "kan",
-    "State Kerala": "mal",
-    "State Madhya Pradesh": "hin",
-    "State Maharashtra": "mar",
-    "State Manipur": "eng",
-    "State Meghalaya": "eng",
-    "State Mizoram": "eng",
-    "State Nagaland": "eng",
-    "State Odisha": "ori",
-    "State Puducherry": "tam",
-    "State Punjab": "pan",
-    "State Rajasthan": "hin",
-    "State Sikkim": "nep",
-    "State Tamilnadu": "tam",
-    "State Telangana": "tel",
-    "State Tripura": "ben",
-    "State Uttar Pradesh": "hin",
-    "State Uttarakhand": "hin",
-    "State West Bengal": "ben",
+    1: "urd",   # Jammu And Kashmir
+    2: "hin",   # Himachal Pradesh
+    3: "pan",   # Punjab
+    5: "hin",   # Uttarakhand
+    6: "hin",   # Haryana
+    7: "hin",   # Delhi
+    8: "hin",   # Rajasthan
+    9: "hin",   # Uttar Pradesh
+    10: "hin",  # Bihar
+    11: "nep",  # Sikkim
+    12: "eng",  # Arunachal Pradesh
+    13: "eng",  # Nagaland
+    14: "eng",  # Manipur
+    15: "eng",  # Mizoram
+    16: "ben",  # Tripura
+    17: "eng",  # Meghalaya
+    18: "asm",  # Assam
+    19: "ben",  # West Bengal
+    20: "hin",  # Jharkhand
+    21: "ori",  # Odisha
+    22: "hin",  # Chhattisgarh
+    23: "hin",  # Madhya Pradesh
+    24: "guj",  # Gujarat
+    27: "mar",  # Maharashtra
+    28: "tel",  # Andhra Pradesh
+    29: "kan",  # Karnataka
+    30: "mar",  # Goa
+    32: "mal",  # Keralam
+    33: "tam",  # Tamil Nadu
+    34: "tam",  # Puducherry
+    35: "hin",  # Andaman And Nicobar Islands
+    36: "tel",  # Telangana
+    39: "hin",  # Central
+}
+
+# Folder name -> LGD code, for the CORPUS LOADER ONLY.
+#
+# dashboard/migrate_from_corpus.py reads the WorkDrive crawl, whose only name for
+# a state is the folder name it found. It has no state_id to work from, so it
+# needs this one translation to reach STATE_LANG. Nothing the server serves uses
+# it: a request carries a state_id, which carries a code.
+#
+# Spellings are the crawl's, including the double space in Jammu and Kashmir.
+CORPUS_FOLDER_CODE = {
+    "Central Advisories": 39,
+    "State  Jammu and Kashmir": 1,
+    "State Andaman and Nicobar": 35,
+    "State Andhra Pradesh": 28,
+    "State Arunachal Pradesh": 12,
+    "State Assam": 18,
+    "State Bihar": 10,
+    "State Chattisgarh": 22,
+    "State Delhi": 7,
+    "State Goa": 30,
+    "State Gujarat": 24,
+    "State Haryana": 6,
+    "State Himachal Pradesh": 2,
+    "State Jharkhand": 20,
+    "State Karnataka": 29,
+    "State Kerala": 32,
+    "State Madhya Pradesh": 23,
+    "State Maharashtra": 27,
+    "State Manipur": 14,
+    "State Meghalaya": 17,
+    "State Mizoram": 15,
+    "State Nagaland": 13,
+    "State Odisha": 21,
+    "State Puducherry": 34,
+    "State Punjab": 3,
+    "State Rajasthan": 8,
+    "State Sikkim": 11,
+    "State Tamilnadu": 33,
+    "State Telangana": 36,
+    "State Tripura": 16,
+    "State Uttar Pradesh": 9,
+    "State Uttarakhand": 5,
+    "State West Bengal": 19,
 }
 
 
-def language_for_state(state_raw: str | None) -> str | None:
-    """The tessdata code for a state, by its ORIGINAL folder name. None for a
-    state that is not in the table -- an unmapped state is unknown, and
-    guessing 'eng' for it would be the exact mistake this table exists to
-    avoid."""
-    if not state_raw:
+def code_for_corpus_folder(folder: str | None) -> int | None:
+    """The LGD code a crawled folder name means. For the corpus loader only."""
+    return CORPUS_FOLDER_CODE.get((folder or "").strip()) if folder else None
+
+
+def language_for_state(state_code) -> str | None:
+    """The tessdata code for a state, by its LGD CODE. None for a state the
+    table has no entry for -- an unmapped state is unknown, and guessing 'eng'
+    for it would be the exact mistake this table exists to avoid.
+
+    Takes the code, never the name: see STATE_LANG. A None code (a placement
+    whose state was never resolved) is unknown too.
+    """
+    if state_code is None:
         return None
-    return STATE_LANG.get(state_raw.strip())
+    try:
+        return STATE_LANG.get(int(state_code))
+    except (TypeError, ValueError):
+        return None
 
 
-def resolve_language(detected: str | None, state_raws) -> tuple[str | None, str]:
+def resolve_language(detected: str | None, state_codes) -> tuple[str | None, str]:
     """(language code, source) for a document.
 
     The rule, per the user and matching what the corpus OCR pass did: a document
@@ -130,8 +195,10 @@ def resolve_language(detected: str | None, state_raws) -> tuple[str | None, str]
     error, or never examined at all -- takes the language of the state it is
     filed under.
 
-    `state_raws` is every state the document is placed in, because a document is
-    shared across placements while a state is not. Almost always one state; six
+    `state_codes` is the LGD code of every state the document is placed in,
+    because a document is shared across placements while a state is not. Codes
+    and not names: a state can be renamed, and this inference must not move with
+    the spelling. Almost always one state; six
     documents in the corpus span more than one. When they disagree, the most
     common wins, and on a tie the FIRST placement's state decides -- the state it
     was originally filed under. Every document gets a language either way,
@@ -153,7 +220,7 @@ def resolve_language(detected: str | None, state_raws) -> tuple[str | None, str]
 
     from collections import Counter
 
-    codes = [c for c in (language_for_state(s) for s in state_raws) if c]
+    codes = [c for c in (language_for_state(s) for s in state_codes) if c]
     if not codes:
         return None, "state"
     ranked = Counter(codes).most_common()

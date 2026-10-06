@@ -66,14 +66,22 @@ class LanguageOut(BaseModel):
 
 
 class StateOut(BaseModel):
+    """A state, synced from LGD. Read-only, and addressed by `id` -- which is
+    the only thing any request ever sends about a state.
+
+    NO `raw_names`. Every vocabulary entry used to carry its older spellings,
+    because a form could type one and the backend would resolve it. Nothing
+    resolves a name now, so serving them only invited a caller to match on one;
+    they are still stored as provenance for the folder names the crawl found.
+    """
+
     id: str  # ObjectId hex -- what a placement's state_id holds
-    name: str
-    # Every other spelling that means this entry: source folder names ("State
-    # Karnataka") and names merged or renamed away. A form typing any of them
-    # resolves here instead of creating a new entry.
-    raw_names: list[str] = []
+    name: str  # for DISPLAY: the dropdown label and the table cell
     # Placements using it, computed on read.
     document_count: int = 0
+    # The LGD state code. This is what languages.STATE_LANG is keyed by, so a
+    # state without one has no OCR language.
+    code: int | None = None
 
 
 class CropOut(BaseModel):
@@ -81,29 +89,28 @@ class CropOut(BaseModel):
 
     id: str  # the master's ObjectId -- what a placement's crop_id holds
     name: str
-    # Our older spellings that resolve to this crop ("Ground Nut"). Not the
-    # master's own `aliases`, which are regional names.
-    raw_names: list[str] = []
     document_count: int = 0
 
 
 class OrganizationOut(BaseModel):
     """A folder that is not a crop: an organisation, department or grouping
-    ("ICAR - ...", "General"). Ours, so it can be renamed, merged and deleted."""
+    ("ICAR - ...", "General").
+
+    A WorkDrive FOLDER name. Read-only like every other vocabulary -- created
+    only by the corpus loader, which is where folder names come from.
+    """
 
     id: str
     name: str
-    raw_names: list[str] = []
     document_count: int = 0
 
 
 class DistrictOut(BaseModel):
-    """A district, synced from LGD. Read-only here: rename/merge/delete answer
-    403, because the next sync would undo them."""
+    """A district, synced from LGD. Read-only: there is no write route, because
+    the next sync would undo it."""
 
     id: str
     name: str
-    raw_names: list[str] = []
     document_count: int = 0
     # The LGD district code -- null on the "All" entry, which is ours.
     code: int | None = None
@@ -119,7 +126,6 @@ class KvkOut(BaseModel):
 
     id: str
     name: str
-    raw_names: list[str] = []
     document_count: int = 0
     # LGD's own id ("K0001"), a string unlike the numeric state/district codes.
     code: str | None = None
@@ -165,12 +171,7 @@ class FolderOut(BaseModel):
     id: str
     name: str
     kind: str  # "crop" | "organization" -- send the id as crop_id / organization_id accordingly
-    raw_names: list[str] = []
     document_count: int = 0
-
-
-class VocabularyCreate(BaseModel):
-    name: str
 
 
 class VocabularyRename(BaseModel):
@@ -184,6 +185,20 @@ class VocabularyMerge(BaseModel):
     """Fold these entries (ObjectId hex) into the one being POSTed to."""
 
     absorb: list[str]
+
+
+class PlacementCreate(BaseModel):
+    """POST body for filing an existing document under one more state + folder.
+
+    Ids only, and exactly one folder: `crop_id` (a crop master entry) or
+    `organization_id`. No names, because every vocabulary is read-only and a
+    name would only be looked up anyway; no district or kvk, because those are
+    the DOCUMENT's fields -- a new placement inherits whatever it already says.
+    """
+
+    state_id: str
+    crop_id: str | None = None
+    organization_id: str | None = None
 
 
 class VocabularyMergeResult(BaseModel):
@@ -229,12 +244,13 @@ class CopyLink(BaseModel):
     shareable_name: str | None = None
     # Where the placement named by row_id files this copy, read from that
     # placement -- none of it is stored on the copy. The documents listing has
-    # no state or folder of its own, so it reads the ANCHOR copy's (the entry
-    # whose row_id is the document's representative_row_id).
+    # no state or folder of its own, so it reads the entry whose `zoho_file_id`
+    # is the document's `representative_file_id`: the copy the document IS.
+    #
+    # No district or kvk. Those are the DOCUMENT's fields, so they are the same
+    # for every copy and the document already carries them.
     state: str | None = None
     crop: str | None = None
-    district: str | None = None
-    kvk: str | None = None
     row_id: int | None = None
 
 
@@ -287,8 +303,16 @@ class UniqueDocumentOut(DocumentMetadata):
     # THE ANCHOR: which entry of duplicate_links is this document, as opposed to
     # another copy of it. Translation acts on this file and no other. Stable
     # across merges; a person can move it with PATCH if the file is a bad scan.
+    # ONE anchor field, not two. `representative_row_id` named the anchor
+    # PLACEMENT as well; it was derivable from the copy entry carrying this file
+    # id, so it was a stored copy of a fact and drifted.
     representative_file_id: str | None = None
-    representative_row_id: int | None = None
+    # Where the document applies: one district and one KVK per document, shown
+    # on every placement of it. Stored on a placement until the anchor went.
+    district: str | None = None
+    kvk: str | None = None
+    district_id: str | None = None
+    kvk_id: str | None = None
     duplicate_links: list[CopyLink] = []
     merged_from: list[str] = []  # ANNAM ids absorbed by a team-approved merge
     created_at: UTCDatetime
@@ -297,7 +321,8 @@ class UniqueDocumentOut(DocumentMetadata):
 
 class UniqueDocumentUpdate(DocumentMetadata):
     """PATCH body for a document. Everything here is shared by every placement
-    of it -- that is the point of the split -- EXCEPT district and kvk."""
+    of it -- that is the point of the split, and district and kvk are no longer
+    an exception to it."""
 
     shareable_name: str | None = None
     language: str | None = None
@@ -307,12 +332,9 @@ class UniqueDocumentUpdate(DocumentMetadata):
     # chosen file turns out to be a bad scan. Validated to be a file this
     # document actually owns.
     representative_file_id: str | None = None
-    # The exceptions: district and kvk are PLACEMENT fields, so these are
-    # written to the document's ANCHOR placement rather than to the document --
-    # a document filed in two states cannot have one district. By name (created
-    # if new) or by id; "" clears. Everything else here changes every placement.
-    district: str | None = None
-    kvk: str | None = None
+    # Where the document applies. The document's own fields: a Package of
+    # Practices is written for a place, and filing it in a second folder does
+    # not put it in a second district. By id; "" clears.
     district_id: str | None = None
     kvk_id: str | None = None
 
@@ -338,10 +360,10 @@ class DocumentOut(BaseModel):
     state_id: str | None = None
     crop_id: str | None = None
     organization_id: str | None = None
-    # Where the document applies and which KVK it came from. Both are on the
-    # PLACEMENT, like state and crop: the same document filed in two places can
-    # name a different district in each. Empty on every migrated row -- the
-    # WorkDrive tree has no district or KVK level to read them from.
+    # Where the document applies and which KVK it came from. On the DOCUMENT,
+    # unlike state and crop, so every placement of one document shows the same
+    # pair. Empty on every migrated row -- the WorkDrive tree has no district
+    # or KVK level to read them from.
     district: str | None = None
     kvk: str | None = None
     district_id: str | None = None
@@ -390,28 +412,23 @@ class DocumentOut(BaseModel):
 class DocumentUpdate(DocumentMetadata):
     """PATCH body for a main-table row.
 
-    The placement moves with `state`/`state_id`, and with ONE of `crop` /
-    `crop_id` (a crop master entry) or `organization` / `organization_id`. A
-    crop must exist in the master; a new state or organisation name is created.
-    `crop` as a name also accepts an existing organisation's name. Every other
-    field belongs to the document and is written there, so it changes for all of
-    its placements -- the endpoint routes them rather than making the caller
-    know which is which.
+    The placement moves with `state_id`, and with ONE of `crop_id` (a crop
+    master entry) or `organization_id`. Every other field belongs to the
+    document and is written there, so it changes for all of its placements --
+    the endpoint routes them rather than making the caller know which is which.
+
+    IDS ONLY. `state`, `crop`, `organization`, `district` and `kvk` as NAMES are
+    gone. Each form field is a selection from a list this API serves, so the
+    caller already holds the id; taking a name as well meant the same edit had
+    two spellings and the backend had to guess which entry was meant.
     """
 
-    state: str | None = None
-    crop: str | None = None
-    organization: str | None = None
     state_id: str | None = None
     crop_id: str | None = None
     organization_id: str | None = None
-    # By name (created if new, like a state) or by id. "" clears the field --
-    # the one way to say "this row has no district after all", which a null
-    # cannot say because an unset field and a cleared one must look the same.
-    district: str | None = None
-    kvk: str | None = None
-    district_id: str | None = None
-    kvk_id: str | None = None
+    # No district_id / kvk_id. A placement is one folder a document is filed
+    # in, and the district is a fact about the document -- PATCH
+    # /unique-documents/{id} sets it, for every placement at once.
     shareable_name: str | None = None
     language: str | None = None
     num_pages: int | None = None
@@ -472,13 +489,10 @@ class Placement(BaseModel):
     state_id: str | None = None
     crop_id: str | None = None
     organization_id: str | None = None
-    # Optional, and absent from every upload until the form offers them: where
-    # the documents apply and which KVK they came from. Resolved to ids (and
-    # created if new) only when the person approves the upload.
-    district: str | None = None
-    kvk: str | None = None
-    district_id: str | None = None
-    kvk_id: str | None = None
+    # No district or kvk. They are the DOCUMENT's fields, so they arrive as
+    # form fields of the upload and are carried in its `metadata`, not once per
+    # (state, folder) group. Reporting them here always answered null, which
+    # reads as "this placement has none" rather than "not a placement field".
 
 
 class UploadCandidate(BaseModel):

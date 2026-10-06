@@ -122,11 +122,11 @@ _INDEXES: dict[str, list[dict]] = {
         # delete checks before refusing.
         {"keys": [("state_id", ASCENDING), ("crop_id", ASCENDING)], "name": "state_id_crop_id"},
         {"keys": [("crop_id", ASCENDING)], "name": "crop_id"},
-        # The two optional placement references. Sparse: nothing in the corpus
-        # has either, so indexing the ~9,800 rows that do not would be an index
-        # of nulls. A filter on one is a filter for the rows that have it.
-        {"keys": [("district_id", ASCENDING)], "name": "district_id", "sparse": True},
-        {"keys": [("kvk_id", ASCENDING)], "name": "kvk_id", "sparse": True},
+        # No district_id / kvk_id here. They were placement references and are
+        # the DOCUMENT's fields now, so their indexes moved with them -- see
+        # COLL_UNIQUE_DOCUMENTS below. The two old sparse indexes on this
+        # collection are empty (no placement ever carried either value) and can
+        # be dropped by hand; init_db only creates.
         # The other kind of folder: an organisation or grouping instead of a crop.
         {"keys": [("state_id", ASCENDING), ("organization_id", ASCENDING)],
          "name": "state_id_organization_id"},
@@ -151,6 +151,11 @@ _INDEXES: dict[str, list[dict]] = {
         # Finding the document behind a given physical copy -- used by the
         # upload path and by anything starting from a WorkDrive file id.
         {"keys": [("duplicate_links.zoho_file_id", ASCENDING)], "name": "copy_file_id"},
+        # Where the document applies. Sparse: nothing in the corpus has either,
+        # so indexing the ~8,750 documents that do not would be an index of
+        # nulls. A filter on one is a filter for the documents that have it.
+        {"keys": [("district_id", ASCENDING)], "name": "district_id", "sparse": True},
+        {"keys": [("kvk_id", ASCENDING)], "name": "kvk_id", "sparse": True},
         {"keys": [("created_at", DESCENDING), ("_id", ASCENDING)], "name": "created_at_id"},
     ],
     # -- controlled vocabularies, referenced by id from every placement --------

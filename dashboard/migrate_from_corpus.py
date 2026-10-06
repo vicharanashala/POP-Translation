@@ -337,7 +337,7 @@ def build_collections(rows: list[dict]) -> tuple[dict, list[dict]]:
     cannot be proven identical to anything, so it must not be silently pooled
     with other unhashed files.
     """
-    from dashboard.languages import resolve_language
+    from dashboard.languages import code_for_corpus_folder, resolve_language
 
     groups: dict[str, list[dict]] = {}
     for r in rows:
@@ -356,7 +356,11 @@ def build_collections(rows: list[dict]) -> tuple[dict, list[dict]]:
         # state's language. Same rule as scripts/fill_language_from_state.py,
         # applied at load so a rebuild and an in-place fill agree.
         verdict, _note = _language_code(fields.pop("language", None))
-        code, source = resolve_language(verdict, [m["state"] for m in members])
+        # The crawl's only name for a state is the folder name, so it is
+        # translated to the LGD code STATE_LANG is keyed by. The server never
+        # needs this: a request carries a state_id, which carries the code.
+        code, source = resolve_language(
+            verdict, [code_for_corpus_folder(m["state"]) for m in members])
         fields["language"] = code
         fields["language_source"] = source
         # A representative name and link for the document; each copy keeps its
@@ -518,25 +522,77 @@ def main() -> None:
             print(f"[migrate] [{i}/{len(docs)}] unique documents inserted...")
 
     # -- placements -----------------------------------------------------------
-    # Folder names -> vocabulary ids. Resolved through the vocabulary, so a
-    # reload lands on entries the team has already renamed or merged (their old
-    # spellings are in raw_names) instead of re-creating the old names.
+    # Folder names -> vocabulary ids, matched HERE and nowhere else.
+    #
+    # dashboard/vocabulary.py has no name lookup at all: the server addresses a
+    # vocabulary by id, because every form is a selection from a list it serves.
+    # The crawl is the one caller that cannot work that way -- a WorkDrive folder
+    # name is the only thing it knows about a state or a crop -- so the matching
+    # lives in the loader that needs it, where it cannot be reached by a request.
+    from pymongo.errors import DuplicateKeyError
+
     from dashboard import vocabulary
+    from dashboard.db import CI_COLLATION
+    from dashboard.models import (
+        COLL_ORGANIZATIONS,
+        normalize_crop_name,
+        normalize_state_name,
+        utcnow,
+    )
 
     state_ids: dict[str, object] = {}
     folders: dict[str, dict] = {}
 
+    def _by_name(kind: str, raw: str) -> dict | None:
+        """The entry a crawled folder name means. Case-insensitive, also
+        matching `raw_names` and the name with its "State " prefix stripped --
+        the three things the folder spellings actually differ by."""
+        name = " ".join(str(raw or "").split())
+        if not name:
+            return vocabulary.coll(db, kind).find_one({"name": ""}) if kind == "organization" else None
+        c = vocabulary.coll(db, kind)
+        candidates = [name]
+        normalised = normalize_state_name(name) if kind == "state" else normalize_crop_name(name)
+        if normalised and normalised != name:
+            candidates.append(normalised)
+        for candidate in candidates:
+            for query in ({"name": candidate}, {"raw_names": candidate}):
+                entry = c.find_one({**query, **({} if kind != "crop" else {"type": {"$ne": "chemical"}})},
+                                   collation=CI_COLLATION)
+                if entry is not None:
+                    return entry
+        return None
+
     def state_id(raw: str):
         if raw not in state_ids:
-            entry = vocabulary.resolve(db, "state", raw)
+            entry = _by_name("state", raw)
+            if entry is None:
+                # States come from the LGD sync; the crawl must not invent one.
+                print(f"[migrate] WARNING: no state matches folder {raw!r}")
             state_ids[raw] = entry["_id"] if entry else None
         return state_ids[raw]
 
     def folder(raw: str) -> dict:
-        """{crop_id: ...} for a crop master crop, else {organization_id: ...}
-        -- a folder the master does not know becomes an organisation."""
+        """{crop_id: ...} for a crop master crop, else {organization_id: ...}.
+
+        A folder the master does not know becomes an ORGANISATION, created here
+        if it is new -- this is the only place an organisation is ever created,
+        because a WorkDrive folder name has nowhere else to come from.
+        """
         if raw not in folders:
-            kind, entry = vocabulary.folder(db, raw) or ("organization", {"_id": None})
+            entry = _by_name("crop", raw)
+            kind = "crop"
+            if entry is None:
+                kind, entry = "organization", _by_name("organization", raw)
+            if entry is None:
+                name = normalize_crop_name(" ".join(str(raw or "").split()))
+                now = utcnow()
+                try:
+                    db[COLL_ORGANIZATIONS].insert_one(
+                        {"name": name, "raw_names": [raw], "created_at": now, "updated_at": now})
+                except DuplicateKeyError:
+                    pass  # a concurrent writer got there first; take theirs
+                entry = _by_name("organization", name) or {"_id": None}
             folders[raw] = {vocabulary.field(kind): entry["_id"]}
         return folders[raw]
 
@@ -590,7 +646,6 @@ def main() -> None:
         anchor = anchor or (agg["links"][0] if agg["links"] else None)
         if anchor:
             update["representative_file_id"] = anchor.get("zoho_file_id")
-            update["representative_row_id"] = anchor.get("row_id")
             # The document's link is the anchor's link, always. They move
             # together or the document points at a file it does not describe.
             update["shareable_link"] = anchor.get("shareable_link")

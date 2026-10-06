@@ -24,7 +24,14 @@ its Zoho file id, link, name and the placement it belongs to. Nothing is lost;
 the main table simply does not surface them.
 
   main_row_ids     every `documents` row that points at this document
-  duplicate_links  every physical copy behind those rows
+  duplicate_links  every physical copy behind those rows, each naming the
+                   placement it sits under
+
+`representative_file_id` names which of those copies IS the document -- what
+translation and the Original download act on. There is no second field naming
+the anchor PLACEMENT: the copy entry carrying that file id already names its
+row, so the anchor row is READ from duplicate_links, never stored. Stored, it
+had five writers to keep in step and drifted into naming a deleted placement.
 
 Both are maintained together by `link_placement()` / `unlink_placement()` below,
 so the load, the upload and the merge cannot drift apart.
@@ -246,8 +253,7 @@ MANUAL_METADATA_FIELDS = (
 
 
 def new_document(*, row_id: int, unique_document_id, state_id, state_raw: str,
-                 crop_raw: str, crop_id=None, organization_id=None,
-                 district_id=None, kvk_id=None, **fields) -> dict:
+                 crop_raw: str, crop_id=None, organization_id=None, **fields) -> dict:
     """One row of the main table: this document, filed under this state and crop.
 
     An ASSOCIATION and nothing more. No sha256, no link, no metadata -- those
@@ -260,10 +266,13 @@ def new_document(*, row_id: int, unique_document_id, state_id, state_raw: str,
     OCR language lookup keys off the raw state name and because a folder has to
     stay findable by the name it actually has in WorkDrive.
 
-    `district_id` and `kvk_id` are optional and OMITTED when not given, rather
-    than stored as null: nothing in WorkDrive's folder tree says which district
-    or KVK a file belongs to, so every migrated placement simply does not have
-    them, and "$exists" is what tells a set one from an unset one.
+    NO DISTRICT AND NO KVK. They were here, briefly, and they were in the wrong
+    place: a district is a fact about the DOCUMENT, not about one of the folders
+    it is filed in, so they live on the unique document. Keeping them here meant
+    a document filed in three folders had three districts to disagree with each
+    other, and a document-level edit had to pick one placement to write to --
+    which is the whole reason the anchor placement existed. Nothing was lost in
+    the move: no placement ever had either value.
     """
     now = utcnow()
     doc = {
@@ -277,8 +286,6 @@ def new_document(*, row_id: int, unique_document_id, state_id, state_raw: str,
         "state_raw": state_raw,
         **({"crop_id": crop_id} if crop_id is not None else {"organization_id": organization_id}),
         "crop_raw": crop_raw,
-        **({"district_id": district_id} if district_id is not None else {}),
-        **({"kvk_id": kvk_id} if kvk_id is not None else {}),
         # Anything nested deeper than <state>/<crop>/<file> in WorkDrive. Empty
         # for the corpus as it stands; recorded rather than flattened so an
         # unexpected extra folder level is visible instead of silently changing
@@ -291,7 +298,8 @@ def new_document(*, row_id: int, unique_document_id, state_id, state_raw: str,
     return doc
 
 
-def new_unique_document(*, display_id: int, sha256: str | None = None, **fields) -> dict:
+def new_unique_document(*, display_id: int, sha256: str | None = None,
+                        district_id=None, kvk_id=None, **fields) -> dict:
     """One distinct document: everything true of the CONTENT.
 
     date_of_release / date_of_collection are deliberately strings, not dates:
@@ -367,8 +375,24 @@ def new_unique_document(*, display_id: int, sha256: str | None = None, **fields)
         # the anchor. A person can re-anchor through
         # PATCH /unique-documents/{id} if the chosen file turns out to be a bad
         # scan, and it is validated to be one of this document's own copies.
+        #
+        # ONE FIELD, NOT TWO. There used to be a `representative_row_id` beside
+        # it naming the anchor PLACEMENT as well. It was redundant: the copy
+        # entry carrying this file id already names its placement, so the anchor
+        # row can always be read off `duplicate_links` instead of stored. Being
+        # stored, it had to be maintained by the loader, the upload, the merge,
+        # the re-anchor PATCH and both link functions -- and it drifted, naming
+        # a deleted placement, which made the district edit refuse.
         "representative_file_id": None,
-        "representative_row_id": None,
+        # WHERE THE DOCUMENT APPLIES. One district and one KVK per document,
+        # which is what they always were in practice -- a Package of Practices
+        # is written for a place, and filing it in a second folder does not put
+        # it in a second district. They were stored on the placement until the
+        # anchor went, and OMITTED rather than null when unset, because
+        # WorkDrive's folder tree has no district level to read them from and
+        # "$exists" is what tells an unset one from a cleared one.
+        **({"district_id": district_id} if district_id is not None else {}),
+        **({"kvk_id": kvk_id} if kvk_id is not None else {}),
         # ANNAM ids absorbed into this document by a team-approved merge. An
         # audit trail, so a merge can be explained (and reversed by hand).
         "merged_from": [],
@@ -502,7 +526,8 @@ def new_translation_job(*, document_id, kind: TranslationJobKind) -> dict:
 # writing their own $push -- that is what stops the two lists drifting apart.
 
 
-def link_placement(db, unique_document_id, *, row_obj_id, row_id: int, copy_link: dict) -> None:
+def link_placement(db, unique_document_id, *, row_obj_id, row_id: int,
+                   copy_link: dict | None = None) -> None:
     """Record that a `documents` row uses this unique document.
 
     $addToSet on main_row_ids rather than $push: re-running the corpus load, or
@@ -521,39 +546,32 @@ def link_placement(db, unique_document_id, *, row_obj_id, row_id: int, copy_link
     again. `row_id` on the entry names the placement it was first filed under --
     for the corpus that is its only placement, for an upload it is one of
     several, which is why unlink_placement cannot simply remove it.
+
+    NO COPY LINK is a legitimate case, which is why it is optional. A placement
+    is an ASSOCIATION -- (document, state, folder) -- and filing a document in
+    one more folder adds no file: the bytes are already in WorkDrive and the
+    document already names them in `representative_file_id`. Only a placement
+    that brought a NEW physical copy has an entry to add.
     """
-    copy_link = {**copy_link, "row_id": row_id}
-    file_id = copy_link.get("zoho_file_id")
-    # Re-running the same placement replaces its entry; a placement whose file
-    # is already listed adds nothing.
-    db[COLL_UNIQUE_DOCUMENTS].update_one(
-        {"_id": unique_document_id},
-        {"$pull": {"duplicate_links": {"row_id": row_id}}},
-    )
+    copy_link = {**copy_link, "row_id": row_id} if copy_link is not None else None
+    file_id = copy_link.get("zoho_file_id") if copy_link else None
+    if copy_link is not None:
+        # Re-running the same placement replaces its entry; a placement whose
+        # file is already listed adds nothing. Not done when there is no link to
+        # add: pulling the row's entry would then just lose a file.
+        db[COLL_UNIQUE_DOCUMENTS].update_one(
+            {"_id": unique_document_id},
+            {"$pull": {"duplicate_links": {"row_id": row_id}}},
+        )
     db[COLL_UNIQUE_DOCUMENTS].update_one(
         {"_id": unique_document_id},
         {"$addToSet": {"main_row_ids": row_obj_id}, "$set": {"updated_at": utcnow()}},
     )
-    db[COLL_UNIQUE_DOCUMENTS].update_one(
-        {"_id": unique_document_id, "duplicate_links.zoho_file_id": {"$ne": file_id}},
-        {"$push": {"duplicate_links": copy_link}},
-    )
-    # If this copy IS the document's anchor, record which placement it is. The
-    # file id is known when the document is created but the row id only exists
-    # once the placement is inserted, so it can only be filled in here.
-    #
-    # Only when it is not set yet: where several placements share one file, the
-    # anchor is that single copy, and its row_id must stay the one the copy
-    # entry carries. Overwriting it with each later placement would leave
-    # representative_row_id naming a placement that is not in duplicate_links,
-    # and anything matching the two up would find no anchor at all.
-    db[COLL_UNIQUE_DOCUMENTS].update_one(
-        {"_id": unique_document_id,
-         "representative_file_id": file_id,
-         "$or": [{"representative_row_id": None},
-                 {"representative_row_id": {"$exists": False}}]},
-        {"$set": {"representative_row_id": row_id}},
-    )
+    if copy_link is not None:
+        db[COLL_UNIQUE_DOCUMENTS].update_one(
+            {"_id": unique_document_id, "duplicate_links.zoho_file_id": {"$ne": file_id}},
+            {"$push": {"duplicate_links": copy_link}},
+        )
 
 
 def unlink_placement(db, unique_document_id, *, row_obj_id, row_id: int) -> None:
@@ -569,6 +587,16 @@ def unlink_placement(db, unique_document_id, *, row_obj_id, row_id: int) -> None
     document with no link at all, and with it the download and the anchor. The
     two cases are told apart by counting: fewer distinct files than placements
     means they are shared.
+
+    THE LAST PLACEMENT KEEPS ITS LINK, whichever case it is, and that is not a
+    detail. Removing a document's only placement does not remove its file from
+    WorkDrive -- the association went, the bytes did not -- so dropping the
+    entry left `duplicate_links` empty while the file was still sitting there,
+    reachable in WorkDrive and named by `representative_file_id`. A document in
+    that state could not be translated (`_source_file_id` finds nothing) and
+    could not be filed anywhere again. The stranding this docstring warns about
+    was reachable by the plainest route there is: upload a document, delete the
+    placement.
     """
     doc = db[COLL_UNIQUE_DOCUMENTS].find_one(
         {"_id": unique_document_id}, {"main_row_ids": 1, "duplicate_links": 1}
@@ -576,15 +604,16 @@ def unlink_placement(db, unique_document_id, *, row_obj_id, row_id: int) -> None
     links = doc.get("duplicate_links") or []
     placements = len(doc.get("main_row_ids") or [])
     shared = len({c.get("zoho_file_id") for c in links}) < placements
+    last = placements <= 1
 
     pull: dict = {"main_row_ids": row_obj_id}
-    if not shared:
+    if not shared and not last:
         pull["duplicate_links"] = {"row_id": row_id}
     db[COLL_UNIQUE_DOCUMENTS].update_one(
         {"_id": unique_document_id},
         {"$pull": pull, "$set": {"updated_at": utcnow()}},
     )
-    if not shared:
+    if not shared and not last:
         return
     # The surviving entry still names the placement that just went. Point it at
     # one that is left, so the row_id on a copy is always a real placement.
@@ -595,8 +624,4 @@ def unlink_placement(db, unique_document_id, *, row_obj_id, row_id: int) -> None
     db[COLL_UNIQUE_DOCUMENTS].update_one(
         {"_id": unique_document_id, "duplicate_links.row_id": row_id},
         {"$set": {"duplicate_links.$.row_id": remaining[0]}},
-    )
-    db[COLL_UNIQUE_DOCUMENTS].update_one(
-        {"_id": unique_document_id, "representative_row_id": row_id},
-        {"$set": {"representative_row_id": remaining[0]}},
     )
