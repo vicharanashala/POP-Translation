@@ -32,8 +32,8 @@ What that replaced, and why none of it is coming back:
   kvk           pop_kvks            synced from agriai.kvks
   crop          the crop master     production reads agriai.crop_master, which
                                     another application edits; staging reads its
-                                    copy in pop_crops. Pesticides in the master
-                                    (type: "chemical") are never offered.
+                                    copy in pop_crops. Only type "crop" (or no
+                                    type) is offered -- see _CROP_VISIBLE.
   organization  pop_organizations   WorkDrive FOLDER names, created ONLY by the
                                     corpus loader, which is the one place a
                                     folder name comes from. It does its own name
@@ -107,8 +107,14 @@ ALL = "All"
 # it is what the unique index in db.py keys on, so the collection cannot end up
 # with two of them.
 IS_ALL = "is_all"
-# What a crop dropdown may offer. The master also lists pesticides.
-_CROP_VISIBLE = {"type": {"$ne": "chemical"}}
+# What a crop dropdown may offer. The master is not a crop list: of its 980
+# entries only 472 are type "crop"; the rest are diseases ("Leaf Rust in
+# Wheat"), pests, weeds, practices, chemicals, soils. Hiding only chemicals let
+# all of those through as though they were crop folders. Untyped entries are
+# kept because some are real crops the master never typed -- Okra, Onion,
+# Mango, Rapeseed & Mustard and four more carry 476 placements between them.
+# No placement on either database points at any other type.
+_CROP_VISIBLE = {"type": {"$in": ["crop", None]}}
 
 
 class VocabularyError(ValueError):

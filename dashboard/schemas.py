@@ -301,8 +301,8 @@ class UniqueDocumentOut(DocumentMetadata):
 
     placement_count: int = 0  # how many main-table rows point here
     # THE ANCHOR: which entry of duplicate_links is this document, as opposed to
-    # another copy of it. Translation acts on this file and no other. Stable
-    # across merges; a person can move it with PATCH if the file is a bad scan.
+    # another copy of it. Translation acts on this file and no other. Fixed
+    # when the document is created: not moved by a merge, not editable.
     # ONE anchor field, not two. `representative_row_id` named the anchor
     # PLACEMENT as well; it was derivable from the copy entry carrying this file
     # id, so it was a stored copy of a fact and drifted.
@@ -328,9 +328,9 @@ class UniqueDocumentUpdate(DocumentMetadata):
     language: str | None = None
     num_pages: int | None = None
     format_original: str | None = None
-    # Re-anchor the document onto a different one of its own copies -- e.g. the
-    # chosen file turns out to be a bad scan. Validated to be a file this
-    # document actually owns.
+    # Accepted only so it can be REFUSED (400): the anchor copy is fixed when
+    # the document is created and cannot be moved. Without the field here a
+    # stale client's re-anchor would be silently ignored and answer 200.
     representative_file_id: str | None = None
     # Where the document applies. The document's own fields: a Package of
     # Practices is written for a place, and filing it in a second folder does

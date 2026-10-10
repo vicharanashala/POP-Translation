@@ -510,23 +510,20 @@ def test_translation_uses_the_anchor_not_the_first_copy(db):
     assert _source_file_id({"duplicate_links": []}) is None
 
 
-def test_reanchoring_is_restricted_to_the_documents_own_copies(client, scratch):
+def test_the_anchor_cannot_be_changed(client, scratch):
+    """Re-anchoring is gone. Asking for it -- even onto one of the document's
+    own copies -- is a 400, not a silent 200, and the anchor stays put."""
     doc, _rows = scratch
-    owned = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()["duplicate_links"]
-    other = owned[1]["zoho_file_id"]
-    assert client.patch(f"/dashboard/unique-documents/{doc['_id']}",
-                        json={"representative_file_id": "not-a-file-of-mine"}).status_code == 400
-    out = client.patch(f"/dashboard/unique-documents/{doc['_id']}",
-                       json={"representative_file_id": other}).json()
-    assert out["representative_file_id"] == other
-    # No anchor ROW is recorded. The copy entry carrying the new file already
-    # names its placement, so the anchor row is read from there when it is
-    # wanted -- which is why the stored field went.
-    assert "representative_row_id" not in out
-    moved = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()
-    anchor = next(c for c in moved["duplicate_links"]
-                  if c["zoho_file_id"] == moved["representative_file_id"])
-    assert anchor["row_id"] == owned[1]["row_id"]
+    before = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()
+    other = next(c["zoho_file_id"] for c in before["duplicate_links"]
+                 if c["zoho_file_id"] != before["representative_file_id"])
+    for target in (other, "not-a-file-of-mine"):
+        resp = client.patch(f"/dashboard/unique-documents/{doc['_id']}",
+                            json={"representative_file_id": target})
+        assert resp.status_code == 400, resp.text
+    after = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()
+    assert after["representative_file_id"] == before["representative_file_id"]
+    assert after["shareable_link"] == before["shareable_link"]
 
 
 def test_merge_does_not_move_the_anchor(client, db, scratch):
@@ -635,13 +632,14 @@ def test_language_must_come_from_the_collection(client, scratch):
 
 
 def test_setting_language_by_hand_marks_it_known(client, scratch):
-    """A person's choice is a known language, not a guess, so it joins
-    "detected" -- which is also what makes it survive a re-run of
+    """A person's choice is "manual" -- the value an upload writes for the same
+    choice. It used to come back "detected", as though OCR had read it, which
+    the testing team caught. Both are known, so both survive a re-run of
     scripts/fill_language_from_state.py."""
     doc, rows = scratch
     client.patch(f"/dashboard/documents/{rows[0]['_id']}", json={"language": "tam"})
     out = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()
-    assert out["language"] == "tam" and out["language_source"] == "detected"
+    assert out["language"] == "tam" and out["language_source"] == "manual"
 
 
 def test_language_source_is_a_closed_vocabulary(db):
@@ -661,6 +659,7 @@ def test_the_fill_script_never_overwrites_a_known_language(db):
     from scripts.fill_language_from_state import _OVERWRITABLE
 
     assert "detected" not in _OVERWRITABLE
+    assert "manual" not in _OVERWRITABLE
 
 
 def test_every_document_has_a_language(client):
@@ -896,6 +895,22 @@ def test_the_crop_dropdown_never_offers_pesticides(client, db):
     assert offered and not (offered & chemicals)
 
 
+def test_the_crop_dropdown_offers_only_crops(client, db):
+    """The master also lists diseases ("Leaf Rust in Wheat"), pests, weeds and
+    practices. Only type "crop" is offered -- plus untyped entries, because
+    Okra, Onion and Mango are untyped and carry placements."""
+    from dashboard.db import crops_collection
+
+    master = list(crops_collection(db).find({}, {"name": 1, "type": 1}))
+    offered = {c["id"] for c in client.get("/dashboard/crops").json()}
+    not_crops = {str(c["_id"]) for c in master if c.get("type") not in ("crop", None)}
+    untyped = {str(c["_id"]) for c in master if c.get("type") is None}
+    assert not_crops and not (offered & not_crops)
+    assert untyped <= offered
+    # the stats tile counts the same list the dropdown shows
+    assert client.get("/dashboard/stats").json()["crops"] == len(offered)
+
+
 def test_a_decision_re_reads_the_stored_ids_and_creates_nothing(client, db):
     """create_placements() is what a decision calls. It reads the IDS the queue
     stored and creates nothing.
@@ -964,14 +979,6 @@ def test_document_carries_its_own_shareable_link(client, db):
     assert mismatched == []
     row = client.get("/dashboard/documents?page=1").json()["items"][0]
     assert row["shareable_link"].startswith("https://workdrive.zoho.in/file/")
-
-
-def test_reanchoring_moves_the_documents_link(client, scratch):
-    doc, _rows = scratch
-    owned = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()["duplicate_links"]
-    out = client.patch(f"/dashboard/unique-documents/{doc['_id']}",
-                       json={"representative_file_id": owned[1]["zoho_file_id"]}).json()
-    assert out["shareable_link"] == owned[1]["shareable_link"]
 
 
 def test_crops_can_be_narrowed_by_state(client):

@@ -1056,26 +1056,23 @@ def _apply_document_updates(db, unique_document_id, updates: dict, unset: dict |
         # reason the collection exists, so free text is refused here.
         if db[COLL_LANGUAGES].count_documents({"code": updates["language"]}, limit=1) == 0:
             raise HTTPException(400, "language must be a code from GET /dashboard/languages")
-        # A person's choice is a known language, not a guess -- the same
-        # category as the OCR pass having read it. Marking it "detected" is also
-        # what makes it survive a re-run of
-        # scripts/fill_language_from_state.py, which only recomputes "state".
-        updates.setdefault("language_source", "detected")
-    if updates.get("representative_file_id") is not None:
-        # A document can only be anchored to one of its OWN copies. Anchoring it
-        # at some other document's file would make translation act on bytes this
-        # document's metadata does not describe.
-        doc = db[COLL_UNIQUE_DOCUMENTS].find_one(
-            {"_id": unique_document_id}, {"duplicate_links": 1}
-        ) or {}
-        match = next((l for l in (doc.get("duplicate_links") or [])
-                      if l.get("zoho_file_id") == updates["representative_file_id"]), None)
-        if match is None:
-            raise HTTPException(400, "representative_file_id must be one of this document's own copies")
-        # Re-anchoring moves the document's own link with it; leaving the old
-        # one would point the document at a copy it no longer claims.
-        updates["shareable_link"] = match.get("shareable_link")
-        updates.setdefault("shareable_name", match.get("shareable_name"))
+        # A person set it, so it is "manual" -- the value an upload already
+        # writes for the same choice made on the Add Document form. This used
+        # to write "detected", so a hand edit read back as an OCR result and
+        # the testing team saw "manual" turn into "detected" after a save.
+        # Either value survives scripts/fill_language_from_state.py, which
+        # only recomputes "state".
+        updates.setdefault("language_source", "manual")
+    if "representative_file_id" in updates:
+        # NO RE-ANCHORING. Which copy is the document is chosen once, when the
+        # document is created, and never changed by hand: the copies are the
+        # same file, so the choice made no difference -- and moving it only
+        # left the read-only file details (SHA-256 above all, which names the
+        # document, not a copy) describing a different file from the link
+        # beside them. Refused rather than ignored, so a stale client finds
+        # out instead of believing it re-anchored.
+        raise HTTPException(400, "representative_file_id cannot be changed -- "
+                                 "a document's anchor copy is fixed when it is created")
     updates["updated_at"] = utcnow()
     db[COLL_UNIQUE_DOCUMENTS].update_one(
         {"_id": unique_document_id},
@@ -1651,7 +1648,7 @@ def stats(db=Depends(get_db)):
         "documents": rows.count_documents({}),
         "files": docs.count_documents({}),
         "states": db[COLL_STATES].count_documents({}),
-        "crops": vocabulary.coll(db, "crop").count_documents({"type": {"$ne": "chemical"}}),
+        "crops": len(vocabulary.name_map(db, "crop")),
         "organizations": db[COLL_ORGANIZATIONS].count_documents({}),
         "translated": docs.count_documents({"translation_status": "done"}),
         "reviewed": docs.count_documents({"review_status": "done"}),
