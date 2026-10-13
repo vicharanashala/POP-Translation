@@ -11,10 +11,53 @@ box; the three decision endpoints resolve an item a person is looking at.
     POST   /uploads/{id}/cancel  discard; nothing was uploaded
     DELETE /uploads/{id}         same as cancel, also clears finished rows
 
+THE APPROVAL CHAIN. Since 2026-10, an upload passes through people before an
+admin files it. Who may act is checked against dashboard/access.py:
+
+    expert uploads ----------> upload approvers ----------> admins
+      ^                          PATCH   edit                PATCH   edit
+      |                          /approve -> admins          /add, /new, /cancel
+      |                          /decline -> uploader        /decline -> approvers
+      |                          (note required)             (note required)
+      +-- declined: PATCH edit, /resubmit -> approvers, or DELETE
+
+An admin's or an upload approver's own upload starts at the admins, and is
+never declined below the level it came from (`level` / `upload_level`, see
+_stage). A declined item goes back one level with a note; at the uploader it can be corrected
+(PATCH) and resubmitted to the approvers, or removed (DELETE) and uploaded
+again -- experts never add or discard. Each item says
+which stage it is at and what THIS caller may do with it (`stage`, `actions`),
+and `GET /uploads` lists only the caller's own uploads plus what waits on them.
+
+    PATCH  /uploads/{id}           whoever holds it corrects the form fields
+    POST   /uploads/{id}/approve   approver -> admins
+    POST   /uploads/{id}/decline   back one stage, {"note": "..."}
+    POST   /uploads/{id}/resubmit  uploader -> approvers, after a decline
+    GET    /uploads/{id}/file      the staged file, for the queue's preview
+
+The same file cannot be queued twice: POST /uploads answers 409 when an item
+with its sha256 is already in the queue, at any stage (_refuse_if_queued). The
+catalogue is checked later, by the worker; the queue has to be checked here,
+because nothing in it is in the catalogue yet.
+
 Every item stops at `awaiting_review` whether or not anything matched -- the
 duplicate check is a placeholder (exact sha256 only, see dashboard/queue_worker)
 so the person is the real check. The pause happens before the Zoho upload, so
 cancelling leaves nothing behind in WorkDrive.
+
+WHO APPROVED IT. /approve, /add and /new take an optional body
+`{"approved_by": "<display name>"}` (/add also its `document_id`), like
+`translated_by` on a translation. The names wait on the item as
+`approved_by_approver` / `approved_by_admin` and are written onto the document
+when /new creates it. /add files more places for a document that already
+exists, and leaves its approvals as they were -- as it leaves `uploaded_by`.
+
+ONE DECISION PER ITEM. Requests run in parallel, not in turn, so every move
+is a conditional write -- "only if it is still where I saw it" -- and the
+loser of a race gets a 409 to refresh on: approve, decline and edit (_move),
+add and new (_start claims the item before the worker sees it), discard
+(_discard). The worker re-checks the document's folders before filing, so even
+a retry files nothing twice.
 
 WHICH DECISIONS ARE AVAILABLE is not the frontend's guess: each candidate in
 `GET /uploads/{id}` carries `can_add` and `can_create_new`, and this module
@@ -53,17 +96,21 @@ Everything else on the form is optional.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from pymongo import ASCENDING, DESCENDING
 
 from dashboard import events, queue_worker, vocabulary
+from dashboard.access import UPLOAD_LIST, Caller, caller
 from dashboard.db import get_db
 from dashboard.display_id import parse_display_id
 from dashboard.models import (
+    COLL_APPROVERS,
     COLL_LANGUAGES,
     COLL_UNIQUE_DOCUMENTS,
     COLL_UPLOAD_QUEUE_ITEMS,
@@ -73,7 +120,7 @@ from dashboard.models import (
     normalize_format,
     utcnow,
 )
-from dashboard.schemas import UploadQueueItemOut
+from dashboard.schemas import UploadActions, UploadDecline, UploadEdit, UploadQueueItemOut, UploadStage
 
 router = APIRouter()
 
@@ -93,7 +140,114 @@ def _stringify_ids(placements: list[dict] | None) -> list[dict]:
             for p in placements or []]
 
 
-def _item_out(item: dict) -> UploadQueueItemOut:
+# -- the approval chain ----------------------------------------------------------
+#
+# Stored as two numbers on the item:
+#
+#     level          where it is NOW:     0 the uploader, 1 the upload
+#                                         approvers, 2 the admins
+#     upload_level   who UPLOADED it:     0 anyone else, 1 an upload
+#                                         approver, 2 an admin
+#
+# An upload starts one level above its uploader's own -- an approver's or an
+# admin's upload skips the approvers, who would only be approving themselves --
+# and a decline moves it down one. It never goes below `upload_level`: there is
+# nobody down there who ever saw it, so at `level == upload_level` there is no
+# decline. That replaced two booleans (`approver`, `admin`) which could not say
+# where an admin's own upload should go when declined, and sent it to approvers
+# who had never been part of its path.
+#
+# An item with no `level` was queued before the chain existed; it was waiting on
+# an admin then, so it is still with the admins, uploaded by nobody in
+# particular (upload_level 0). Read that way rather than rewritten.
+#
+# Who sees an item: its uploader always (their own uploads, at any level), the
+# upload approvers while it is at 1, the admins while it is at 2. A person can
+# be several of these, and sees the union.
+
+_LEVEL = {UploadStage.expert: 0, UploadStage.approver: 1, UploadStage.admin: 2}
+_STAGE_AT = {n: stage for stage, n in _LEVEL.items()}
+
+
+def _level(item: dict) -> int:
+    return item.get("level", 2)
+
+
+def _upload_level(item: dict) -> int:
+    return item.get("upload_level", 0)
+
+
+def _stage(item: dict) -> UploadStage:
+    return _STAGE_AT[_level(item)]
+
+
+def upload_level_of(who: Caller) -> int:
+    """The level a person's own upload counts as uploaded from."""
+    return 2 if who.is_admin else 1 if who.can_approve_uploads else 0
+
+
+# The Mongo spelling of each stage, for conditional updates: a decision only
+# lands if the item is still where the person saw it.
+_AT_STAGE = {
+    UploadStage.admin: {"$or": [{"level": 2}, {"level": {"$exists": False}}]},
+    UploadStage.approver: {"level": 1},
+    UploadStage.expert: {"level": 0},
+}
+
+_REVIEWABLE = (UploadQueueStatus.awaiting_review.value, UploadQueueStatus.failed.value)
+
+
+def _holds(who: Caller, stage: UploadStage, item: dict) -> bool:
+    """Whether `who` is one of the people the item is waiting on. At the
+    uploader's stage that is the uploader alone."""
+    return ((stage is UploadStage.approver and who.can_approve_uploads)
+            or (stage is UploadStage.admin and who.is_admin)
+            or (stage is UploadStage.expert and item.get("expert") == who.user_id))
+
+
+def _actions(item: dict, who: Caller | None) -> UploadActions:
+    if who is None:
+        return UploadActions()
+    stage, status = _stage(item), item.get("status")
+    holds = _holds(who, stage, item)
+    waiting = status == UploadQueueStatus.awaiting_review.value
+    not_filing = status != UploadQueueStatus.uploading.value
+    return UploadActions(
+        can_edit=holds and waiting,
+        can_approve=holds and stage is UploadStage.approver and waiting,
+        # Down one level, never below where it was uploaded from.
+        can_decline=holds and _level(item) > _upload_level(item) and status in _REVIEWABLE,
+        can_decide=holds and stage is UploadStage.admin and status in _REVIEWABLE,
+        can_discard=holds and stage is UploadStage.admin and not_filing,
+        can_resubmit=holds and stage is UploadStage.expert and waiting,
+        # The uploader may drop their own upload once it is back at their own
+        # level: an expert's declined upload, or an approver's own upload that
+        # an admin sent back. (An admin's is the admins' to discard anyway.)
+        can_remove=(item.get("expert") == who.user_id and _level(item) == _upload_level(item)
+                    and not_filing),
+    )
+
+
+def _visible_filter(who: Caller) -> dict:
+    clauses = [{"expert": who.user_id}]
+    if who.can_approve_uploads:
+        clauses.append(_AT_STAGE[UploadStage.approver])
+    if who.is_admin:
+        clauses.append(_AT_STAGE[UploadStage.admin])
+    return {"$or": clauses}
+
+
+def _visible_item(db, item_id: str, who: Caller) -> tuple[ObjectId, dict]:
+    """The item, if this caller may see it. Someone else's item is a 404, not a
+    403: whether it exists is not theirs to know either."""
+    oid = _to_object_id(item_id)
+    item = db[COLL_UPLOAD_QUEUE_ITEMS].find_one({"$and": [{"_id": oid}, _visible_filter(who)]})
+    if item is None:
+        raise HTTPException(404, "upload not found")
+    return oid, item
+
+
+def _item_out(item: dict, who: Caller | None = None) -> UploadQueueItemOut:
     data = dict(item)
     data["id"] = str(data.pop("_id"))
     data["placements"] = _stringify_ids(data.get("placements"))
@@ -109,6 +263,11 @@ def _item_out(item: dict) -> UploadQueueItemOut:
     data["metadata"] = meta
     data["candidates"] = [{**c, "new_placements": _stringify_ids(c.get("new_placements"))}
                           for c in data.get("candidates") or []]
+    stage = _stage(item)
+    data["level"] = _level(item)
+    data["upload_level"] = _upload_level(item)
+    data["stage"] = stage
+    data["actions"] = _actions(item, who)
     return UploadQueueItemOut(**data)
 
 
@@ -214,6 +373,38 @@ def _checked_ref(db, source: dict, key: str):
     return entry["_id"]
 
 
+_STAGE_WORDS = {
+    UploadStage.expert: "declined back to its uploader",
+    UploadStage.approver: "waiting on the upload approvers",
+    UploadStage.admin: "waiting on the admins",
+}
+
+
+def _refuse_if_queued(db, sha: str) -> None:
+    """409 when this exact file is already in the upload queue.
+
+    The duplicate check (queue_worker.find_candidates) only looks at the
+    CATALOGUE, and an upload is not in the catalogue until an admin files it --
+    which, with the approval chain, can be days. Without this, the same file
+    sent twice (by two experts, or by one who did not see the first go through)
+    became two queue items, each reviewed by the approvers and the admins in
+    turn, and the second one's add then found the first's document.
+
+    Any status counts, `failed` included: the item is still there, and removing
+    it is the way to send the file again. Matched on the exact sha256, like the
+    catalogue check -- a re-scan is a different file to both.
+    """
+    queued = db[COLL_UPLOAD_QUEUE_ITEMS].find_one({"sha256": sha}, {"filename": 1, "level": 1,
+                                                                    "status": 1})
+    if queued is not None:
+        raise HTTPException(
+            409,
+            f"This exact file is already in the upload queue as \"{queued.get('filename')}\" "
+            f"({_STAGE_WORDS[_stage(queued)]}, status {queued.get('status')}). "
+            "It cannot be queued twice -- wait for that one to be decided, or have it removed first.",
+        )
+
+
 @router.post("/uploads", response_model=UploadQueueItemOut, status_code=201)
 async def create_upload(
     file: UploadFile = File(...),
@@ -244,6 +435,7 @@ async def create_upload(
     # the document -- not to a state group, which is where they used to arrive.
     district_id: str | None = Form(None),
     kvk_id: str | None = Form(None),
+    who: Caller = Depends(caller),
     db=Depends(get_db),
 ):
     placements = _parse_placements(db, placements_json)
@@ -255,13 +447,21 @@ async def create_upload(
     pdf_bytes = await file.read()
     if not pdf_bytes:
         raise HTTPException(400, "uploaded file is empty")
+    sha = hashlib.sha256(pdf_bytes).hexdigest()
+    _refuse_if_queued(db, sha)
 
     local = locals()
     metadata = {"language": language, **{name: local.get(name) for name in MANUAL_METADATA_FIELDS},
                 "format_original": normalize_format(format_original),
                 **{k: v for k, v in where.items() if v is not None}}
 
-    item = new_upload_queue_item(filename=file.filename, placements=placements, metadata=metadata)
+    # Starts one level above the uploader's own: an admin's or an upload
+    # approver's upload skips the approvers, who would only approve themselves.
+    item = new_upload_queue_item(filename=file.filename, placements=placements, metadata=metadata,
+                                 expert=who.user_id, upload_level=upload_level_of(who))
+    # Stored now rather than when the worker gets to it, so a second copy sent
+    # a moment later is already refused by _refuse_if_queued.
+    item["sha256"] = sha
     item_id = db[COLL_UPLOAD_QUEUE_ITEMS].insert_one(item).inserted_id
     item["_id"] = item_id
     # Staged before the worker is told about it, so the worker can never race
@@ -270,11 +470,11 @@ async def create_upload(
     queue_worker.stage(item_id, pdf_bytes)
     queue_worker.enqueue_check(item_id)
     events.upload_changed(item_id)
-    return _item_out(item)
+    return _item_out(item, who)
 
 
 @router.get("/uploads", response_model=list[UploadQueueItemOut])
-def list_uploads(db=Depends(get_db)):
+def list_uploads(who: Caller = Depends(caller), db=Depends(get_db)):
     """The queue: uploads still being checked, waiting on a decision, or failed.
 
     Nothing finished is here. Once a person picks add/new and the work
@@ -282,48 +482,203 @@ def list_uploads(db=Depends(get_db)):
     rows, which the main table already shows. Cancel deletes it too. So an item
     disappearing from this list IS the success signal; poll it, and refresh the
     main table when something goes.
+
+    Only what THIS caller should see: their own uploads, plus whatever is
+    waiting on them (see _visible_filter).
     """
-    rows = db[COLL_UPLOAD_QUEUE_ITEMS].find().sort([("created_at", DESCENDING), ("_id", ASCENDING)])
-    return [_item_out(item) for item in rows]
+    rows = db[COLL_UPLOAD_QUEUE_ITEMS].find(_visible_filter(who)).sort(
+        [("created_at", DESCENDING), ("_id", ASCENDING)])
+    return [_item_out(item, who) for item in rows]
 
 
 @router.get("/uploads/{item_id}", response_model=UploadQueueItemOut)
-def get_upload(item_id: str, db=Depends(get_db)):
-    item = db[COLL_UPLOAD_QUEUE_ITEMS].find_one({"_id": _to_object_id(item_id)})
-    if item is None:
-        raise HTTPException(404, "upload not found")
-    return _item_out(item)
+def get_upload(item_id: str, who: Caller = Depends(caller), db=Depends(get_db)):
+    return _item_out(_visible_item(db, item_id, who)[1], who)
 
 
-def _decidable(db, item_id: str) -> tuple[ObjectId, dict]:
-    """The item, if it is at a point where a decision is meaningful.
+@router.get("/uploads/{item_id}/file")
+def get_upload_file(item_id: str, who: Caller = Depends(caller), db=Depends(get_db)):
+    """The uploaded file itself, for the queue's preview. It has not reached Zoho
+    yet -- it waits on local disk until an admin decides -- so it is served from
+    there, to the same people who can see the item."""
+    oid, item = _visible_item(db, item_id, who)
+    path = queue_worker.stage_path(oid)
+    if not path.exists():
+        raise HTTPException(404, "the staged file is gone")
+    filename = item.get("filename") or path.name
+    media = "application/pdf" if filename.lower().endswith(".pdf") else None
+    return FileResponse(path, media_type=media, filename=filename, content_disposition_type="inline")
+
+
+def _held_item(db, item_id: str, who: Caller, *stages: UploadStage,
+               statuses: tuple = _REVIEWABLE) -> tuple[ObjectId, dict]:
+    """The item, if it is waiting on `who` at one of `stages` and in a status
+    where acting on it means something. 404 if they cannot see it at all, 403
+    if they can but it is not theirs to act on, 409 if it is mid-work."""
+    oid, item = _visible_item(db, item_id, who)
+    stage = _stage(item)
+    if stage not in stages or not _holds(who, stage, item):
+        raise HTTPException(403, f"this upload is with the {stage.value}s -- not yours to act on")
+    if item["status"] not in statuses:
+        raise HTTPException(409, f"upload is {item['status']}, not {' or '.join(statuses)}")
+    return oid, item
+
+
+def _decidable(db, item_id: str, who: Caller) -> tuple[ObjectId, dict]:
+    """The item, if an admin may add / new it now.
 
     `failed` is decidable too: that is a retry, and it is safe because a failure
     before the Zoho upload leaves the staged file in place, while one after it
     has already finished its upload.
     """
-    oid = _to_object_id(item_id)
-    item = db[COLL_UPLOAD_QUEUE_ITEMS].find_one({"_id": oid})
-    if item is None:
-        raise HTTPException(404, "upload not found")
-    if item["status"] not in (UploadQueueStatus.awaiting_review.value, UploadQueueStatus.failed.value):
-        raise HTTPException(409, f"upload is {item['status']}, not awaiting_review")
-    return oid, item
+    return _held_item(db, item_id, who, UploadStage.admin)
 
 
-def _start(db, oid: ObjectId, document_id: ObjectId | None) -> UploadQueueItemOut:
-    db[COLL_UPLOAD_QUEUE_ITEMS].update_one(
-        {"_id": oid},
-        {"$set": {"status": UploadQueueStatus.uploading.value, "error_message": None,
-                  "progress_pct": 55, "updated_at": utcnow()}},
+def _move(db, oid: ObjectId, stage: UploadStage, who: Caller, **fields) -> UploadQueueItemOut:
+    """Apply a stage change only if the item is still at `stage` -- two people
+    acting on one item at once must not both land."""
+    result = db[COLL_UPLOAD_QUEUE_ITEMS].update_one(
+        {"$and": [{"_id": oid}, _AT_STAGE[stage]]},
+        {"$set": {**fields, "updated_at": utcnow()}},
     )
+    if result.matched_count == 0:
+        raise HTTPException(409, "this upload was just acted on by someone else -- refresh")
+    events.upload_changed(oid)
+    return _item_out(db[COLL_UPLOAD_QUEUE_ITEMS].find_one({"_id": oid}), who)
+
+
+def _approver_name(db, body: dict | None, who: Caller, list_name: str | None = None) -> str | None:
+    """Who is approving, by display name -- `{"approved_by": "<name>"}`, sent
+    with the action like `translated_by` on a translation. Without it, the
+    name stored when the person was added to the approval list, where there is
+    one; an admin is on no list, so an admin who sends nothing is recorded as
+    unknown (null) rather than as an id nobody can read."""
+    name = str((body or {}).get("approved_by") or "").strip()
+    if name or list_name is None:
+        return name or None
+    entry = db[COLL_APPROVERS].find_one({"list": list_name, "user_id": who.user_id}, {"name": 1})
+    return ((entry or {}).get("name") or "").strip() or None
+
+
+@router.post("/uploads/{item_id}/approve", response_model=UploadQueueItemOut)
+def approve_upload(item_id: str, body: dict = Body(default=None), who: Caller = Depends(caller),
+                   db=Depends(get_db)):
+    """An upload approver passes it on to the admins, with any edits they made.
+    Optional body `{"approved_by": "<display name>"}` -- see _approver_name."""
+    oid, _ = _held_item(db, item_id, who, UploadStage.approver,
+                        statuses=(UploadQueueStatus.awaiting_review.value,))
+    return _move(db, oid, UploadStage.approver, who, level=2,
+                 approved_by_approver=_approver_name(db, body, who, UPLOAD_LIST))
+
+
+@router.post("/uploads/{item_id}/resubmit", response_model=UploadQueueItemOut)
+def resubmit_upload(item_id: str, who: Caller = Depends(caller), db=Depends(get_db)):
+    """The uploader sends a declined item back to the upload approvers, after
+    correcting it with PATCH. The approvers' note stays on it, so they can see
+    what they asked for. A wrong FILE cannot be corrected this way -- that is
+    still remove and upload again."""
+    oid, _ = _held_item(db, item_id, who, UploadStage.expert,
+                        statuses=(UploadQueueStatus.awaiting_review.value,))
+    return _move(db, oid, UploadStage.expert, who, level=1)
+
+
+@router.post("/uploads/{item_id}/decline", response_model=UploadQueueItemOut)
+def decline_upload(item_id: str, body: UploadDecline, who: Caller = Depends(caller),
+                   db=Depends(get_db)):
+    """Send it back one level, with a note saying why.
+
+    From the approvers it goes back to the uploader, who reads the note and
+    either corrects the item and resubmits it, or removes it and uploads again.
+    From the admins it goes back to the approvers, who either fix it and approve
+    again or decline it on to the uploader. The note is required: a bare "no"
+    tells nobody what to change.
+
+    Never below the level it was uploaded from (409): an admin's own upload has
+    no approvers to go back to, and an approver's own has no expert. Those are
+    corrected where they are, or discarded / removed.
+    """
+    note = (body.note or "").strip()
+    if not note:
+        raise HTTPException(400, "a note is required when declining")
+    oid, item = _held_item(db, item_id, who, UploadStage.approver, UploadStage.admin)
+    if _level(item) <= _upload_level(item):
+        raise HTTPException(409, "this upload was uploaded at this level -- there is nobody to decline "
+                                 "it back to; correct it here, or discard it")
+    stage = _stage(item)
+    if stage is UploadStage.approver:
+        # Back to the uploader unapproved: an approval from an earlier pass
+        # (before an admin sent it back) no longer stands.
+        return _move(db, oid, stage, who, level=0, approver_note=note, approved_by_approver=None)
+    return _move(db, oid, stage, who, level=1, admin_note=note)
+
+
+@router.patch("/uploads/{item_id}", response_model=UploadQueueItemOut)
+def edit_upload(item_id: str, body: UploadEdit, who: Caller = Depends(caller), db=Depends(get_db)):
+    """Correct what the uploader filled in, before passing it on.
+
+    Whoever holds the item -- an approver, an admin, or the uploader once it
+    has been declined back to them -- may change any form field
+    except `uploaded_by`, under the same rules as the form: ids only, every id
+    checked now. Changing the placements re-reads which of them each candidate
+    already has, since that is what decides whether "add" means anything.
+    """
+    oid, item = _held_item(db, item_id, who, UploadStage.approver, UploadStage.admin,
+                           UploadStage.expert, statuses=(UploadQueueStatus.awaiting_review.value,))
+    sent = body.model_dump(include=body.model_fields_set)
+    meta, unset, update = dict(item.get("metadata") or {}), [], {}
+
+    if "language" in sent:
+        if db[COLL_LANGUAGES].count_documents({"code": sent["language"]}, limit=1) == 0:
+            raise HTTPException(400, "language must be a code from GET /dashboard/languages")
+        meta["language"] = sent.pop("language")
+    if "placements" in sent:
+        update["placements"] = _parse_placements(db, json.dumps(sent.pop("placements")))
+    for key in _LOCATION_REFS:
+        if key in sent:
+            ref = _checked_ref(db, sent, key)
+            sent.pop(key)
+            if ref is None:
+                meta.pop(key, None)
+            else:
+                meta[key] = ref
+    if "format_original" in sent:
+        meta["format_original"] = normalize_format(sent.pop("format_original"))
+    meta.update(sent)  # the plain metadata fields; UploadEdit forbids anything else
+    update["metadata"] = meta
+
+    if "placements" in update and item.get("sha256"):
+        candidates = queue_worker.find_candidates(db, item["sha256"], update["placements"])
+        update["candidates"] = candidates
+        update["note"] = queue_worker.describe_candidates(candidates)
+    return _move(db, oid, _stage(item), who, **update)
+
+
+def _start(db, oid: ObjectId, document_id: ObjectId | None, who: Caller,
+           approved_by: str | None) -> UploadQueueItemOut:
+    """CLAIM the item, then hand it to the worker.
+
+    The claim is one conditional write: `uploading` only if it is still with
+    the admins and still reviewable. Two admins clicking add/new at the same
+    moment both pass _decidable's read, but only one of these writes matches;
+    the other gets the 409 and nothing runs twice. Without it both were queued:
+    a second `new` uploaded the file to WorkDrive again and filed the document
+    in every folder a second time.
+    """
+    result = db[COLL_UPLOAD_QUEUE_ITEMS].update_one(
+        {"$and": [{"_id": oid, "status": {"$in": list(_REVIEWABLE)}}, _AT_STAGE[UploadStage.admin]]},
+        {"$set": {"status": UploadQueueStatus.uploading.value, "error_message": None,
+                  "progress_pct": 55, "approved_by_admin": approved_by, "updated_at": utcnow()}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(409, "this upload was just acted on by someone else -- refresh")
     queue_worker.enqueue_decision(oid, document_id)
     events.upload_changed(oid)
-    return _item_out(db[COLL_UPLOAD_QUEUE_ITEMS].find_one({"_id": oid}))
+    return _item_out(db[COLL_UPLOAD_QUEUE_ITEMS].find_one({"_id": oid}), who)
 
 
 @router.post("/uploads/{item_id}/add", response_model=UploadQueueItemOut)
-def add_to_existing(item_id: str, body: dict = Body(default=None), db=Depends(get_db)):
+def add_to_existing(item_id: str, body: dict = Body(default=None), who: Caller = Depends(caller),
+                    db=Depends(get_db)):
     """File this upload's NEW placements onto a document that already exists.
 
     `document_id` is an ObjectId hex or an ANNAM id, and must be one of the
@@ -332,7 +687,7 @@ def add_to_existing(item_id: str, body: dict = Body(default=None), db=Depends(ge
     document already has the file, and the dashboard's storage is one flat
     folder rather than one per state/crop.
     """
-    oid, item = _decidable(db, item_id)
+    oid, item = _decidable(db, item_id, who)
     candidates = item.get("candidates") or []
     if not candidates:
         raise HTTPException(409, "nothing matched this upload -- use /new")
@@ -353,7 +708,7 @@ def add_to_existing(item_id: str, body: dict = Body(default=None), db=Depends(ge
             f"{chosen['document_code']} is already filed under every place you selected -- "
             f"there is nothing to add",
         )
-    return _start(db, oid, ObjectId(chosen["document_id"]))
+    return _start(db, oid, ObjectId(chosen["document_id"]), who, _approver_name(db, body, who))
 
 
 def _match_candidate(candidates: list[dict], wanted: str) -> dict | None:
@@ -369,14 +724,15 @@ def _match_candidate(candidates: list[dict], wanted: str) -> dict | None:
 
 
 @router.post("/uploads/{item_id}/new", response_model=UploadQueueItemOut)
-def create_new_document(item_id: str, db=Depends(get_db)):
+def create_new_document(item_id: str, body: dict = Body(default=None), who: Caller = Depends(caller),
+                        db=Depends(get_db)):
     """Upload the file and create a separate document for it.
 
     Refused when an exact sha256 candidate exists: sha256 is unique on
     `unique_documents`, so byte-identical content cannot become a second
     document. That is a storage fact, not a policy -- the answer there is /add.
     """
-    oid, item = _decidable(db, item_id)
+    oid, item = _decidable(db, item_id, who)
     exact = next((c for c in (item.get("candidates") or []) if c.get("match_type") == "sha"), None)
     if exact is not None:
         raise HTTPException(
@@ -386,33 +742,47 @@ def create_new_document(item_id: str, db=Depends(get_db)):
         )
     if not queue_worker.stage_path(oid).exists():
         raise HTTPException(409, "the staged file is gone -- submit the upload again")
-    return _start(db, oid, None)
+    return _start(db, oid, None, who, _approver_name(db, body, who))
 
 
 @router.post("/uploads/{item_id}/cancel", status_code=204)
-def cancel_pending_upload(item_id: str, db=Depends(get_db)):
+def cancel_pending_upload(item_id: str, who: Caller = Depends(caller), db=Depends(get_db)):
     """Discard the item and the staged file. Nothing was sent to Zoho and no
     rows exist, so there is nothing else to undo."""
-    _discard(db, item_id)
+    _discard(db, item_id, who)
 
 
 @router.delete("/uploads/{item_id}", status_code=204)
-def delete_upload(item_id: str, db=Depends(get_db)):
+def delete_upload(item_id: str, who: Caller = Depends(caller), db=Depends(get_db)):
     """Same effect as /cancel, kept because clearing a `failed` row from the
     list is a delete, not a decision. A successful upload removes itself (see
     queue_worker._finish), so there is no `done` row to clear."""
-    _discard(db, item_id)
+    _discard(db, item_id, who)
 
 
-def _discard(db, item_id: str) -> None:
-    oid = _to_object_id(item_id)
-    item = db[COLL_UPLOAD_QUEUE_ITEMS].find_one({"_id": oid})
-    if item is None:
-        raise HTTPException(404, "upload not found")
+def _discard(db, item_id: str, who: Caller) -> None:
+    """Two people may drop an item: an admin, while it is with the admins, and
+    its uploader, once it is back at the level it was uploaded from. Nobody
+    else -- an expert can no longer withdraw an upload that is still in review,
+    and an approver's "no" is a decline with a note, not a discard."""
+    oid, item = _visible_item(db, item_id, who)
+    if not (_actions(item, who).can_discard or _actions(item, who).can_remove):
+        if item["status"] == UploadQueueStatus.uploading.value:
+            raise HTTPException(409, "cannot cancel an upload that is already uploading")
+        raise HTTPException(403, f"this upload is with the {_stage(item).value}s -- not yours to remove")
     if item["status"] == UploadQueueStatus.uploading.value:
         # Its Zoho upload and row inserts are already in flight; deleting the
         # item would not stop them.
         raise HTTPException(409, "cannot cancel an upload that is already uploading")
+    # Deleted only if it is still at the stage the check above saw and still
+    # not being filed: an admin's add landing between that read and this
+    # delete must win, not lose its item mid-flight. Not pinned to the exact
+    # status -- the worker moves a fresh upload through queued/hashing/checking
+    # on its own, and that is not someone else acting on it.
+    result = db[COLL_UPLOAD_QUEUE_ITEMS].delete_one({"$and": [
+        {"_id": oid, "status": {"$ne": UploadQueueStatus.uploading.value}},
+        _AT_STAGE[_stage(item)]]})
+    if result.deleted_count == 0:
+        raise HTTPException(409, "this upload was just acted on by someone else -- refresh")
     queue_worker.unstage(oid)
-    db[COLL_UPLOAD_QUEUE_ITEMS].delete_one({"_id": oid})
     events.upload_removed(oid)

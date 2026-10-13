@@ -1006,6 +1006,7 @@ from dashboard.routes_translation import router as _dashboard_translation_router
 from dashboard.routes_merge import router as _dashboard_merge_router
 from dashboard.routes_files import router as _dashboard_files_router
 from dashboard.events import router as _dashboard_events_router
+from dashboard.routes_access import router as _dashboard_access_router
 
 app.include_router(_dashboard_documents_router, prefix="/dashboard", tags=["dashboard"])
 app.include_router(_dashboard_uploads_router, prefix="/dashboard", tags=["dashboard"])
@@ -1013,6 +1014,7 @@ app.include_router(_dashboard_translation_router, prefix="/dashboard", tags=["da
 app.include_router(_dashboard_merge_router, prefix="/dashboard", tags=["dashboard"])
 app.include_router(_dashboard_files_router, prefix="/dashboard", tags=["dashboard"])
 app.include_router(_dashboard_events_router, prefix="/dashboard", tags=["dashboard"])
+app.include_router(_dashboard_access_router, prefix="/dashboard", tags=["dashboard"])
 # No dedup router: this schema has no embeddings and no duplicate-review flow.
 # Duplicates are expected in the main table and grouping them is a later job.
 

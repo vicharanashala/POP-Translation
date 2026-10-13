@@ -28,10 +28,26 @@ from bson import ObjectId
 
 BASE_URL = os.environ.get("POP_RENDER_BASE_URL", "http://127.0.0.1:8047")
 
+# Who the suite says it is (see dashboard/access.py). Made up per run, so no
+# test can collide with a real member of the approval lists on staging. The
+# shared client is an ADMIN, which is what every test written before the
+# approval chain assumed; tests about permissions pass `headers=_as(...)`.
+ADMIN_ID = str(ObjectId())
+
+
+# A real organisation, for tests that need one: an agriai.organizations entry,
+# which is what placements point at since 2026-10. It used to be our folder
+# "KVK Files", which the move of non-organisation folders to crop "All" deleted.
+SOME_ORG = "Central Rice Research Institute"
+
+
+def _as(user_id: str, role: str = "expert") -> dict:
+    return {"X-User-Id": user_id, "X-User-Role": role}
+
 
 @pytest.fixture(scope="session")
 def client():
-    c = httpx.Client(base_url=BASE_URL, timeout=30.0)
+    c = httpx.Client(base_url=BASE_URL, timeout=30.0, headers=_as(ADMIN_ID, "admin"))
     try:
         resp = c.get("/dashboard/stats")
         if resp.status_code != 200:
@@ -66,28 +82,30 @@ def vocab_guard(db):
     (scripts/sync_lgd.py), no test creates one -- the API answers 403 -- and
     deleting one would quietly shrink a real dropdown. Crops likewise.
     """
-    from dashboard.models import COLL_DOCUMENTS, COLL_ORGANIZATIONS, COLL_STATES
+    from dashboard.models import COLL_DOCUMENTS, COLL_ORG_MASTER, COLL_STATES
 
-    watched = (COLL_STATES, COLL_ORGANIZATIONS)
+    # (collection, placement field, the entry's name field). Organisations are
+    # staging's copy of agriai.organizations, which names entries in `org_name`.
+    watched = ((COLL_STATES, "state_id", "name"), (COLL_ORG_MASTER, "organization_id", "org_name"))
     # NAMES, not just ids: a rename test leaves the entry renamed, and deleting
     # only the unused new ones left it behind whenever something still pointed
     # at it. The next test's fixture then resolved "Scratch Alpha" onto the
     # renamed row and read back "scratch ALPHA" -- a failure that only appeared
     # in a full run, never when the test was run on its own.
-    before = {c: {e["_id"]: e["name"] for e in db[c].find({}, {"_id": 1, "name": 1})}
-              for c in watched}
+    before = {c: {e["_id"]: e.get(nf) for e in db[c].find({}, {"_id": 1, nf: 1})}
+              for c, _f, nf in watched}
     yield
-    for coll, field in ((COLL_STATES, "state_id"), (COLL_ORGANIZATIONS, "organization_id")):
-        for e in db[coll].find({}, {"_id": 1, "name": 1}):
+    for coll, field, nf in watched:
+        for e in db[coll].find({}, {"_id": 1, nf: 1}):
             was = before[coll].get(e["_id"])
-            if was is None:
+            if e["_id"] not in before[coll]:
                 if db[COLL_DOCUMENTS].count_documents({field: e["_id"]}, limit=1) == 0:
                     db[coll].delete_one({"_id": e["_id"]})
-            elif e["name"] != was:
-                db[coll].update_one({"_id": e["_id"]}, {"$set": {"name": was}})
+            elif e.get(nf) != was:
+                db[coll].update_one({"_id": e["_id"]}, {"$set": {nf: was}})
 
 
-def _seed_entry(db, collection, name: str, **fields) -> dict:
+def _seed_entry(db, collection, name: str, name_field: str = "name", **fields) -> dict:
     """A throwaway vocabulary entry, inserted straight through pymongo.
 
     No API route creates a vocabulary entry and nothing resolves one by name, so
@@ -96,12 +114,12 @@ def _seed_entry(db, collection, name: str, **fields) -> dict:
     """
     from dashboard.models import utcnow
 
-    entry = db[collection].find_one({"name": name})
+    entry = db[collection].find_one({name_field: name})
     if entry is None:
         now = utcnow()
-        db[collection].insert_one({"name": name, "raw_names": [], "created_at": now,
+        db[collection].insert_one({name_field: name, "raw_names": [], "created_at": now,
                                    "updated_at": now, **fields})
-        entry = db[collection].find_one({"name": name})
+        entry = db[collection].find_one({name_field: name})
     return entry
 
 
@@ -113,12 +131,12 @@ def _placement_row(db, *, row_id, unique_document_id, state, crop, **fields):
     crop master, and the fixture does not ask: it seeds the entry it wants and
     uses its id, because nothing turns a name into an id any more.
     """
-    from dashboard.models import COLL_ORGANIZATIONS, COLL_STATES, new_document
+    from dashboard.models import COLL_ORG_MASTER, COLL_STATES, new_document
 
     return new_document(
         row_id=row_id, unique_document_id=unique_document_id,
         state_id=_seed_entry(db, COLL_STATES, state)["_id"],
-        organization_id=_seed_entry(db, COLL_ORGANIZATIONS, crop)["_id"],
+        organization_id=_seed_entry(db, COLL_ORG_MASTER, crop, "org_name", type="central")["_id"],
         state_raw=state, crop_raw=crop, **fields)
 
 
@@ -580,7 +598,7 @@ def test_patch_placement_stays_on_the_row(client, db, scratch):
     doc, rows = scratch
     # By ID. Nothing is created from a request and nothing is matched by name,
     # so a move names the entry the person picked from the dropdown.
-    moved_to = "KVK Files"
+    moved_to = SOME_ORG
     resp = client.patch(f"/dashboard/documents/{rows[0]['_id']}",
                         json={"organization_id": _vocab_id(client, "organizations", moved_to)})
     assert resp.status_code == 200, resp.text
@@ -868,9 +886,9 @@ def test_no_request_can_write_any_vocabulary(client, db):
     whole path is gone. Nothing is created either way, which is what this
     asserts -- a status code alone would not notice a write that happened.
     """
-    from dashboard.models import COLL_ORGANIZATIONS, COLL_STATES
+    from dashboard.models import COLL_ORG_MASTER, COLL_STATES
 
-    before = (db[COLL_ORGANIZATIONS].count_documents({}), db[COLL_STATES].count_documents({}))
+    before = (db[COLL_ORG_MASTER].count_documents({}), db[COLL_STATES].count_documents({}))
     for path in ("states", "organizations", "districts", "kvks", "crops"):
         entries = client.get(f"/dashboard/{path}").json()
         assert entries, f"no {path} in this database"
@@ -883,7 +901,7 @@ def test_no_request_can_write_any_vocabulary(client, db):
         ):
             resp = getattr(client, method)(url, **({"json": body} if body is not None else {}))
             assert resp.status_code in (404, 405), (method, url, resp.status_code)
-    assert (db[COLL_ORGANIZATIONS].count_documents({}),
+    assert (db[COLL_ORG_MASTER].count_documents({}),
             db[COLL_STATES].count_documents({})) == before
 
 
@@ -922,44 +940,45 @@ def test_a_decision_re_reads_the_stored_ids_and_creates_nothing(client, db):
     fallback -- so an id that had gone silently re-resolved to whatever the label
     now matched. Both are gone: an id that no longer resolves fails the decision.
     """
-    from dashboard.db import get_database
+    from dashboard.db import get_database, organizations_collection
     from dashboard.display_id import free_display_ids
     from dashboard.models import (
         COLL_DOCUMENTS,
-        COLL_ORGANIZATIONS,
         COLL_UNIQUE_DOCUMENTS,
         new_unique_document,
     )
     from dashboard.queue_worker import create_placements
 
     live = get_database()
+    # Looked up BEFORE the insert: a name that is gone must fail the test, not
+    # strand a document that then fails every test counting documents.
+    state_id = _vocab_id(client, "states", "Karnataka")
+    org_id = _vocab_id(client, "organizations", SOME_ORG)
     live[COLL_UNIQUE_DOCUMENTS].delete_many({"sha256": "vocab" + "0" * 59})
     doc = new_unique_document(display_id=free_display_ids(live, 1)[0], sha256="vocab" + "0" * 59)
     doc["_id"] = live[COLL_UNIQUE_DOCUMENTS].insert_one(doc).inserted_id
-    state_id = _vocab_id(client, "states", "Karnataka")
-    org_id = _vocab_id(client, "organizations", "KVK Files")
     try:
         copy = {"zoho_file_id": "fidV", "shareable_link": "http://example/v",
                 "shareable_name": "v.pdf"}
         # Stored ids that still resolve file normally.
         rows = create_placements(live, document=doc, copy=copy, placements=[
             {"state": "Karnataka", "state_id": ObjectId(state_id),
-             "crop": "KVK Files", "crop_kind": "organization",
+             "crop": SOME_ORG, "crop_kind": "organization",
              "organization_id": ObjectId(org_id)}])
         assert len(rows) == 1 and rows[0]["organization_id"] == ObjectId(org_id)
 
         # An id that names nothing fails, and the LABEL beside it is not used to
         # rescue it -- that fallback is what made a stale id dangerous.
         for bad in ({"state": "Karnataka", "state_id": ObjectId("0" * 24),
-                     "crop": "KVK Files", "crop_kind": "organization",
+                     "crop": SOME_ORG, "crop_kind": "organization",
                      "organization_id": ObjectId(org_id)},
                     {"state": "Karnataka", "state_id": ObjectId(state_id),
-                     "crop": "KVK Files", "crop_kind": "organization",
+                     "crop": SOME_ORG, "crop_kind": "organization",
                      "organization_id": ObjectId("0" * 24)}):
             with pytest.raises(ValueError):
                 create_placements(live, document=doc, copy=copy, placements=[bad])
-        assert live[COLL_ORGANIZATIONS].find_one({"name": "KVK Files"}) is not None
-        assert live[COLL_ORGANIZATIONS].count_documents({"name": "Zz Brand New Thing"}) == 0
+        assert organizations_collection(live).find_one({"org_name": SOME_ORG}) is not None
+        assert organizations_collection(live).count_documents({"org_name": "Zz Brand New Thing"}) == 0
     finally:
         live[COLL_DOCUMENTS].delete_many({"unique_document_id": doc["_id"]})
         live[COLL_UNIQUE_DOCUMENTS].delete_one({"_id": doc["_id"]})
@@ -1000,11 +1019,12 @@ def test_every_placement_references_a_real_state_and_one_folder(db):
     """A placement points at a state and at EXACTLY ONE of a crop master entry or
     an organisation. An id naming nothing would render as a blank column."""
     from dashboard.db import crops_collection
-    from dashboard.models import COLL_DOCUMENTS, COLL_ORGANIZATIONS, COLL_STATES
+    from dashboard.db import organizations_collection
+    from dashboard.models import COLL_DOCUMENTS, COLL_STATES
 
     states = {e["_id"] for e in db[COLL_STATES].find({}, {"_id": 1})}
     crops = {e["_id"] for e in crops_collection(db).find({"type": {"$ne": "chemical"}}, {"_id": 1})}
-    orgs = {e["_id"] for e in db[COLL_ORGANIZATIONS].find({}, {"_id": 1})}
+    orgs = {e["_id"] for e in organizations_collection(db).find({}, {"_id": 1})}
     bad = []
     for r in db[COLL_DOCUMENTS].find({}, {"row_id": 1, "state_id": 1, "crop_id": 1, "organization_id": 1}):
         if r.get("state_id") not in states or ("crop_id" in r) == ("organization_id" in r) \
@@ -1049,12 +1069,12 @@ def test_a_patch_cannot_invent_a_state_or_a_folder(client, db, scratch):
     the contract the frontend has to hold up, which is why the row is checked
     afterwards and not just the status code.
     """
-    from dashboard.models import COLL_ORGANIZATIONS, COLL_STATES
+    from dashboard.models import COLL_ORG_MASTER, COLL_STATES
 
     _doc, rows = scratch
     url = f"/dashboard/documents/{rows[0]['_id']}"
     counts = lambda: (db[COLL_STATES].count_documents({}),
-                      db[COLL_ORGANIZATIONS].count_documents({}))
+                      db[COLL_ORG_MASTER].count_documents({}))
     before = counts()
     nowhere = "000000000000000000000000"
     for body, expect in (
@@ -1161,11 +1181,11 @@ def test_an_upload_names_every_folder_by_id(client):
     `"crops"` list that accepted either could.
     """
     item_id = _submit(client, placements_json=_placements(
-        client, ("Karnataka", ["Paddy", "KVK Files"])))
+        client, ("Karnataka", ["Paddy", SOME_ORG])))
     try:
         got = sorted((p["crop"], p["crop_kind"], bool(p.get("crop_id") or p.get("organization_id")))
                      for p in client.get(f"/dashboard/uploads/{item_id}").json()["placements"])
-        assert got == [("KVK Files", "organization", True), ("Paddy", "crop", True)]
+        assert got == sorted([(SOME_ORG, "organization", True), ("Paddy", "crop", True)])
     finally:
         client.post(f"/dashboard/uploads/{item_id}/cancel")
 
@@ -1213,10 +1233,19 @@ def test_organization_names_are_unique_regardless_of_case(client, db):
 
     from dashboard.models import COLL_ORGANIZATIONS, utcnow
 
-    existing = client.get("/dashboard/organizations").json()[0]
-    with pytest.raises(DuplicateKeyError):
-        db[COLL_ORGANIZATIONS].insert_one({"name": existing["name"].upper(), "raw_names": [],
-                                           "created_at": utcnow(), "updated_at": utcnow()})
+    # pop_organizations is the corpus loader's folder list, no longer what the
+    # dropdown serves (that is the agriai master), so the test brings its own
+    # entry rather than borrowing one from /dashboard/organizations.
+    probe = "Zz Index Probe Organisation"
+    db[COLL_ORGANIZATIONS].delete_many({"name": {"$in": [probe, probe.upper()]}})
+    db[COLL_ORGANIZATIONS].insert_one({"name": probe, "raw_names": [],
+                                       "created_at": utcnow(), "updated_at": utcnow()})
+    try:
+        with pytest.raises(DuplicateKeyError):
+            db[COLL_ORGANIZATIONS].insert_one({"name": probe.upper(), "raw_names": [],
+                                               "created_at": utcnow(), "updated_at": utcnow()})
+    finally:
+        db[COLL_ORGANIZATIONS].delete_one({"name": probe})
 
 
 def test_the_vocabulary_module_has_no_name_lookup_left(client, db):
@@ -1324,11 +1353,22 @@ _MINIMAL_PDF = (
 )
 
 
-def _submit(client, **data):
+def _unique_pdf() -> bytes:
+    """_MINIMAL_PDF with a unique trailing comment, so its sha256 is its own.
+
+    The same file cannot be queued twice (routes_uploads._refuse_if_queued), so
+    two tests -- or one test's two uploads -- sending identical bytes would
+    refuse each other."""
+    return _MINIMAL_PDF + b"%" + ObjectId().binary.hex().encode() + b"\n"
+
+
+def _submit(client, headers=None, **data):
     """Submit an upload. `placements_json` is required and carries IDS -- see
-    _placements() for building one from names a test can read."""
-    resp = client.post("/dashboard/uploads",
-                       files={"file": ("render_test.pdf", _MINIMAL_PDF, "application/pdf")},
+    _placements() for building one from names a test can read. `headers` says
+    who is uploading; the default is the suite's admin."""
+    resp = client.post("/dashboard/uploads", headers=headers,
+                       files={"file": ("render_test.pdf", data.pop("pdf", None) or _unique_pdf(),
+                                       "application/pdf")},
                        data={"language": "eng", **data})
     assert resp.status_code == 201, resp.text
     return resp.json()["id"]
@@ -1364,10 +1404,10 @@ def _placements(client, *groups) -> str:
     return json.dumps(out)
 
 
-def _await_review(client, item_id, timeout=30.0):
+def _await_review(client, item_id, timeout=30.0, headers=None):
     deadline = time.time() + timeout
     while time.time() < deadline:
-        item = client.get(f"/dashboard/uploads/{item_id}").json()
+        item = client.get(f"/dashboard/uploads/{item_id}", headers=headers).json()
         if item["status"] in ("awaiting_review", "failed"):
             return item
         time.sleep(0.3)
@@ -1667,6 +1707,7 @@ def test_documents_carry_only_the_agreed_fields(db):
         "translation_status", "translation_zoho_file_id", "translation_shareable_link",
         "review_status", "review_zoho_file_id", "review_shareable_link",
         "translated_by", "translated_at", "reviewed_by", "reviewed_at",
+        "approved_by_approver", "approved_by_admin",
         "chunk_embeddings", "main_row_ids", "duplicate_links", "merged_from",
         "representative_file_id", "district_id", "kvk_id",
         "created_at", "updated_at",
@@ -2499,15 +2540,16 @@ def test_a_placement_needs_no_file_of_its_own(client, db, scratch):
 
 
 def test_kvk_is_its_own_vocabulary_not_an_organisation(client):
-    """`pop_organizations` holds FOLDER names, one of which IS called "KVK
-    Files". Which KVK a document came from is a different question, so the two
-    vocabularies must not leak into each other's dropdowns."""
+    """`pop_organizations` holds FOLDER names, one of which was called "KVK
+    Files" until it moved to crop "All". Which KVK a document came from is a
+    different question, so the two vocabularies must not leak into each other's
+    dropdowns."""
     kvks = {k["name"] for k in client.get("/dashboard/kvks").json()}
     folders = {f["name"] for f in client.get("/dashboard/folders").json()}
     organizations = {o["name"] for o in client.get("/dashboard/organizations").json()}
     assert kvks, "no KVKs -- run scripts/sync_lgd.py against this database"
     # The folder entry and the KVK vocabulary are separate things.
-    assert "KVK Files" in organizations and "KVK Files" not in kvks
+    assert "KVK Files" not in kvks
     # No synced KVK is offered as a folder.
     assert not (kvks - {"All"}) & folders
 
@@ -2676,7 +2718,7 @@ def test_an_upload_with_a_district_comes_back_as_json(client, db):
     district, kvk = _a_district(client, with_kvk=True)
     resp = client.post(
         "/dashboard/uploads",
-        files={"file": ("district-json.pdf", _MINIMAL_PDF, "application/pdf")},
+        files={"file": ("district-json.pdf", _unique_pdf(), "application/pdf")},
         data={"language": "eng",
               "district_id": district["id"], "kvk_id": kvk["id"],
               "placements_json": _placements(client, ("Keralam", ["Paddy"]))})
@@ -2745,3 +2787,413 @@ def test_an_upload_names_one_district_for_the_document_not_one_per_group(client,
     # Neither sent -> nothing stored.
     assert _checked_ref(db, {}, "district_id") is None
     assert _optional_ref(db, {}, "district") is None
+
+
+# -- who may do what (dashboard/access.py) ----------------------------------------
+# Admin is a ROLE, sent by the frontend. Edit approver and upload approver are
+# LISTS kept here, which an admin fills from the user dropdown. Everyone else is
+# an expert: browse, download, upload.
+
+
+@pytest.fixture
+def members(client):
+    """Put made-up users into the approval lists for one test, and take them
+    out again. Returns add(list_name) -> user_id."""
+    added = []
+
+    def add(list_name: str) -> str:
+        user_id = str(ObjectId())
+        resp = client.post(f"/dashboard/user-management/{list_name}",
+                           json={"user_id": user_id, "name": "Render Test", "email": "rt@example.org"})
+        assert resp.status_code == 201, resp.text
+        added.append((list_name, user_id))
+        return user_id
+
+    yield add
+    for list_name, user_id in added:
+        client.delete(f"/dashboard/user-management/{list_name}/{user_id}")
+
+
+def test_a_write_without_a_caller_is_refused_but_reads_stay_open(client):
+    """No X-User-Id is a 401, not an anonymous expert -- an anonymous queue
+    would come back empty and look like a working answer."""
+    with httpx.Client(base_url=BASE_URL, timeout=30.0) as anonymous:
+        assert anonymous.get("/dashboard/stats").status_code == 200
+        assert anonymous.get("/dashboard/documents", params={"page_size": 1}).status_code == 200
+        assert anonymous.get("/dashboard/me").status_code == 401
+        assert anonymous.get("/dashboard/uploads").status_code == 401
+        assert anonymous.patch(f"/dashboard/unique-documents/{'0' * 24}",
+                               json={"advisory_name": "x"}).status_code == 401
+
+
+def test_me_says_what_the_caller_may_do(client, members):
+    admin = client.get("/dashboard/me").json()
+    assert admin == {"user_id": ADMIN_ID, "role": "admin", "is_admin": True, "can_edit": True,
+                     "can_approve_uploads": False, "can_translate": True}
+
+    expert = str(ObjectId())
+    mine = client.get("/dashboard/me", headers=_as(expert, "moderator")).json()
+    # A moderator is an expert here: only "admin" is a role that grants anything.
+    assert (mine["is_admin"], mine["can_edit"], mine["can_approve_uploads"], mine["can_translate"]) \
+        == (False, False, False, False)
+
+    editor, approver = members("edit"), members("upload")
+    assert client.get("/dashboard/me", headers=_as(editor)).json()["can_edit"] is True
+    flags = client.get("/dashboard/me", headers=_as(approver)).json()
+    assert (flags["can_approve_uploads"], flags["can_edit"], flags["can_translate"]) == (True, False, False)
+
+
+def test_the_approval_lists_are_admin_only(client, members):
+    expert = _as(str(ObjectId()))
+    assert client.get("/dashboard/user-management/edit", headers=expert).status_code == 403
+    assert client.post("/dashboard/user-management/edit", headers=expert,
+                       json={"user_id": str(ObjectId())}).status_code == 403
+
+    user_id = members("edit")
+    listed = client.get("/dashboard/user-management/edit").json()
+    entry = next(e for e in listed if e["user_id"] == user_id)
+    assert (entry["name"], entry["email"], entry["added_by"]) == ("Render Test", "rt@example.org", ADMIN_ID)
+    # In one list is not in the other.
+    assert user_id not in [e["user_id"] for e in client.get("/dashboard/user-management/upload").json()]
+
+    assert client.post("/dashboard/user-management/edit", json={"user_id": user_id}).status_code == 409
+    assert client.post("/dashboard/user-management/edit", json={"user_id": "Ramesh"}).status_code == 400
+    assert client.get("/dashboard/user-management/translate").status_code == 404
+
+    assert client.delete(f"/dashboard/user-management/edit/{user_id}").status_code == 204
+    assert client.delete(f"/dashboard/user-management/edit/{user_id}").status_code == 404
+
+
+def test_only_an_editor_changes_documents(client, scratch, members):
+    doc, rows = scratch
+    doc_id = str(doc["_id"])
+    expert = _as(str(ObjectId()))
+    assert client.patch(f"/dashboard/unique-documents/{doc_id}", headers=expert,
+                        json={"advisory_name": "by an expert"}).status_code == 403
+    assert client.delete(f"/dashboard/documents/{rows[0]['_id']}", headers=expert).status_code == 403
+    assert client.post(f"/dashboard/unique-documents/{doc_id}/merge", headers=expert,
+                       json={"absorb": []}).status_code == 403
+    # ...and an expert can still READ it.
+    assert client.get(f"/dashboard/unique-documents/{doc_id}", headers=expert).status_code == 200
+
+    editor = _as(members("edit"))
+    resp = client.patch(f"/dashboard/unique-documents/{doc_id}", headers=editor,
+                        json={"advisory_name": "by an edit approver"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["advisory_name"] == "by an edit approver"
+
+
+def test_only_an_admin_translates(client, scratch, members):
+    """Every translation action, the translation queue included -- even for an
+    edit approver, who may otherwise do everything an admin does to a document."""
+    doc_id = str(scratch[0]["_id"])
+    for who in (_as(str(ObjectId())), _as(members("edit")), _as(members("upload"))):
+        assert client.get("/dashboard/translation-jobs", headers=who).status_code == 403
+        assert client.post(f"/dashboard/unique-documents/{doc_id}/translate", headers=who).status_code == 403
+        assert client.post(f"/dashboard/unique-documents/{doc_id}/review", headers=who,
+                           files={"file": ("r.docx", b"x", "application/octet-stream")}).status_code == 403
+        assert client.delete(f"/dashboard/unique-documents/{doc_id}/translation", headers=who).status_code == 403
+    assert client.get("/dashboard/translation-jobs").status_code == 200
+
+
+def _drop_upload(item_id: str) -> None:
+    """Remove a test's upload whatever stage it was left at -- the API only lets
+    the person holding it do that, and a failed assertion can leave it anywhere.
+    The server runs on this machine, so its staged file is ours to remove too."""
+    from dashboard import queue_worker
+    from dashboard.db import get_database
+    from dashboard.models import COLL_UPLOAD_QUEUE_ITEMS
+
+    get_database()[COLL_UPLOAD_QUEUE_ITEMS].delete_one({"_id": ObjectId(item_id)})
+    queue_worker.unstage(ObjectId(item_id))
+
+
+def _queue_ids(client, headers) -> list[str]:
+    return [i["id"] for i in client.get("/dashboard/uploads", headers=headers).json()]
+
+
+def test_an_expert_upload_goes_through_the_approvers_to_the_admins(client, db, members):
+    """The whole chain, both declines included:
+
+        expert -> approver -(approve)-> admin -(decline)-> approver -(decline)-> expert
+    """
+    expert, other = _as(str(ObjectId())), _as(str(ObjectId()))
+    approver = _as(members("upload"))
+    item_id = _submit(client, headers=expert,
+                      placements_json=_placements(client, ("Karnataka", ["Paddy"])))
+    try:
+        item = _await_review(client, item_id, headers=expert)
+        assert (item["stage"], item["level"], item["upload_level"]) == ("approver", 1, 0)
+        # The uploader sees it but can no longer withdraw or decide it.
+        assert not any(item["actions"].values()), item["actions"]
+        assert client.post(f"/dashboard/uploads/{item_id}/cancel", headers=expert).status_code == 403
+        # Another expert does not see it at all; the admins not yet.
+        assert item_id not in _queue_ids(client, other)
+        assert client.get(f"/dashboard/uploads/{item_id}", headers=other).status_code == 404
+        assert item_id not in _queue_ids(client, None)
+        assert client.post(f"/dashboard/uploads/{item_id}/add").status_code == 404
+
+        # The approver: preview, edit, approve.
+        seen = next(i for i in client.get("/dashboard/uploads", headers=approver).json() if i["id"] == item_id)
+        assert seen["actions"] == {"can_edit": True, "can_approve": True, "can_decline": True,
+                                   "can_decide": False, "can_discard": False, "can_resubmit": False,
+                                   "can_remove": False}
+        preview = client.get(f"/dashboard/uploads/{item_id}/file", headers=approver)
+        assert preview.status_code == 200 and preview.content.startswith(_MINIMAL_PDF)
+        assert client.post(f"/dashboard/uploads/{item_id}/add", headers=approver).status_code == 403
+        edited = client.patch(f"/dashboard/uploads/{item_id}", headers=approver,
+                              json={"advisory_name": "fixed by approver",
+                                    "placements": json.loads(_placements(client, ("Keralam", ["Coconut"])))})
+        assert edited.status_code == 200, edited.text
+        assert edited.json()["metadata"]["advisory_name"] == "fixed by approver"
+        assert [(p["state"], p["crop"]) for p in edited.json()["placements"]] == [("Keralam", "Coconut")]
+        assert client.patch(f"/dashboard/uploads/{item_id}", headers=approver,
+                            json={"uploaded_by": "someone else"}).status_code == 422
+        assert client.post(f"/dashboard/uploads/{item_id}/approve", headers=approver).json()["stage"] == "admin"
+        assert item_id not in _queue_ids(client, approver)
+
+        # The admin declines it back to the approvers, with a note.
+        assert client.post(f"/dashboard/uploads/{item_id}/decline", json={"note": "  "}).status_code == 400
+        back = client.post(f"/dashboard/uploads/{item_id}/decline", json={"note": "wrong season"}).json()
+        assert (back["stage"], back["admin_note"]) == ("approver", "wrong season")
+        assert item_id not in _queue_ids(client, None)
+
+        # The approver declines it on to the uploader.
+        back = client.post(f"/dashboard/uploads/{item_id}/decline", headers=approver,
+                           json={"note": "please re-scan"}).json()
+        assert (back["stage"], back["level"], back["upload_level"]) == ("expert", 0, 0)
+        assert item_id not in _queue_ids(client, approver)
+
+        mine = next(i for i in client.get("/dashboard/uploads", headers=expert).json() if i["id"] == item_id)
+        assert (mine["approver_note"], mine["admin_note"]) == ("please re-scan", "wrong season")
+        assert mine["actions"]["can_remove"] is True
+        assert (mine["actions"]["can_edit"], mine["actions"]["can_resubmit"],
+                mine["actions"]["can_decline"]) == (True, True, False)
+
+        # The uploader corrects it and sends it back to the approvers -- nobody
+        # else may (to them it is not even visible while it is with its
+        # uploader), and the approvers' note stays on it.
+        fix = {"season": "Kharif", "placements": json.loads(_placements(client, ("Keralam", ["Paddy"])))}
+        assert client.patch(f"/dashboard/uploads/{item_id}", headers=other, json=fix).status_code == 404
+        assert client.patch(f"/dashboard/uploads/{item_id}", headers=approver, json=fix).status_code == 404
+        fixed = client.patch(f"/dashboard/uploads/{item_id}", headers=expert, json=fix)
+        assert fixed.status_code == 200, fixed.text
+        assert fixed.json()["metadata"]["season"] == "Kharif"
+        assert client.post(f"/dashboard/uploads/{item_id}/resubmit", headers=approver).status_code == 404
+        again = client.post(f"/dashboard/uploads/{item_id}/resubmit", headers=expert)
+        assert again.status_code == 200, again.text
+        assert (again.json()["stage"], again.json()["approver_note"]) == ("approver", "please re-scan")
+        assert client.post(f"/dashboard/uploads/{item_id}/resubmit", headers=expert).status_code == 403
+        assert item_id in _queue_ids(client, approver)
+        # Once it is with the approvers again, the uploader can no longer edit it.
+        assert client.patch(f"/dashboard/uploads/{item_id}", headers=expert, json=fix).status_code == 403
+
+        # Declined once more, and this time the uploader removes it instead.
+        client.post(f"/dashboard/uploads/{item_id}/decline", headers=approver, json={"note": "still wrong"})
+        assert client.delete(f"/dashboard/uploads/{item_id}", headers=other).status_code == 404
+        assert client.delete(f"/dashboard/uploads/{item_id}", headers=expert).status_code == 204
+        assert client.get(f"/dashboard/uploads/{item_id}", headers=expert).status_code == 404
+    finally:
+        client.delete(f"/dashboard/uploads/{item_id}", headers=expert)
+        _drop_upload(item_id)
+
+
+def test_an_approver_or_admin_upload_starts_with_the_admins(client, members):
+    """Their own uploads skip the approvers, and are never declined below the
+    level they came from: an admin's has nobody to go back to, an approver's
+    goes back to the approvers once and stops there."""
+    approver = _as(members("upload"))
+    for headers, upload_level in ((approver, 1), (None, 2)):
+        item_id = _submit(client, headers=headers,
+                          placements_json=_placements(client, ("Karnataka", ["Paddy"])))
+        try:
+            item = _await_review(client, item_id, headers=headers)
+            assert (item["stage"], item["level"], item["upload_level"]) == ("admin", 2, upload_level)
+            assert item_id in _queue_ids(client, None)
+            mine = client.get(f"/dashboard/uploads/{item_id}").json()
+            assert mine["actions"]["can_decline"] is (upload_level < 2)
+            declined = client.post(f"/dashboard/uploads/{item_id}/decline", json={"note": "fix it"})
+            if upload_level == 2:
+                assert declined.status_code == 409, declined.text
+                continue
+            assert (declined.json()["stage"], declined.json()["level"]) == ("approver", 1)
+            # Back at the approver's own level: they may edit, approve or
+            # remove it, but there is no expert to decline it to.
+            back = client.get(f"/dashboard/uploads/{item_id}", headers=approver).json()
+            assert (back["actions"]["can_decline"], back["actions"]["can_approve"],
+                    back["actions"]["can_remove"]) == (False, True, True)
+            assert client.post(f"/dashboard/uploads/{item_id}/decline", headers=approver,
+                               json={"note": "no"}).status_code == 409
+            assert client.delete(f"/dashboard/uploads/{item_id}", headers=approver).status_code == 204
+        finally:
+            client.post(f"/dashboard/uploads/{item_id}/cancel")
+            _drop_upload(item_id)
+
+
+def test_a_concurrent_decision_on_one_upload_lands_once(client, db, members):
+    """Two approvers approving the same item: the second finds it gone from
+    their stage, rather than both moving it."""
+    first, second = _as(members("upload")), _as(members("upload"))
+    expert = _as(str(ObjectId()))
+    item_id = _submit(client, headers=expert, placements_json=_placements(client, ("Karnataka", ["Paddy"])))
+    try:
+        _await_review(client, item_id, headers=expert)
+        assert client.post(f"/dashboard/uploads/{item_id}/approve", headers=first).status_code == 200
+        assert client.post(f"/dashboard/uploads/{item_id}/approve", headers=second).status_code == 404
+    finally:
+        client.post(f"/dashboard/uploads/{item_id}/cancel")
+        _drop_upload(item_id)
+
+
+def test_the_same_file_cannot_be_queued_twice(client, members):
+    """An upload is not in the catalogue until an admin files it, so the
+    catalogue check cannot see a copy still in review. The queue is checked at
+    submit: the second copy is refused, whoever sends it and whatever stage the
+    first one is at, and goes through once the first is removed."""
+    expert, approver = _as(str(ObjectId())), _as(members("upload"))
+    pdf = _unique_pdf()
+    placements = _placements(client, ("Keralam", ["Paddy"]))
+    first = _submit(client, expert, pdf=pdf, placements_json=placements)
+    try:
+        for who in (expert, approver, None):
+            resp = client.post("/dashboard/uploads", headers=who,
+                               files={"file": ("again.pdf", pdf, "application/pdf")},
+                               data={"language": "eng", "placements_json": placements})
+            assert resp.status_code == 409, resp.text
+            assert "already in the upload queue" in resp.json()["detail"]
+            assert "render_test.pdf" in resp.json()["detail"]
+        # A different file is not held up by it.
+        _drop_upload(_submit(client, expert, placements_json=placements))
+    finally:
+        _drop_upload(first)
+    _drop_upload(_submit(client, expert, pdf=pdf, placements_json=placements))
+
+
+def test_organizations_say_their_type_and_state(client):
+    """The organisation master has entries sharing one name (17 names twice or
+    more), so each option carries the master's own `type` and `state`."""
+    orgs = client.get("/dashboard/organizations").json()
+    assert orgs and all(o["type"] in ("central", "state", "district") and o["state"] for o in orgs)
+    folders = client.get("/dashboard/folders").json()
+    assert all(f["type"] and f["state"] for f in folders if f["kind"] == "organization")
+    assert all(f["type"] is None and f["state"] is None for f in folders if f["kind"] == "crop")
+
+
+def test_a_placement_that_loses_its_pop_number_takes_the_next_one(db):
+    """Two writers can draw the same free POP number. The one that loses the
+    race moves to the next free number instead of failing the upload."""
+    from dashboard.display_id import free_row_ids
+    from dashboard.models import COLL_DOCUMENTS
+    from dashboard.queue_worker import _insert_row
+
+    taken = free_row_ids(db, 1)[0]
+    ids = []
+    try:
+        ids.append(db[COLL_DOCUMENTS].insert_one({"row_id": taken, "render_test": True}).inserted_id)
+        row = {"row_id": taken, "render_test": True}
+        ids.append(_insert_row(db, row))
+        assert row["row_id"] != taken
+        assert db[COLL_DOCUMENTS].count_documents({"row_id": row["row_id"]}) == 1
+    finally:
+        db[COLL_DOCUMENTS].delete_many({"_id": {"$in": ids}})
+
+
+def test_two_admins_deciding_one_upload_at_once_lands_once(client, db, scratch):
+    """Requests run in parallel. Two adds and a discard fired together on one
+    item: exactly one wins, the others get 409, and the document gains the
+    new folder once."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from dashboard.models import COLL_DOCUMENTS, COLL_UPLOAD_QUEUE_ITEMS
+
+    doc, _rows = scratch
+    before = db[COLL_DOCUMENTS].count_documents({"unique_document_id": doc["_id"]})
+    item_id = _submit(client, placements_json=_placements(client, ("Karnataka", ["Paddy"])))
+    try:
+        _await_review(client, item_id)
+        db[COLL_UPLOAD_QUEUE_ITEMS].update_one({"_id": ObjectId(item_id)}, {"$set": {
+            "candidates": [{"document_id": str(doc["_id"]),
+                            "document_code": f"ANNAM_{doc['display_id']:05d}",
+                            "match_type": "sha", "score": 1.0, "can_add": True,
+                            "can_create_new": False,
+                            "new_placements": [{"state": "Karnataka", "crop": "Paddy"}]}]}})
+
+        def fire(action):
+            with httpx.Client(base_url=BASE_URL, timeout=30.0, headers=_as(ADMIN_ID, "admin")) as c:
+                if action == "add":
+                    return c.post(f"/dashboard/uploads/{item_id}/add").status_code
+                return c.post(f"/dashboard/uploads/{item_id}/cancel").status_code
+
+        with ThreadPoolExecutor(3) as pool:
+            codes = list(pool.map(fire, ["add", "add", "cancel"]))
+        winners = [c for c in codes if c in (200, 204)]
+        assert len(winners) == 1 and all(c == 409 for c in codes if c not in (200, 204)), codes
+
+        deadline = time.time() + 30
+        while time.time() < deadline and client.get(f"/dashboard/uploads/{item_id}").status_code != 404:
+            time.sleep(0.3)
+        after = db[COLL_DOCUMENTS].count_documents({"unique_document_id": doc["_id"]})
+        assert after == before + (1 if winners[0] == 200 else 0), (codes, before, after)
+    finally:
+        _drop_upload(item_id)
+
+
+def test_who_approved_an_upload_is_recorded_on_its_new_document(client, db, members, monkeypatch):
+    """The approver's and the admin's names travel with the item and land on
+    the document /new creates. The filing step runs IN THIS PROCESS, with the
+    WorkDrive upload stubbed, so the test writes nothing to Zoho."""
+    import sys
+    import types
+
+    from dashboard import queue_worker, zoho_layout
+    from dashboard.models import COLL_DOCUMENTS, COLL_UNIQUE_DOCUMENTS, COLL_UPLOAD_QUEUE_ITEMS
+
+    expert = _as(str(ObjectId()))
+    approver = _as(members("upload"))  # listed as "Render Test"
+    item_id = _submit(client, headers=expert, placements_json=_placements(client, ("Karnataka", ["Paddy"])))
+    doc_id = None
+    try:
+        _await_review(client, item_id, headers=expert)
+        # No name sent: the approval list's stored name is used.
+        out = client.post(f"/dashboard/uploads/{item_id}/approve", headers=approver).json()
+        assert out["approved_by_approver"] == "Render Test"
+        # Declined back by the admin, approved again by name.
+        client.post(f"/dashboard/uploads/{item_id}/decline", json={"note": "check"})
+        out = client.post(f"/dashboard/uploads/{item_id}/approve", headers=approver,
+                          json={"approved_by": "Approver Person"}).json()
+        assert out["approved_by_approver"] == "Approver Person"
+
+        # The admin's claim, as POST /new makes it -- then the worker's filing,
+        # run here so the Zoho upload can be stubbed.
+        oid = ObjectId(item_id)
+        db[COLL_UPLOAD_QUEUE_ITEMS].update_one({"_id": oid}, {"$set": {
+            "status": "uploading", "approved_by_admin": "Admin Person"}})
+        monkeypatch.setitem(sys.modules, "pop_server", types.SimpleNamespace(_get_zoho=lambda: None))
+        monkeypatch.setattr(zoho_layout, "upload_original", lambda *_a, **_k: "render-test-file")
+        queue_worker._finish(oid, None)
+
+        assert db[COLL_UPLOAD_QUEUE_ITEMS].find_one({"_id": oid}) is None, "the filing failed"
+        doc = db[COLL_UNIQUE_DOCUMENTS].find_one({"representative_file_id": "render-test-file"})
+        doc_id = doc["_id"]
+        assert (doc["approved_by_approver"], doc["approved_by_admin"]) == ("Approver Person", "Admin Person")
+        served = client.get(f"/dashboard/unique-documents/{doc_id}").json()
+        assert (served["approved_by_approver"], served["approved_by_admin"]) == ("Approver Person", "Admin Person")
+        page = client.get("/dashboard/unique-documents",
+                          params={"filter[approved_by_admin]": "admin person"}).json()
+        assert [d["id"] for d in page["items"]] == [str(doc_id)]
+        assert "Admin Person" in client.get("/dashboard/approved-by-admin").json()
+        assert "Approver Person" in client.get("/dashboard/approved-by-approver").json()
+        # Document-only: the main table neither shows nor filters on them.
+        rows = client.get("/dashboard/documents",
+                          params={"filter[sha256]": doc["sha256"]}).json()["items"]
+        assert rows and all("approved_by_admin" not in r and "approved_by_approver" not in r for r in rows)
+        assert client.get("/dashboard/documents",
+                          params={"filter[approved_by_admin]": "admin person"}).status_code == 400
+        # Read-only, like uploaded_by.
+        client.patch(f"/dashboard/unique-documents/{doc_id}", json={"approved_by_admin": "Someone"})
+        assert db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc_id})["approved_by_admin"] == "Admin Person"
+    finally:
+        _drop_upload(item_id)
+        if doc_id is not None:
+            db[COLL_DOCUMENTS].delete_many({"unique_document_id": doc_id})
+            db[COLL_UNIQUE_DOCUMENTS].delete_one({"_id": doc_id})

@@ -29,12 +29,14 @@ from dashboard.config import (
     CROP_MASTER_COLLECTION,
     CROP_MASTER_DB_NAME,
     CROP_MASTER_HOST_DB,
+    ORG_MASTER_COLLECTION,
     _PREFIX,
     DB_NAME,
     DB_URL,
     POP_ENV,
 )
 from dashboard.models import (
+    COLL_APPROVERS,
     COLL_CONFIG,
     COLL_CROP_ALIASES,
     COLL_CROPS,
@@ -42,6 +44,7 @@ from dashboard.models import (
     COLL_DOCUMENTS,
     COLL_KVKS,
     COLL_LANGUAGES,
+    COLL_ORG_MASTER,
     COLL_ORGANIZATIONS,
     COLL_STATES,
     COLL_TRANSLATION_JOBS,
@@ -98,6 +101,16 @@ def crops_collection(db: Database):
     if db.name == CROP_MASTER_HOST_DB:
         return db.client[CROP_MASTER_DB_NAME][CROP_MASTER_COLLECTION]
     return db[COLL_CROPS]
+
+
+def organizations_collection(db: Database):
+    """Where `db`'s organisations live, chosen exactly as crops_collection does:
+    agriai.organizations for the production dashboard database, the local
+    `pop_org_master` copy for any other. Its entries name themselves in
+    `org_name`, not `name` -- dashboard/vocabulary.py translates."""
+    if db.name == CROP_MASTER_HOST_DB:
+        return db.client[CROP_MASTER_DB_NAME][ORG_MASTER_COLLECTION]
+    return db[COLL_ORG_MASTER]
 
 
 # Index specs, applied by init_db(). Kept here rather than scattered through
@@ -215,6 +228,14 @@ _INDEXES: dict[str, list[dict]] = {
     COLL_UPLOAD_QUEUE_ITEMS: [
         {"keys": [("created_at", DESCENDING), ("_id", ASCENDING)], "name": "created_at_id"},
         {"keys": [("status", ASCENDING)], "name": "status"},
+        # Who sees an item: its uploader, or whoever holds the stage it is at.
+        {"keys": [("expert", ASCENDING)], "name": "expert"},
+        # The same file may not be queued twice (routes_uploads._refuse_if_queued).
+        # Not unique: items queued before that check may already share one.
+        {"keys": [("sha256", ASCENDING)], "name": "sha256"},
+    ],
+    COLL_APPROVERS: [
+        {"keys": [("list", ASCENDING), ("user_id", ASCENDING)], "unique": True, "name": "uq_list_user"},
     ],
     COLL_TRANSLATION_JOBS: [
         # Scoped to a unique document now, not a placement -- translating a

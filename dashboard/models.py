@@ -78,6 +78,12 @@ COLL_CROPS = "pop_crops"
 # ("ICAR - Indian Council Of Agriculture Research") and groupings ("General",
 # "Pulses"). Ours, and editable, unlike crops.
 COLL_ORGANIZATIONS = "pop_organizations"
+# Staging's copy of the organisation master (agriai.organizations), which is
+# what placements' `organization_id` points at since 2026-10 -- see
+# dashboard/db.py:organizations_collection. `pop_organizations` above is the
+# folder-name list it replaced: no placement points into it any more, and only
+# the corpus loader still writes it.
+COLL_ORG_MASTER = "pop_org_master"
 # Our own spellings of master crops ("Ground Nut" -> Groundnut), so a folder or
 # a form using an old spelling still lands on the master entry. The master's
 # `aliases` are regional names ("sajje"), a different thing.
@@ -96,6 +102,11 @@ COLL_LANGUAGES = "pop_languages"
 COLL_UPLOAD_QUEUE_ITEMS = "pop_upload_queue_items"
 COLL_TRANSLATION_JOBS = "pop_translation_jobs"
 COLL_CONFIG = "pop_config"
+# The two permission lists an admin manages: "edit" (may change documents) and
+# "upload" (reviews experts' uploads). One row per (list, user), keyed on the
+# agriai.users id; name and email ride along because production cannot read
+# agriai.users to look them up. See dashboard/access.py.
+COLL_APPROVERS = "pop_approvers"
 
 
 # -- Enums --------------------------------------------------------------------
@@ -424,7 +435,8 @@ def new_copy_link(*, zoho_file_id: str | None, shareable_link: str | None,
     }
 
 
-def new_upload_queue_item(*, filename: str, placements: list[dict], metadata: dict) -> dict:
+def new_upload_queue_item(*, filename: str, placements: list[dict], metadata: dict,
+                          expert: str | None = None, upload_level: int = 0) -> dict:
     """Status tracking for an in-flight upload -- drives the Add Document box.
 
     `placements` is the (state, crop) list the form asked for, already flattened
@@ -438,6 +450,12 @@ def new_upload_queue_item(*, filename: str, placements: list[dict], metadata: di
     documents, best first, each carrying which of THIS upload's placements it
     does not already have. That is what makes the three-way choice meaningful:
     "add" is only offered when there is something to add.
+
+    The approval chain (see dashboard/routes_uploads): `expert` is whoever
+    uploaded it and `upload_level` what they are (0 anyone, 1 an upload
+    approver, 2 an admin). `level` is where it waits: one above the uploader's
+    own -- the approvers (1) for anyone, the admins (2) for an approver or an
+    admin.
     """
     now = utcnow()
     return {
@@ -462,6 +480,17 @@ def new_upload_queue_item(*, filename: str, placements: list[dict], metadata: di
         # What the decision produced.
         "created_document_id": None,   # ANNAM id used or created
         "created_row_ids": [],         # POP ids of the placements created
+        # Approval chain: who uploaded it, where it waits (`level`: 0 uploader,
+        # 1 approvers, 2 admins) and what its uploader is (`upload_level`, same
+        # numbers), and the latest decline note from each stage.
+        "expert": expert,
+        "level": 1 if upload_level == 0 else 2,
+        "upload_level": upload_level,
+        "approver_note": None,
+        "admin_note": None,
+        # Who approved it at each stage; written onto the document by /new.
+        "approved_by_approver": None,
+        "approved_by_admin": None,
         "created_at": now,
         "updated_at": now,
     }

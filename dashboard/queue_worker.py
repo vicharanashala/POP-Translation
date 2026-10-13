@@ -45,6 +45,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from bson import ObjectId
+from pymongo.errors import DuplicateKeyError
 
 from dashboard import events, vocabulary, zoho_layout
 from dashboard.db import get_session
@@ -265,14 +266,34 @@ def find_or_create_document(db, *, sha: str, fields: dict) -> dict:
     return doc
 
 
+_ROW_ID_RETRIES = 5
+
+
+def _insert_row(db, row: dict) -> ObjectId:
+    """Insert one placement, moving to the next free row_id if another writer
+    took this one between the scan and the insert. Any other duplicate (or a
+    sixth loss in a row) still raises."""
+    for attempt in range(_ROW_ID_RETRIES + 1):
+        try:
+            return db[COLL_DOCUMENTS].insert_one(row).inserted_id
+        except DuplicateKeyError as e:
+            if attempt == _ROW_ID_RETRIES or "row_id" not in ((e.details or {}).get("keyPattern") or {}):
+                raise
+            row.pop("_id", None)
+            row["row_id"] = free_row_ids(db, 1)[0]
+    raise AssertionError("unreachable")
+
+
 def create_placements(db, *, document, placements: list[dict], copy: dict) -> list[dict]:
     """Insert one `documents` row per placement, all pointing at `document`.
 
     row_ids are drawn in bulk from one scan rather than one at a time, so filing
     a document under 20 crops does not rescan the collection 20 times. The unique
-    index on row_id is still the arbiter if another writer takes one first -- an
-    insert that loses that race raises, which is correct: the caller reports a
-    failed upload rather than silently creating fewer rows than asked for.
+    index on row_id is still the arbiter if another writer takes one first, and
+    a row that loses that race draws the next free number and tries again
+    (_insert_row). It used to fail the whole decision instead: on 2026-10-13 an
+    admin's add on staging drew POP_00269 while the test suite briefly held it,
+    and the upload went to `failed` over a number nobody kept.
 
     `copy` is the physical file each new placement is backed by. On the `add`
     path that is the document's EXISTING anchor file: the dashboard stores
@@ -311,9 +332,8 @@ def create_placements(db, *, document, placements: list[dict], copy: dict) -> li
             state_raw=placement.get("state") or "", crop_raw=placement.get("crop") or "",
             **{vocabulary.field(kind): folder_id},
         ))
-    result = db[COLL_DOCUMENTS].insert_many(rows)
-    for row, inserted_id in zip(rows, result.inserted_ids):
-        row["_id"] = inserted_id
+    for row in rows:
+        inserted_id = row["_id"] = _insert_row(db, row)
         link_placement(
             db, document["_id"],
             row_obj_id=inserted_id,
@@ -396,6 +416,21 @@ def _finish(item_id: ObjectId, document_id: ObjectId | None) -> None:
                     "shareable_name": document.get("shareable_name"),
                 }
                 verb = "Filed"
+            elif item.get("sha256") and (existing := db[COLL_UNIQUE_DOCUMENTS].find_one(
+                    {"sha256": item["sha256"]})) is not None:
+                # NEW, but this exact file is already a document: an earlier
+                # attempt at this item got as far as creating it (a retry
+                # after a failure), or another upload of the file was filed in
+                # the meantime. Joined like an add -- no second WorkDrive
+                # upload, and only the folders it is not in yet.
+                document = existing
+                placements = new_placements_for(db, document, placements)
+                copy = {
+                    "zoho_file_id": document.get("representative_file_id"),
+                    "shareable_link": document.get("shareable_link"),
+                    "shareable_name": document.get("shareable_name"),
+                }
+                verb = "Filed"
             else:
                 path = stage_path(item_id)
                 if not path.exists():
@@ -424,6 +459,10 @@ def _finish(item_id: ObjectId, document_id: ObjectId | None) -> None:
                         "language": metadata.get("language"),
                         "language_source": "manual",
                         **{k: metadata.get(k) for k in _METADATA_FIELDS},
+                        # Who passed it through the approval chain, as the
+                        # queue recorded them (routes_uploads).
+                        "approved_by_approver": item.get("approved_by_approver"),
+                        "approved_by_admin": item.get("approved_by_admin"),
                         # Where the document applies, re-read from the ids the
                         # submit verified. Omitted when unset, like every other
                         # optional reference.
@@ -439,6 +478,10 @@ def _finish(item_id: ObjectId, document_id: ObjectId | None) -> None:
                 }
                 verb = "Created"
 
+            # Re-checked against the rows as they are NOW, on every path: a
+            # document created a moment ago by a racing upload of the same file
+            # is joined above, and must not be filed twice in one folder.
+            placements = new_placements_for(db, document, placements)
             rows = create_placements(db, document=document, placements=placements, copy=copy)
             code = format_display_id(document["display_id"])
             row_codes = [format_row_id(r["row_id"]) for r in rows]

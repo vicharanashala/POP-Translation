@@ -40,6 +40,7 @@ from pymongo import ASCENDING, DESCENDING
 
 from dashboard import events, zoho_layout
 from dashboard.config import DASHBOARD_TRANSLATE_CONCURRENCY, REPO_ROOT, TRANS_ENABLED
+from dashboard.access import require_admin
 from dashboard.db import get_db, get_session
 from dashboard.display_id import format_display_id
 from dashboard.models import (
@@ -117,7 +118,7 @@ def _person(value) -> str | None:
     return (str(value).strip() or None) if value is not None else None
 
 
-@router.post("/unique-documents/{document_id}/translate", status_code=202)
+@router.post("/unique-documents/{document_id}/translate", status_code=202, dependencies=[Depends(require_admin)])
 def start_translation(document_id: str, body: dict | None = Body(default=None), db=Depends(get_db)):
     """Queue the pipeline for this document. Optional JSON body
     `{"translated_by": "<display name>"}` -- recorded on the document when the
@@ -158,7 +159,7 @@ def start_translation(document_id: str, body: dict | None = Body(default=None), 
     return {"job_id": str(job_id)}
 
 
-@router.get("/translation-jobs", response_model=list[TranslationJobOut])
+@router.get("/translation-jobs", response_model=list[TranslationJobOut], dependencies=[Depends(require_admin)])
 def list_translation_jobs(status: TranslationJobStatus | None = None, db=Depends(get_db)):
     if status is not None:
         query = {"status": status.value}
@@ -172,7 +173,7 @@ def list_translation_jobs(status: TranslationJobStatus | None = None, db=Depends
     return _hydrate_jobs(db, rows)
 
 
-@router.post("/translation-jobs/{job_id}/cancel", status_code=202)
+@router.post("/translation-jobs/{job_id}/cancel", status_code=202, dependencies=[Depends(require_admin)])
 def cancel_translation_job(job_id: str, db=Depends(get_db)):
     """Real cancellation, not a soft un-flag: this sets the same _job_ctl
     cancel event pop_server.py's own /run endpoint uses, which _run_one_doc
@@ -191,7 +192,7 @@ def cancel_translation_job(job_id: str, db=Depends(get_db)):
     return {"cancelling": True}
 
 
-@router.delete("/translation-jobs/{job_id}", status_code=204)
+@router.delete("/translation-jobs/{job_id}", status_code=204, dependencies=[Depends(require_admin)])
 def delete_translation_job(job_id: str, db=Depends(get_db)):
     """Clear one finished job off the queue.
 
@@ -296,7 +297,7 @@ def _run_translation(job_id: ObjectId, document_id: ObjectId) -> None:
         tmp_pdf.unlink(missing_ok=True)
 
 
-@router.post("/unique-documents/{document_id}/translation", status_code=201)
+@router.post("/unique-documents/{document_id}/translation", status_code=201, dependencies=[Depends(require_admin)])
 async def upload_translation(document_id: str, file: UploadFile = File(...),
                              translated_by: str | None = Form(None), db=Depends(get_db)):
     """Attach a translation produced somewhere else.
@@ -361,7 +362,7 @@ async def upload_translation(document_id: str, file: UploadFile = File(...),
     return {"translation_file_id": translation_zoho_file_id}
 
 
-@router.delete("/unique-documents/{document_id}/translation", status_code=204)
+@router.delete("/unique-documents/{document_id}/translation", status_code=204, dependencies=[Depends(require_admin)])
 def delete_translation(document_id: str, db=Depends(get_db)):
     oid = _to_object_id(document_id, "document")
     doc = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": oid})
@@ -390,7 +391,7 @@ def delete_translation(document_id: str, db=Depends(get_db)):
     events.document_changed(oid)
 
 
-@router.post("/unique-documents/{document_id}/review", status_code=201)
+@router.post("/unique-documents/{document_id}/review", status_code=201, dependencies=[Depends(require_admin)])
 async def upload_review(document_id: str, file: UploadFile = File(...),
                         reviewed_by: str | None = Form(None), db=Depends(get_db)):
     oid = _to_object_id(document_id, "document")
@@ -424,7 +425,7 @@ async def upload_review(document_id: str, file: UploadFile = File(...),
             "review_zoho_file_id": review_zoho_file_id}
 
 
-@router.delete("/unique-documents/{document_id}/review", status_code=204)
+@router.delete("/unique-documents/{document_id}/review", status_code=204, dependencies=[Depends(require_admin)])
 def delete_review(document_id: str, db=Depends(get_db)):
     oid = _to_object_id(document_id, "document")
     doc = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": oid})
@@ -495,29 +496,29 @@ def _document_id_for_row(db, row_id: str) -> str:
     return str(row["unique_document_id"])
 
 
-@router.post("/documents/{row_id}/translate", status_code=202)
+@router.post("/documents/{row_id}/translate", status_code=202, dependencies=[Depends(require_admin)])
 def start_translation_for_row(row_id: str, body: dict | None = Body(default=None), db=Depends(get_db)):
     return start_translation(_document_id_for_row(db, row_id), body=body, db=db)
 
 
-@router.delete("/documents/{row_id}/translation", status_code=204)
+@router.delete("/documents/{row_id}/translation", status_code=204, dependencies=[Depends(require_admin)])
 def delete_translation_for_row(row_id: str, db=Depends(get_db)):
     return delete_translation(_document_id_for_row(db, row_id), db=db)
 
 
-@router.post("/documents/{row_id}/translation", status_code=201)
+@router.post("/documents/{row_id}/translation", status_code=201, dependencies=[Depends(require_admin)])
 async def upload_translation_for_row(row_id: str, file: UploadFile = File(...),
                                      translated_by: str | None = Form(None), db=Depends(get_db)):
     return await upload_translation(_document_id_for_row(db, row_id), file,
                                     translated_by=translated_by, db=db)
 
 
-@router.post("/documents/{row_id}/review", status_code=201)
+@router.post("/documents/{row_id}/review", status_code=201, dependencies=[Depends(require_admin)])
 async def upload_review_for_row(row_id: str, file: UploadFile = File(...),
                                 reviewed_by: str | None = Form(None), db=Depends(get_db)):
     return await upload_review(_document_id_for_row(db, row_id), file, reviewed_by=reviewed_by, db=db)
 
 
-@router.delete("/documents/{row_id}/review", status_code=204)
+@router.delete("/documents/{row_id}/review", status_code=204, dependencies=[Depends(require_admin)])
 def delete_review_for_row(row_id: str, db=Depends(get_db)):
     return delete_review(_document_id_for_row(db, row_id), db=db)

@@ -33,6 +33,7 @@ from pymongo import ASCENDING, DESCENDING
 
 from dashboard import vocabulary
 from dashboard.config import PAGE_SIZE
+from dashboard.access import require_editor
 from dashboard.db import get_db
 from dashboard.display_id import (
     format_display_id,
@@ -47,7 +48,6 @@ from dashboard.models import (
     COLL_DOCUMENTS,
     COLL_KVKS,
     COLL_LANGUAGES,
-    COLL_ORGANIZATIONS,
     COLL_STATES,
     COLL_TRANSLATION_JOBS,
     COLL_UNIQUE_DOCUMENTS,
@@ -303,14 +303,15 @@ _VOCABULARY_FILTER_KEYS = frozenset({
 _EXTRA_FILTER_KEYS = frozenset({"multi_placement"})
 
 
-def _reject_unknown_filters(request: Request) -> None:
-    plain = (_VOCABULARY_FILTER_KEYS | _EXTRA_FILTER_KEYS
-             | set(_DOCUMENT_FILTERS) | set(_JOINED_FILTERS))
+def _reject_unknown_filters(request: Request, *extra: dict) -> None:
+    """`extra`: filter tables this listing accepts beyond the shared ones."""
+    tables = (_DOCUMENT_FILTERS, _JOINED_FILTERS, *extra)
+    plain = _VOCABULARY_FILTER_KEYS | _EXTRA_FILTER_KEYS | {k for t in tables for k in t}
     # A range end only exists where the column has an order: _min/_max on
     # numbers, _from/_to on dates. `filter[state_id_from]` is not a filter, and
     # saying so beats answering it with the unfiltered table.
     known = set(plain)
-    for table in (_DOCUMENT_FILTERS, _JOINED_FILTERS):
+    for table in tables:
         for key, (_field, kind) in table.items():
             if kind == INT:
                 known |= {f"{key}_min", f"{key}_max"}
@@ -443,6 +444,16 @@ _JOINED_FILTERS = {
     "reviewed_at": ("reviewed_at", DATETIME),
 }
 
+# Filters on the documents list (GET /unique-documents) only. Who approved an
+# upload belongs to the DOCUMENT, not to where it is filed: an /add files an
+# existing document in more places and changes none of its fields, so a
+# placement has nothing of its own to show here and the main table leaves these
+# columns out -- and refuses the filters (400) rather than ignoring them.
+_DOCUMENT_ONLY_FILTERS = {
+    "approved_by_approver": ("approved_by_approver", TEXT),
+    "approved_by_admin": ("approved_by_admin", TEXT),
+}
+
 # Fields a PATCH on a main-table row applies to the ROW; everything else goes to
 # the document.
 _ROW_FIELDS = {"state_id", "crop_id", "organization_id"}
@@ -505,7 +516,8 @@ def _sortable(scope: str) -> dict[str, str]:
     document = {key: field for key, (field, _kind) in _JOINED_FILTERS.items()}
     if scope == "placements":
         return {**{k: f"doc.{f}" for k, f in document.items()}, **_SORT_ROW_FIELDS}
-    return {**document, **_SORT_DOC_FIELDS}
+    only = {key: field for key, (field, _kind) in _DOCUMENT_ONLY_FILTERS.items()}
+    return {**document, **only, **_SORT_DOC_FIELDS}
 
 
 def _ranked_ids(db, kinds: tuple[str, ...]) -> list:
@@ -900,7 +912,7 @@ def _location_refs(db, submitted: dict) -> tuple[dict, dict]:
     return move, unset
 
 
-@router.patch("/documents/{row_id}", response_model=DocumentOut)
+@router.patch("/documents/{row_id}", response_model=DocumentOut, dependencies=[Depends(require_editor)])
 def update_document(row_id: str, body: DocumentUpdate, db=Depends(get_db)):
     """Edit a row. state/crop change this placement; every other field changes
     the DOCUMENT, and therefore all of its placements."""
@@ -957,7 +969,7 @@ def update_document(row_id: str, body: DocumentUpdate, db=Depends(get_db)):
     return _joined_one(db, db[COLL_DOCUMENTS].find_one({"_id": oid}))
 
 
-@router.delete("/documents/{row_id}", status_code=204)
+@router.delete("/documents/{row_id}", status_code=204, dependencies=[Depends(require_editor)])
 def delete_document(row_id: str, db=Depends(get_db)):
     """Remove one placement.
 
@@ -977,7 +989,7 @@ def delete_document(row_id: str, db=Depends(get_db)):
 # -- the documents behind them -------------------------------------------------
 
 
-@router.delete("/unique-documents/{document_id}", status_code=204)
+@router.delete("/unique-documents/{document_id}", status_code=204, dependencies=[Depends(require_editor)])
 def delete_unique_document(document_id: str, db=Depends(get_db)):
     """Delete a document, its placements, and its files. Nothing survives.
 
@@ -1081,8 +1093,9 @@ def _apply_document_updates(db, unique_document_id, updates: dict, unset: dict |
 
 # filter[<key>] on unique_documents when it is queried directly. Same fields as
 # _JOINED_FILTERS, which is deliberate: a filter must mean the same thing whether
-# the caller starts from the main table or from the documents list.
-_UNIQUE_FILTERS = dict(_JOINED_FILTERS)
+# the caller starts from the main table or from the documents list. Plus the
+# document-only ones, which the main table does not show.
+_UNIQUE_FILTERS = {**_JOINED_FILTERS, **_DOCUMENT_ONLY_FILTERS}
 
 
 def _multi_placement(value: str):
@@ -1137,7 +1150,7 @@ def list_unique_documents(request: Request, db=Depends(get_db)):
     `filter[multi_placement]=true` for the documents filed in more than one
     place.
     """
-    _reject_unknown_filters(request)
+    _reject_unknown_filters(request, _DOCUMENT_ONLY_FILTERS)
     page, page_size = _pagination(request)
     sort = _sort_stages(db, request, "documents")
     query = _build_filter(request, _UNIQUE_FILTERS)
@@ -1185,7 +1198,7 @@ def get_unique_document(document_id: str, db=Depends(get_db)):
     return _unique_one(db, doc)
 
 
-@router.patch("/unique-documents/{document_id}", response_model=UniqueDocumentOut)
+@router.patch("/unique-documents/{document_id}", response_model=UniqueDocumentOut, dependencies=[Depends(require_editor)])
 def update_unique_document(document_id: str, body: UniqueDocumentUpdate, db=Depends(get_db)):
     """Edit a document. EVERYTHING lands on the document, and therefore shows on
     all of its placements -- district and kvk included.
@@ -1279,7 +1292,7 @@ def _document_for_placement(db, raw: str) -> dict:
 
 
 @router.post("/unique-documents/{document_id}/placements",
-             response_model=DocumentOut, status_code=201)
+             response_model=DocumentOut, status_code=201, dependencies=[Depends(require_editor)])
 def create_placement(document_id: str, body: PlacementCreate, db=Depends(get_db)):
     """File a document that already exists under one more state + folder.
 
@@ -1388,6 +1401,7 @@ _ENTRY_EXTRAS = {
     "KvkOut": (("code", "kvk_code"), ("address", "address"),
                ("district_id", "district_id"), ("state_id", "state_id")),
     "StateOut": (("code", "state_code"),),
+    "OrganizationOut": (("type", "type"), ("state", "state")),
 }
 
 
@@ -1447,6 +1461,16 @@ def list_uploaders(db=Depends(get_db)):
     return _names_in(db, "uploaded_by")
 
 
+@router.get("/approved-by-approver", response_model=list[str])
+def list_upload_approvers_named(db=Depends(get_db)):
+    return _names_in(db, "approved_by_approver")
+
+
+@router.get("/approved-by-admin", response_model=list[str])
+def list_admins_named(db=Depends(get_db)):
+    return _names_in(db, "approved_by_admin")
+
+
 @router.get("/translated-by", response_model=list[str])
 def list_translators(db=Depends(get_db)):
     return _names_in(db, "translated_by")
@@ -1472,13 +1496,15 @@ def list_crops(request: Request, db=Depends(get_db)):
 
 @router.get("/organizations", response_model=list[OrganizationOut])
 def list_organizations(request: Request, db=Depends(get_db)):
-    """Folders that are not crops: organisations, departments, groupings.
+    """The organisation master (agriai.organizations; staging's copy), for the
+    dropdown -- every entry, about 1,300, which the frontend searches.
     `?state_id=` narrows to those filed under that state."""
     query = _narrowed_by_state(db, request, "organization")
     if query is None:
         return []
     counts = vocabulary.usage_counts(db, "organization")
-    return sorted((_entry_out(OrganizationOut, row, counts) for row in db[COLL_ORGANIZATIONS].find(query)),
+    return sorted((_entry_out(OrganizationOut, row, counts)
+                   for row in vocabulary.entries(db, "organization", query)),
                   key=lambda o: o.name.lower())
 
 
@@ -1649,7 +1675,7 @@ def stats(db=Depends(get_db)):
         "files": docs.count_documents({}),
         "states": db[COLL_STATES].count_documents({}),
         "crops": len(vocabulary.name_map(db, "crop")),
-        "organizations": db[COLL_ORGANIZATIONS].count_documents({}),
+        "organizations": len(vocabulary.name_map(db, "organization")),
         "translated": docs.count_documents({"translation_status": "done"}),
         "reviewed": docs.count_documents({"review_status": "done"}),
     }

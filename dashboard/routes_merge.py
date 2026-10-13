@@ -37,6 +37,7 @@ from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, HTTPException
 
+from dashboard.access import require_editor
 from dashboard.db import get_db
 from dashboard.display_id import format_display_id, parse_display_id
 from dashboard.models import COLL_DOCUMENTS, COLL_TRANSLATION_JOBS, COLL_UNIQUE_DOCUMENTS, utcnow
@@ -98,7 +99,7 @@ def _find_candidates(db, document: dict) -> list:
     return []
 
 
-@router.post("/documents/{row_id}/find-duplicates", response_model=DuplicateCandidatesOut)
+@router.post("/documents/{row_id}/find-duplicates", response_model=DuplicateCandidatesOut, dependencies=[Depends(require_editor)])
 def find_duplicates_for_row(row_id: str, db=Depends(get_db)):
     """The button on a main-table row. Resolves the row to its document and
     asks for candidates."""
@@ -115,7 +116,7 @@ def find_duplicates_for_row(row_id: str, db=Depends(get_db)):
     )
 
 
-@router.post("/unique-documents/{document_id}/find-duplicates", response_model=DuplicateCandidatesOut)
+@router.post("/unique-documents/{document_id}/find-duplicates", response_model=DuplicateCandidatesOut, dependencies=[Depends(require_editor)])
 def find_duplicates_for_document(document_id: str, db=Depends(get_db)):
     """The same search, started from the document rather than a placement."""
     document = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": _to_object_id(document_id, "unique document")})
@@ -128,7 +129,7 @@ def find_duplicates_for_document(document_id: str, db=Depends(get_db)):
     )
 
 
-@router.post("/unique-documents/{document_id}/merge", response_model=MergeResult)
+@router.post("/unique-documents/{document_id}/merge", response_model=MergeResult, dependencies=[Depends(require_editor)])
 def merge_documents(document_id: str, body: MergeRequest, db=Depends(get_db)):
     """Absorb the named documents into this one.
 

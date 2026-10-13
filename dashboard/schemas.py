@@ -22,10 +22,11 @@ of 100 rows must not carry them.
 """
 from __future__ import annotations
 
+import enum
 from datetime import datetime, timezone
 from typing import Annotated, Generic, TypeVar
 
-from pydantic import AfterValidator, BaseModel, ConfigDict
+from pydantic import AfterValidator, BaseModel, ConfigDict, model_validator
 
 from dashboard.models import ReviewStatus, TranslationJobKind, TranslationJobStatus, TranslationStatus, UploadQueueStatus
 
@@ -93,16 +94,23 @@ class CropOut(BaseModel):
 
 
 class OrganizationOut(BaseModel):
-    """A folder that is not a crop: an organisation, department or grouping
-    ("ICAR - ...", "General").
+    """A folder that is not a crop: an entry of the organisation master
+    (agriai.organizations), e.g. "Central Rice Research Institute" or "General".
 
-    A WorkDrive FOLDER name. Read-only like every other vocabulary -- created
-    only by the corpus loader, which is where folder names come from.
+    Read-only like every other vocabulary. Until 2026-10 these were WorkDrive
+    folder names of our own; `crop_raw` on a placement still says which folder
+    it was found in.
     """
 
     id: str
     name: str
     document_count: int = 0
+    # As the master stores them, so two entries with one name can be told
+    # apart in the dropdown. `type` is "central", "state" or "district";
+    # `state` is a state NAME, not a pop_states id -- the master is another
+    # application's and is not keyed on LGD codes.
+    type: str | None = None
+    state: str | None = None
 
 
 class DistrictOut(BaseModel):
@@ -172,6 +180,9 @@ class FolderOut(BaseModel):
     name: str
     kind: str  # "crop" | "organization" -- send the id as crop_id / organization_id accordingly
     document_count: int = 0
+    # Organisations only (see OrganizationOut); None for a crop.
+    type: str | None = None
+    state: str | None = None
 
 
 class VocabularyRename(BaseModel):
@@ -254,9 +265,27 @@ class CopyLink(BaseModel):
     row_id: int | None = None
 
 
+_STORED_INTS = ("month_of_release", "year_of_release", "month_of_collection", "year_of_collection")
+
+
 class UniqueDocumentOut(DocumentMetadata):
     model_config = ConfigDict(from_attributes=True)
     id: str  # ObjectId, 24-char hex
+
+    @model_validator(mode="before")
+    @classmethod
+    def _blank_is_none(cls, data):
+        """A blank month/year as stored is no value, not a 500.
+
+        A bulk edit on 2026-09-18 wrote nine years as STRINGS, two of them ""
+        (ANNAM_05977, ANNAM_05982). "2022" parses; "" does not, and one such
+        row failed every listing page it landed on -- the whole page, not the
+        row. Only the output is lenient: a PATCH still has to send a number."""
+        if isinstance(data, dict):
+            for f in _STORED_INTS:
+                if isinstance(data.get(f), str) and not data[f].strip():
+                    data = {**data, f: None}
+        return data
     document_id: str  # ANNAM_##### -- names the DOCUMENT
 
     sha256: str | None = None
@@ -298,6 +327,13 @@ class UniqueDocumentOut(DocumentMetadata):
     # Who uploaded it (sent by the frontend with the upload). Read-only: it is
     # not on UniqueDocumentUpdate, so a PATCH cannot change it.
     uploaded_by: str | None = None
+    # Who passed it through the approval chain (see routes_uploads): the upload
+    # approver who approved it, and the admin who filed it as a new document.
+    # Display names, sent by the frontend with the action like translated_by.
+    # Read-only, like uploaded_by. Null on documents from before the chain and
+    # where a stage was skipped (an admin's or approver's own upload).
+    approved_by_approver: str | None = None
+    approved_by_admin: str | None = None
 
     placement_count: int = 0  # how many main-table rows point here
     # THE ANCHOR: which entry of duplicate_links is this document, as opposed to
@@ -517,6 +553,25 @@ class UploadCandidate(BaseModel):
     can_create_new: bool = True
 
 
+class UploadStage(str, enum.Enum):
+    """Who an upload is waiting on, in words. Derived from `level` (0 expert,
+    1 approver, 2 admin), never stored -- see routes_uploads._stage."""
+
+    approver = "approver"  # the upload approvers
+    admin = "admin"  # the admins
+    expert = "expert"  # declined back to whoever uploaded it
+
+
+class UploadActions(BaseModel):
+    can_edit: bool = False  # PATCH the metadata / placements
+    can_approve: bool = False  # approver: send it on to the admins
+    can_decline: bool = False  # send it back a stage, with a note
+    can_decide: bool = False  # admin: add / new (see each candidate's flags)
+    can_discard: bool = False  # admin: drop it
+    can_resubmit: bool = False  # uploader: send a declined item back to the approvers
+    can_remove: bool = False  # uploader: clear an item returned to them
+
+
 class UploadQueueItemOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str  # ObjectId, 24-char hex
@@ -540,8 +595,89 @@ class UploadQueueItemOut(BaseModel):
     # What the decision produced.
     created_document_id: str | None = None  # ANNAM id used or created
     created_row_ids: list[str] = []  # POP ids of the placements created
+
+    # The approval chain -- see routes_uploads. `expert` is the uploader's
+    # agriai.users id (None on items queued before the chain existed).
+    # `level` is where it waits: 0 its uploader, 1 the upload approvers, 2 the
+    # admins. `upload_level` is what its uploader is, on the same scale: 0
+    # anyone, 1 an upload approver, 2 an admin. It is never declined below
+    # `upload_level`. Each note is the latest decline from that stage.
+    expert: str | None = None
+    level: int
+    upload_level: int = 0
+    approver_note: str | None = None
+    admin_note: str | None = None
+    # Who approved it at each stage so far; copied onto the document when it
+    # is filed as a new one.
+    approved_by_approver: str | None = None
+    approved_by_admin: str | None = None
+    stage: UploadStage
+    # What THIS caller may do with the item. Empty on SSE events, which have no
+    # caller; the frontend refetches the queue on those.
+    actions: UploadActions = UploadActions()
     created_at: UTCDatetime
     updated_at: UTCDatetime
+
+
+class UploadEdit(BaseModel):
+    """PATCH body for an upload still in review: any subset of what the upload
+    form sent, by the approver or admin holding it. Same rules as the form --
+    ids only, `placements` in the form's per-state group shape. `uploaded_by`
+    is not here: who uploaded it is not something a reviewer corrects."""
+
+    model_config = ConfigDict(extra="forbid")
+    language: str | None = None
+    placements: list[dict] | None = None
+    district_id: str | None = None
+    kvk_id: str | None = None
+    format_original: str | None = None
+    advisory_type: str | None = None
+    advisory_scope: str | None = None
+    season: str | None = None
+    edition_revision_volume: str | None = None
+    date_of_release: str | None = None
+    month_of_release: int | None = None
+    year_of_release: int | None = None
+    date_of_collection: str | None = None
+    month_of_collection: int | None = None
+    year_of_collection: int | None = None
+    advisory_name: str | None = None
+    advisory_released_org: str | None = None
+    advisory_org_address: str | None = None
+    live_source_link: str | None = None
+    domain: str | None = None
+    verification_status: str | None = None
+    document_status: str | None = None
+
+
+class UploadDecline(BaseModel):
+    note: str
+
+
+# -- Access ----------------------------------------------------------------------
+
+
+class MeOut(BaseModel):
+    user_id: str
+    role: str
+    is_admin: bool
+    can_edit: bool
+    can_approve_uploads: bool
+    can_translate: bool
+
+
+class ApproverIn(BaseModel):
+    user_id: str  # agriai.users _id
+    name: str | None = None
+    email: str | None = None
+
+
+class ApproverOut(BaseModel):
+    user_id: str
+    name: str | None = None
+    email: str | None = None
+    added_by: str | None = None
+    added_at: UTCDatetime | None = None
 
 
 # -- Translation queue ---------------------------------------------------------

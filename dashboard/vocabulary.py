@@ -34,11 +34,19 @@ What that replaced, and why none of it is coming back:
                                     another application edits; staging reads its
                                     copy in pop_crops. Only type "crop" (or no
                                     type) is offered -- see _CROP_VISIBLE.
-  organization  pop_organizations   WorkDrive FOLDER names, created ONLY by the
-                                    corpus loader, which is the one place a
-                                    folder name comes from. It does its own name
-                                    matching (migrate_from_corpus._lookup_by_name)
-                                    so that this module has none.
+  organization  the org master      production reads agriai.organizations,
+                                    which another application edits; staging
+                                    reads its copy in pop_org_master. Entries
+                                    name themselves in `org_name`, which get(),
+                                    entries() and name_map() serve as `name`, so
+                                    nothing above this module sees the
+                                    difference. Until 2026-10 this was
+                                    pop_organizations: WorkDrive FOLDER names
+                                    from the corpus loader, 176 of which were
+                                    mapped by hand onto the master and their
+                                    placements re-pointed
+                                    (scripts/map_orgs_to_agriai.py). `crop_raw`
+                                    on a placement keeps the old folder name.
 
 `state_raw` / `crop_raw` stay on the placement as the folder names it was found
 under. They are PROVENANCE, not references: nothing resolves them, nothing
@@ -54,17 +62,16 @@ import re
 from bson import ObjectId
 from bson.errors import InvalidId
 
-from dashboard.db import crops_collection
+from dashboard.db import crops_collection, organizations_collection
 from dashboard.models import (
     COLL_DISTRICTS,
     COLL_DOCUMENTS,
     COLL_KVKS,
-    COLL_ORGANIZATIONS,
     COLL_STATES,
     COLL_UPLOAD_QUEUE_ITEMS,
 )
 
-# kind -> (our collection or None for the crop master, placement field)
+# kind -> (our collection or None for a master, placement field)
 #
 # No normaliser and no editable flag: both existed to serve names typed into a
 # form. A vocabulary is now read-only and addressed by id, so a kind is just
@@ -72,7 +79,7 @@ from dashboard.models import (
 # row here plus a collection, an index and its read routes.
 KINDS = {
     "state": (COLL_STATES, "state_id"),
-    "organization": (COLL_ORGANIZATIONS, "organization_id"),
+    "organization": (None, "organization_id"),
     "crop": (None, "crop_id"),
     "district": (COLL_DISTRICTS, "district_id"),
     "kvk": (COLL_KVKS, "kvk_id"),
@@ -130,9 +137,23 @@ def field(kind: str) -> str:
     return KINDS[kind][1]
 
 
+# The masters another application owns, for the kinds whose collection is None.
+_MASTERS = {"crop": crops_collection, "organization": organizations_collection}
+# A master's own name for its name field, where it is not `name`.
+_NAME_FIELD = {"organization": "org_name"}
+
+
 def coll(db, kind: str):
     name = KINDS[kind][0]
-    return crops_collection(db) if name is None else db[name]
+    return _MASTERS[kind](db) if name is None else db[name]
+
+
+def _named(kind: str, entry: dict | None) -> dict | None:
+    """The entry with its name under `name`, whatever the master calls it."""
+    source = _NAME_FIELD.get(kind)
+    if entry is not None and source:
+        entry["name"] = entry.get(source) or ""
+    return entry
 
 
 def _visible(kind: str) -> dict:
@@ -191,17 +212,18 @@ def children_of(db, kind: str, parent_id) -> list[dict]:
 
 def get(db, kind: str, entry_id) -> dict | None:
     oid = to_object_id(entry_id)
-    return None if oid is None else coll(db, kind).find_one({"_id": oid, **_visible(kind)})
+    return None if oid is None else _named(kind, coll(db, kind).find_one({"_id": oid, **_visible(kind)}))
 
 
 def entries(db, kind: str, query: dict | None = None):
-    return coll(db, kind).find({**(query or {}), **_visible(kind)})
+    return (_named(kind, e) for e in coll(db, kind).find({**(query or {}), **_visible(kind)}))
 
 
 def name_map(db, kind: str) -> dict[ObjectId, str]:
     """id -> name for a whole vocabulary. A few hundred rows, so a listing
     loads it once per request instead of joining inside the query."""
-    return {e["_id"]: e["name"] for e in coll(db, kind).find(_visible(kind), {"name": 1})}
+    source = _NAME_FIELD.get(kind, "name")
+    return {e["_id"]: e.get(source) or "" for e in coll(db, kind).find(_visible(kind), {source: 1})}
 
 
 def usage_counts(db, kind: str) -> dict[ObjectId, int]:
