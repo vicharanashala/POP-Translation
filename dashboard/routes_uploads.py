@@ -251,6 +251,9 @@ def _item_out(item: dict, who: Caller | None = None) -> UploadQueueItemOut:
     data = dict(item)
     data["id"] = str(data.pop("_id"))
     data["placements"] = _stringify_ids(data.get("placements"))
+    # The uploader by name, from the form's own `uploaded_by` -- `expert` is an
+    # account id, which nobody reading the queue can place (UM-002).
+    data["uploaded_by"] = ((data.get("metadata") or {}).get("uploaded_by") or "").strip() or None
     # `metadata` is served as a plain dict, so an ObjectId in it reaches the
     # JSON serializer raw and fails the whole response with a 500. The location
     # refs are stored as ObjectIds -- they are references, and the queue worker
@@ -513,15 +516,56 @@ def get_upload_file(item_id: str, who: Caller = Depends(caller), db=Depends(get_
 def _held_item(db, item_id: str, who: Caller, *stages: UploadStage,
                statuses: tuple = _REVIEWABLE) -> tuple[ObjectId, dict]:
     """The item, if it is waiting on `who` at one of `stages` and in a status
-    where acting on it means something. 404 if they cannot see it at all, 403
-    if they can but it is not theirs to act on, 409 if it is mid-work."""
-    oid, item = _visible_item(db, item_id, who)
+    where acting on it means something.
+
+    When it is not, the answer names the reason, because the button that sent
+    the request was on the caller's screen a moment ago. A blanket "upload not
+    found" told an approver taken off the list, and one who lost a race to
+    another approver, the same untrue thing (UM-009):
+
+        404  it is gone (filed or discarded), or the caller never had any
+             business with it -- whether it exists is not theirs to know
+        409  someone else acted first: it moved on to another level
+        403  the caller can see it but it is not theirs to act on, or it is
+             still with the approvers and the caller is no longer one
+        409  (below) it is mid-work
+    """
+    oid = _to_object_id(item_id)
+    item = db[COLL_UPLOAD_QUEUE_ITEMS].find_one({"_id": oid})
+    if item is None:
+        raise HTTPException(404, "this upload is no longer in the queue -- it was filed or discarded")
     stage = _stage(item)
     if stage not in stages or not _holds(who, stage, item):
-        raise HTTPException(403, f"this upload is with the {stage.value}s -- not yours to act on")
+        if ((UploadStage.approver in stages and who.can_approve_uploads)
+                or (UploadStage.admin in stages and who.is_admin)):
+            # The caller holds one of the stages this action is for, so the
+            # item was there when they saw it and someone else moved it.
+            raise HTTPException(409, _moved_on(item))
+        if (item.get("expert") == who.user_id
+                or (stage is UploadStage.approver and who.can_approve_uploads)
+                or (stage is UploadStage.admin and who.is_admin)):
+            raise HTTPException(403, f"this upload is with the {stage.value}s -- not yours to act on")
+        if stage is UploadStage.approver and UploadStage.approver in stages:
+            # Still where an approver would have seen it: it is the caller who
+            # changed, taken off the approval list since the page loaded.
+            raise HTTPException(403, "you are no longer an upload approver")
+        raise HTTPException(404, "upload not found")
     if item["status"] not in statuses:
         raise HTTPException(409, f"upload is {item['status']}, not {' or '.join(statuses)}")
     return oid, item
+
+
+def _moved_on(item: dict) -> str:
+    """Why an item is no longer where the caller saw it -- someone else acted
+    first. Names the approver where the item says who it was."""
+    stage = _stage(item)
+    if stage is UploadStage.admin:
+        name = item.get("approved_by_approver")
+        return (f"already approved by {name}" if name else "already approved") + \
+            " -- it is now with the admins; refresh"
+    if stage is UploadStage.expert:
+        return "it has been declined back to its uploader -- refresh"
+    return "it is with the upload approvers now -- refresh"
 
 
 def _decidable(db, item_id: str, who: Caller) -> tuple[ObjectId, dict]:
@@ -567,19 +611,22 @@ def approve_upload(item_id: str, body: dict = Body(default=None), who: Caller = 
     Optional body `{"approved_by": "<display name>"}` -- see _approver_name."""
     oid, _ = _held_item(db, item_id, who, UploadStage.approver,
                         statuses=(UploadQueueStatus.awaiting_review.value,))
-    return _move(db, oid, UploadStage.approver, who, level=2,
+    # The approvers' own note asked the uploader for something that has now
+    # been passed; left on, the admins would read a settled reason as current.
+    return _move(db, oid, UploadStage.approver, who, level=2, approver_note=None,
                  approved_by_approver=_approver_name(db, body, who, UPLOAD_LIST))
 
 
 @router.post("/uploads/{item_id}/resubmit", response_model=UploadQueueItemOut)
 def resubmit_upload(item_id: str, who: Caller = Depends(caller), db=Depends(get_db)):
     """The uploader sends a declined item back to the upload approvers, after
-    correcting it with PATCH. The approvers' note stays on it, so they can see
-    what they asked for. A wrong FILE cannot be corrected this way -- that is
-    still remove and upload again."""
+    correcting it with PATCH. The approvers' note is cleared: the uploader has
+    answered it, and an approver opening the item again should not read it as
+    a current objection (UM-005). A wrong FILE cannot be corrected this way --
+    that is still remove and upload again."""
     oid, _ = _held_item(db, item_id, who, UploadStage.expert,
                         statuses=(UploadQueueStatus.awaiting_review.value,))
-    return _move(db, oid, UploadStage.expert, who, level=1)
+    return _move(db, oid, UploadStage.expert, who, level=1, approver_note=None)
 
 
 @router.post("/uploads/{item_id}/decline", response_model=UploadQueueItemOut)

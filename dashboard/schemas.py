@@ -603,6 +603,9 @@ class UploadQueueItemOut(BaseModel):
     # anyone, 1 an upload approver, 2 an admin. It is never declined below
     # `upload_level`. Each note is the latest decline from that stage.
     expert: str | None = None
+    # The uploader's display name, as the upload form sent it (metadata's
+    # `uploaded_by`). For showing; `expert` stays the id that decides access.
+    uploaded_by: str | None = None
     level: int
     upload_level: int = 0
     approver_note: str | None = None

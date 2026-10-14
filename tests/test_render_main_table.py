@@ -2919,7 +2919,7 @@ def test_an_expert_upload_goes_through_the_approvers_to_the_admins(client, db, m
     """
     expert, other = _as(str(ObjectId())), _as(str(ObjectId()))
     approver = _as(members("upload"))
-    item_id = _submit(client, headers=expert,
+    item_id = _submit(client, headers=expert, uploaded_by="Render Test Expert",
                       placements_json=_placements(client, ("Karnataka", ["Paddy"])))
     try:
         item = _await_review(client, item_id, headers=expert)
@@ -2931,10 +2931,16 @@ def test_an_expert_upload_goes_through_the_approvers_to_the_admins(client, db, m
         assert item_id not in _queue_ids(client, other)
         assert client.get(f"/dashboard/uploads/{item_id}", headers=other).status_code == 404
         assert item_id not in _queue_ids(client, None)
-        assert client.post(f"/dashboard/uploads/{item_id}/add").status_code == 404
+        # An admin's /add on it is a 409 that says where it is, not a 404: an
+        # admin meets an item at the approvers only after another admin
+        # declined it back, i.e. after losing a race (UM-009).
+        early = client.post(f"/dashboard/uploads/{item_id}/add")
+        assert early.status_code == 409 and "upload approvers" in early.json()["detail"]
 
         # The approver: preview, edit, approve.
         seen = next(i for i in client.get("/dashboard/uploads", headers=approver).json() if i["id"] == item_id)
+        # The uploader by name, not only by account id (UM-002).
+        assert seen["uploaded_by"] == "Render Test Expert"
         assert seen["actions"] == {"can_edit": True, "can_approve": True, "can_decline": True,
                                    "can_decide": False, "can_discard": False, "can_resubmit": False,
                                    "can_remove": False}
@@ -2951,6 +2957,10 @@ def test_an_expert_upload_goes_through_the_approvers_to_the_admins(client, db, m
                             json={"uploaded_by": "someone else"}).status_code == 422
         assert client.post(f"/dashboard/uploads/{item_id}/approve", headers=approver).json()["stage"] == "admin"
         assert item_id not in _queue_ids(client, approver)
+        # A second approver clicking Approve a moment later is told it was
+        # already approved, and by whom -- not "upload not found" (UM-009).
+        late = client.post(f"/dashboard/uploads/{item_id}/approve", headers=approver)
+        assert late.status_code == 409 and late.json()["detail"].startswith("already approved by Render Test")
 
         # The admin declines it back to the approvers, with a note.
         assert client.post(f"/dashboard/uploads/{item_id}/decline", json={"note": "  "}).status_code == 400
@@ -2972,21 +2982,31 @@ def test_an_expert_upload_goes_through_the_approvers_to_the_admins(client, db, m
 
         # The uploader corrects it and sends it back to the approvers -- nobody
         # else may (to them it is not even visible while it is with its
-        # uploader), and the approvers' note stays on it.
+        # uploader), and the approvers' note is cleared once it is answered
+        # (UM-005).
         fix = {"season": "Kharif", "placements": json.loads(_placements(client, ("Keralam", ["Paddy"])))}
         assert client.patch(f"/dashboard/uploads/{item_id}", headers=other, json=fix).status_code == 404
-        assert client.patch(f"/dashboard/uploads/{item_id}", headers=approver, json=fix).status_code == 404
+        # An approver is told it went back to the uploader (409), a stranger
+        # learns nothing (404).
+        assert client.patch(f"/dashboard/uploads/{item_id}", headers=approver, json=fix).status_code == 409
         fixed = client.patch(f"/dashboard/uploads/{item_id}", headers=expert, json=fix)
+
         assert fixed.status_code == 200, fixed.text
         assert fixed.json()["metadata"]["season"] == "Kharif"
         assert client.post(f"/dashboard/uploads/{item_id}/resubmit", headers=approver).status_code == 404
         again = client.post(f"/dashboard/uploads/{item_id}/resubmit", headers=expert)
         assert again.status_code == 200, again.text
-        assert (again.json()["stage"], again.json()["approver_note"]) == ("approver", "please re-scan")
+        assert (again.json()["stage"], again.json()["approver_note"]) == ("approver", None)
         assert client.post(f"/dashboard/uploads/{item_id}/resubmit", headers=expert).status_code == 403
         assert item_id in _queue_ids(client, approver)
         # Once it is with the approvers again, the uploader can no longer edit it.
         assert client.patch(f"/dashboard/uploads/{item_id}", headers=expert, json=fix).status_code == 403
+
+        # Taken off the approval list while the item still waits there: told
+        # so, rather than "upload not found" (UM-009).
+        gone = _as(str(ObjectId()))
+        refused = client.post(f"/dashboard/uploads/{item_id}/approve", headers=gone)
+        assert (refused.status_code, refused.json()["detail"]) == (403, "you are no longer an upload approver")
 
         # Declined once more, and this time the uploader removes it instead.
         client.post(f"/dashboard/uploads/{item_id}/decline", headers=approver, json={"note": "still wrong"})
@@ -3039,7 +3059,8 @@ def test_a_concurrent_decision_on_one_upload_lands_once(client, db, members):
     try:
         _await_review(client, item_id, headers=expert)
         assert client.post(f"/dashboard/uploads/{item_id}/approve", headers=first).status_code == 200
-        assert client.post(f"/dashboard/uploads/{item_id}/approve", headers=second).status_code == 404
+        late = client.post(f"/dashboard/uploads/{item_id}/approve", headers=second)
+        assert late.status_code == 409 and late.json()["detail"].startswith("already approved"), late.text
     finally:
         client.post(f"/dashboard/uploads/{item_id}/cancel")
         _drop_upload(item_id)
@@ -3127,7 +3148,9 @@ def test_two_admins_deciding_one_upload_at_once_lands_once(client, db, scratch):
         with ThreadPoolExecutor(3) as pool:
             codes = list(pool.map(fire, ["add", "add", "cancel"]))
         winners = [c for c in codes if c in (200, 204)]
-        assert len(winners) == 1 and all(c == 409 for c in codes if c not in (200, 204)), codes
+        # A loser is told someone acted first: 409 while the item is still
+        # there, 404 "no longer in the queue" once the winner discarded it.
+        assert len(winners) == 1 and all(c in (404, 409) for c in codes if c not in (200, 204)), codes
 
         deadline = time.time() + 30
         while time.time() < deadline and client.get(f"/dashboard/uploads/{item_id}").status_code != 404:
