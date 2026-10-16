@@ -543,6 +543,19 @@ def new_translation_job(*, document_id, kind: TranslationJobKind) -> dict:
         "pages_done": None,
         "total_pages": None,
         "error_message": None,
+        # One entry per page, in page order: the WorkDrive link of that page's
+        # translated .docx once it is finished, "" until then. Set once the PDF
+        # is split; a failed job keeps them, so translating again only redoes
+        # the "" pages. Emptied when the job ends done or cancelled (the page
+        # files are trashed then). page_file_ids is the same list as file ids.
+        "page_links": [],
+        "page_file_ids": [],
+        # The original the pages were cut from -- if the document's file has
+        # changed since, the stored pages are not its pages any more.
+        "source_file_id": None,
+        # Bumped every few seconds while this server holds the job (queued or
+        # running); a job whose heartbeat stops was lost to a restart.
+        "heartbeat_at": now,
         "created_at": now,
         "updated_at": now,
     }

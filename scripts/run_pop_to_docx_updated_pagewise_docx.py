@@ -282,6 +282,62 @@ def split_pdf_to_page_folders(
 # - googleSearch enabled
 # ---------------------------------------------------------------------
 
+# ---------------------------------------------------------------------
+# Time limit and cancellation for one Gemini attempt.
+# A Gemini call has no time limit of its own: one that never answers blocks
+# its page forever, and a job cancel (checked only between steps) waits on it
+# forever too. So each attempt runs in a helper thread and the page thread
+# waits on it a second at a time -- checking for a cancel each second and
+# giving up once the attempt has run GEMINI_ATTEMPT_TIMEOUT_SECONDS.
+# ---------------------------------------------------------------------
+
+GEMINI_ATTEMPT_TIMEOUT_SECONDS = int(os.environ.get("GEMINI_ATTEMPT_TIMEOUT_SECONDS") or 60)
+
+try:  # present when run inside pop_server; absent when the script runs alone
+    import _job_ctl as _ctl
+except ImportError:
+    _ctl = None
+
+
+def _check_cancel():
+    if _ctl is not None:
+        _ctl.check_cancel()
+
+
+def _sleep_cancellable(seconds: float):
+    end = time.monotonic() + seconds
+    while (left := end - time.monotonic()) > 0:
+        _check_cancel()
+        time.sleep(min(1.0, left))
+
+
+def _run_with_deadline(fn, timeout_seconds: float):
+    """Run fn() in a helper thread; return its result, re-raise its error, or
+    raise TimeoutError after timeout_seconds. A cancel raises at once. A
+    thread given up on is left to die on the client's own HTTP timeout; its
+    result is thrown away."""
+    box = {}
+    finished = threading.Event()
+
+    def run():
+        try:
+            box["value"] = fn()
+        except BaseException as e:  # noqa: BLE001 -- handed back to the waiting thread
+            box["error"] = e
+        finally:
+            finished.set()
+
+    threading.Thread(target=run, daemon=True, name="gemini-attempt").start()
+    deadline = time.monotonic() + timeout_seconds
+    while not finished.wait(1.0):
+        _check_cancel()
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"no complete reply from Gemini within {timeout_seconds}s")
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
 def make_generate_content_config(enable_google_search: bool = True, thinking_level: str = "HIGH"):
     tools = []
 
@@ -323,7 +379,11 @@ def translate_page_pdf_to_html_gemini(
     png_bytes = render_pdf_page_to_png_bytes(pdf_path)
     last_error = None
 
-    client = genai.Client(api_key=api_key)
+    # The HTTP timeout only frees a helper thread _run_with_deadline gave up on.
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=GEMINI_ATTEMPT_TIMEOUT_SECONDS * 1000),
+    )
     generate_content_config = make_generate_content_config(
         enable_google_search=enable_google_search,
         thinking_level=thinking_level,
@@ -333,54 +393,60 @@ def translate_page_pdf_to_html_gemini(
     image_size_kb = len(png_bytes) / 1024
 
     for attempt in range(1, max_retries + 1):
+        _check_cancel()
         attempt_start = time.perf_counter()
 
         try:
-            collected = []
-            usage_metadata = None
-
             log(
                 f"{pname} | attempt {attempt}/{max_retries} | "
-                f"request sent to Gemini | image_size={image_size_kb:.1f} KB | thinking_level={thinking_level}"
+                f"request sent to Gemini | image_size={image_size_kb:.1f} KB | thinking_level={thinking_level} | "
+                f"time_limit={GEMINI_ATTEMPT_TIMEOUT_SECONDS}s"
             )
 
-            chunk_count = 0
-            text_chunk_count = 0
-            last_stream_log = time.perf_counter()
+            def stream(attempt=attempt, attempt_start=attempt_start):
+                collected = []
+                usage_metadata = None
+                chunk_count = 0
+                text_chunk_count = 0
+                last_stream_log = time.perf_counter()
 
-            for chunk in client.models.generate_content_stream(
-                model=model,
-                contents=[
-                    types.Content(
-                        role="user",
-                        parts=[
-                            types.Part.from_text(text=prompt),
-                            types.Part.from_bytes(
-                                data=png_bytes,
-                                mime_type="image/png",
-                            ),
-                        ],
-                    ),
-                ],
-                config=generate_content_config,
-            ):
-                chunk_count += 1
+                for chunk in client.models.generate_content_stream(
+                    model=model,
+                    contents=[
+                        types.Content(
+                            role="user",
+                            parts=[
+                                types.Part.from_text(text=prompt),
+                                types.Part.from_bytes(
+                                    data=png_bytes,
+                                    mime_type="image/png",
+                                ),
+                            ],
+                        ),
+                    ],
+                    config=generate_content_config,
+                ):
+                    chunk_count += 1
 
-                if getattr(chunk, "usage_metadata", None):
-                    usage_metadata = chunk.usage_metadata
+                    if getattr(chunk, "usage_metadata", None):
+                        usage_metadata = chunk.usage_metadata
 
-                if text := chunk.text:
-                    collected.append(text)
-                    text_chunk_count += 1
+                    if text := chunk.text:
+                        collected.append(text)
+                        text_chunk_count += 1
 
-                now = time.perf_counter()
-                if now - last_stream_log >= 30:
-                    log(
-                        f"{pname} | attempt {attempt} | still streaming... "
-                        f"elapsed={format_duration(now - attempt_start)} | "
-                        f"chunks={chunk_count} | text_chunks={text_chunk_count}"
-                    )
-                    last_stream_log = now
+                    now = time.perf_counter()
+                    if now - last_stream_log >= 30:
+                        log(
+                            f"{pname} | attempt {attempt} | still streaming... "
+                            f"elapsed={format_duration(now - attempt_start)} | "
+                            f"chunks={chunk_count} | text_chunks={text_chunk_count}"
+                        )
+                        last_stream_log = now
+                return collected, usage_metadata, chunk_count, text_chunk_count
+
+            collected, usage_metadata, chunk_count, text_chunk_count = _run_with_deadline(
+                stream, GEMINI_ATTEMPT_TIMEOUT_SECONDS)
 
             full_text = "".join(collected).strip()
             attempt_elapsed = time.perf_counter() - attempt_start
@@ -427,7 +493,7 @@ def translate_page_pdf_to_html_gemini(
 
             if attempt < max_retries:
                 log(f"{pname} | waiting {retry_wait_seconds}s before retry")
-                time.sleep(retry_wait_seconds)
+                _sleep_cancellable(retry_wait_seconds)
 
     raise RuntimeError(f"Failed after {max_retries} attempts for {pdf_path}") from last_error
 
@@ -549,7 +615,7 @@ def translate_page_pdf_to_html_minimax(
 
             if attempt < max_retries:
                 log(f"{pname} | waiting {retry_wait_seconds}s before retry")
-                time.sleep(retry_wait_seconds)
+                _sleep_cancellable(retry_wait_seconds)
 
     raise RuntimeError(f"Failed after {max_retries} attempts for {pdf_path}") from last_error
 
@@ -700,7 +766,7 @@ def translate_page_pdf_to_html_openai(
 
             if attempt < max_retries:
                 log(f"{pname} | waiting {retry_wait_seconds}s before retry")
-                time.sleep(retry_wait_seconds)
+                _sleep_cancellable(retry_wait_seconds)
 
     raise RuntimeError(f"Failed after {max_retries} attempts for {pdf_path}") from last_error
 
@@ -804,7 +870,7 @@ def translate_page_pdf_to_html_claude(
 
             if attempt < max_retries:
                 log(f"{pname} | waiting {retry_wait_seconds}s before retry")
-                time.sleep(retry_wait_seconds)
+                _sleep_cancellable(retry_wait_seconds)
 
     raise RuntimeError(f"Failed after {max_retries} attempts for {pdf_path}") from last_error
 

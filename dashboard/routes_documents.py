@@ -1029,6 +1029,9 @@ def delete_unique_document(document_id: str, db=Depends(get_db)):
         *[c.get("zoho_file_id") for c in doc.get("duplicate_links") or []],
         doc.get("translation_zoho_file_id"),
         doc.get("review_zoho_file_id"),
+        # A failed translation's finished pages.
+        *[f for j in db[COLL_TRANSLATION_JOBS].find({"document_id": oid}, {"page_file_ids": 1})
+          for f in j.get("page_file_ids") or []],
     ):
         if candidate and candidate not in file_ids:
             file_ids.append(candidate)

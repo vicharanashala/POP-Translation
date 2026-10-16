@@ -699,6 +699,9 @@ class TranslationJobOut(BaseModel):
     pages_done: int | None = None
     total_pages: int | None = None
     error_message: str | None = None
+    # One per page: the WorkDrive link of the page's translated .docx, "" for a
+    # page not translated yet. Kept on a failed job; empty once done/cancelled.
+    page_links: list[str] = []
     created_at: UTCDatetime
     updated_at: UTCDatetime
 
