@@ -59,6 +59,7 @@ from dashboard.models import (
     link_placement,
     new_copy_link,
     new_document,
+    sha_match,
     new_unique_document,
     new_upload_candidate,
     utcnow,
@@ -217,7 +218,7 @@ def find_candidates(db, sha: str, placements: list[dict], limit: int = 3) -> lis
     around it -- the queue item, the three-way decision, the endpoints -- already
     works against a list and does not care how it was produced.
     """
-    matches = list(db[COLL_UNIQUE_DOCUMENTS].find({"sha256": sha}).limit(limit))
+    matches = list(db[COLL_UNIQUE_DOCUMENTS].find(sha_match(sha)).limit(limit))
     out = []
     for document in matches:
         candidate = new_upload_candidate(
@@ -257,7 +258,7 @@ def find_or_create_document(db, *, sha: str, fields: dict) -> dict:
     the same file race, where the second must join the first's document rather
     than fail on the unique sha256 index.
     """
-    existing = db[COLL_UNIQUE_DOCUMENTS].find_one({"sha256": sha})
+    existing = db[COLL_UNIQUE_DOCUMENTS].find_one(sha_match(sha))
     if existing is not None:
         return existing
     display_id = free_display_ids(db, 1)[0]
@@ -417,7 +418,7 @@ def _finish(item_id: ObjectId, document_id: ObjectId | None) -> None:
                 }
                 verb = "Filed"
             elif item.get("sha256") and (existing := db[COLL_UNIQUE_DOCUMENTS].find_one(
-                    {"sha256": item["sha256"]})) is not None:
+                    sha_match(item["sha256"]))) is not None:
                 # NEW, but this exact file is already a document: an earlier
                 # attempt at this item got as far as creating it (a retry
                 # after a failure), or another upload of the file was filed in

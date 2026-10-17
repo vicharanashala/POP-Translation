@@ -566,8 +566,8 @@ def test_merge_does_not_move_the_anchor(client, db, scratch):
                    copy_link=new_copy_link(zoho_file_id="fidOTHER", shareable_link="http://example/o",
                                            shareable_name="other.pdf"))
     try:
-        client.post(f"/dashboard/unique-documents/{survivor['_id']}/merge",
-                    json={"absorb": [str(other["_id"])]})
+        assert client.post(f"/dashboard/unique-documents/{survivor['_id']}/merge",
+                           json={"absorb": [str(other["_id"])]}).status_code == 200
         after = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": survivor["_id"]})
         assert after["representative_file_id"] == before
         assert "fidOTHER" in [l["zoho_file_id"] for l in after["duplicate_links"]]
@@ -797,46 +797,220 @@ def test_find_duplicates_is_empty_but_says_why(client, scratch):
     assert out["document_id"].startswith("ANNAM_")
 
 
-def test_merge_repoints_placements_and_never_deletes_a_row(client, db, scratch):
-    """A merge changes which document a folder entry is understood to hold. It
-    does not claim the folder entry stopped existing."""
+def _merge_victim(db, *, name, sha, folders, file_prefix, **fields):
+    """A throwaway document filed under `folders` (Scratchland organisations),
+    one copy per placement, the way the corpus files them."""
     from dashboard.display_id import free_display_ids, free_row_ids
     from dashboard.models import (
         COLL_DOCUMENTS, COLL_UNIQUE_DOCUMENTS, link_placement,
         new_copy_link, new_unique_document,
     )
 
-    survivor, survivor_rows = scratch
-    other = new_unique_document(display_id=free_display_ids(db, 1)[0],
-                                sha256="mergeme" + "0" * 57, shareable_name="merge-me.pdf")
-    other["_id"] = db[COLL_UNIQUE_DOCUMENTS].insert_one(other).inserted_id
-    row_id = free_row_ids(db, 1)[0]
-    row = _placement_row(db, row_id=row_id, unique_document_id=other["_id"],
-                         state="Scratchland", crop="Scratch Gamma", source="upload")
-    row["_id"] = db[COLL_DOCUMENTS].insert_one(row).inserted_id
-    link_placement(db, other["_id"], row_obj_id=row["_id"], row_id=row_id,
-                   copy_link=new_copy_link(zoho_file_id="fidX", shareable_link="http://example/x",
-                                           shareable_name="merge-me.pdf"))
-    rows_before = db[COLL_DOCUMENTS].count_documents({})
+    doc = new_unique_document(display_id=free_display_ids(db, 1)[0], sha256=sha + "0" * (64 - len(sha)),
+                              shareable_name=name, representative_file_id=f"{file_prefix}0", **fields)
+    doc["_id"] = db[COLL_UNIQUE_DOCUMENTS].insert_one(doc).inserted_id
+    rows = []
+    for i, (row_id, folder) in enumerate(zip(free_row_ids(db, len(folders)), folders)):
+        row = _placement_row(db, row_id=row_id, unique_document_id=doc["_id"],
+                             state="Scratchland", crop=folder, source="upload")
+        row["_id"] = db[COLL_DOCUMENTS].insert_one(row).inserted_id
+        link_placement(db, doc["_id"], row_obj_id=row["_id"], row_id=row_id,
+                       copy_link=new_copy_link(zoho_file_id=f"{file_prefix}{i}",
+                                               shareable_link=f"http://example/{file_prefix}{i}",
+                                               shareable_name=name))
+        rows.append(row)
+    return doc, rows
+
+
+def _cleanup(db, docs_and_rows):
+    from dashboard.models import COLL_DOCUMENTS, COLL_UNIQUE_DOCUMENTS
+
+    for doc, rows in docs_and_rows:
+        db[COLL_DOCUMENTS].delete_many({"_id": {"$in": [r["_id"] for r in rows]}})
+        db[COLL_UNIQUE_DOCUMENTS].delete_one({"_id": doc["_id"]})
+
+
+def test_merge_moves_new_placements_and_drops_ones_already_filed(client, db, scratch):
+    """The team's rule (2026-10-17). A placement in a folder the survivor is
+    already filed in is deleted; every other one moves across keeping its POP
+    id. The merged document is deleted; every one of its FILES stays listed on
+    the survivor, tagged with where it came from."""
+    from dashboard.models import COLL_DOCUMENTS, COLL_UNIQUE_DOCUMENTS
+
+    survivor, survivor_rows = scratch  # filed under Scratch Alpha and Scratch Beta
+    other, other_rows = _merge_victim(db, name="merge-me.pdf", sha="mergeme",
+                                      folders=("Scratch Alpha", "Scratch Gamma"), file_prefix="fidM")
+    try:
+        resp = client.post(f"/dashboard/unique-documents/{survivor['_id']}/merge",
+                           json={"absorb": [str(other["_id"])], "merged_by": "Test Merger"})
+        assert resp.status_code == 200, resp.text
+        result = resp.json()
+        assert result["placements_moved"] == 1 and result["placements_dropped"] == 1
+        assert result["placement_count"] == 3 and result["links_added"] == 2
+        assert result["absorbed"] == ["merge-me.pdf"]
+
+        assert db[COLL_DOCUMENTS].find_one({"_id": other_rows[0]["_id"]}) is None  # Alpha: dropped
+        moved = db[COLL_DOCUMENTS].find_one({"_id": other_rows[1]["_id"]})       # Gamma: moved
+        assert moved["unique_document_id"] == survivor["_id"]
+        assert moved["row_id"] == other_rows[1]["row_id"]
+        assert db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": other["_id"]}) is None
+
+        out = client.get(f"/dashboard/unique-documents/{survivor['_id']}").json()
+        assert "merged_from" not in out
+        own = [l for l in out["duplicate_links"] if l["merged_document"] is None]
+        merged = [l for l in out["duplicate_links"] if l["merged_document"] is not None]
+        assert len(own) == 2 and all(l["merged_by"] == "system" and l["merged_at"] is None for l in own)
+        assert sorted(l["zoho_file_id"] for l in merged) == ["fidM0", "fidM1"]
+        assert all(l["merged_document"] == "merge-me.pdf" and l["merged_by"] == "Test Merger"
+                   and l["merged_at"] and l["row_id"] is None for l in merged)
+        assert out["representative_file_id"] == survivor.get("representative_file_id")
+
+        # The merged fingerprint: on every merged copy and in A's list, so the
+        # upload duplicate check finds A when B's file comes in again.
+        stored = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": survivor["_id"]})
+        assert stored["merged_sha256s"] == [other["sha256"]]
+        assert all(l.get("merged_sha256") == other["sha256"]
+                   for l in stored["duplicate_links"] if l.get("merged_document"))
+        from dashboard.queue_worker import find_candidates
+        assert [c["document_code"] for c in find_candidates(db, other["sha256"], [])] == [out["document_id"]]
+    finally:
+        _cleanup(db, [(other, other_rows)])
+
+
+def test_a_second_merged_document_with_the_same_name_gets_its_own_group(client, db, scratch):
+    survivor, _rows = scratch
+    one, one_rows = _merge_victim(db, name="same.pdf", sha="sameone", folders=("Scratch Gamma",), file_prefix="fidP")
+    two, two_rows = _merge_victim(db, name="same.pdf", sha="sametwo", folders=("Scratch Delta",), file_prefix="fidQ")
+    try:
+        assert client.post(f"/dashboard/unique-documents/{survivor['_id']}/merge",
+                           json={"absorb": [str(one["_id"]), str(two["_id"])]}).status_code == 200
+        groups = {l["zoho_file_id"]: l["merged_document"] for l in
+                  client.get(f"/dashboard/unique-documents/{survivor['_id']}").json()["duplicate_links"]}
+        assert (groups["fidP0"], groups["fidQ0"]) == ("same.pdf", "same.pdf (2)")
+    finally:
+        _cleanup(db, [(one, one_rows), (two, two_rows)])
+
+
+def test_merge_keeps_an_earlier_merges_tags(client, db, scratch):
+    """C merged into B, then B into A: C's files stay grouped under C."""
+    survivor, _rows = scratch
+    b, b_rows = _merge_victim(db, name="b.pdf", sha="chainb", folders=("Scratch Gamma",), file_prefix="fidB")
+    c, c_rows = _merge_victim(db, name="c.pdf", sha="chainc", folders=("Scratch Delta",), file_prefix="fidC")
+    try:
+        assert client.post(f"/dashboard/unique-documents/{b['_id']}/merge",
+                           json={"absorb": [str(c["_id"])], "merged_by": "First"}).status_code == 200
+        assert client.post(f"/dashboard/unique-documents/{survivor['_id']}/merge",
+                           json={"absorb": [str(b["_id"])], "merged_by": "Second"}).status_code == 200
+        links = {l["zoho_file_id"]: l for l in
+                 client.get(f"/dashboard/unique-documents/{survivor['_id']}").json()["duplicate_links"]}
+        assert (links["fidB0"]["merged_document"], links["fidB0"]["merged_by"]) == ("b.pdf", "Second")
+        assert (links["fidC0"]["merged_document"], links["fidC0"]["merged_by"]) == ("c.pdf", "First")
+    finally:
+        _cleanup(db, [(b, b_rows), (c, c_rows)])
+
+
+def test_merge_takes_translation_and_review_as_a_pair(client, db, scratch):
+    """A survivor with no translation takes the merged document's translation
+    AND its review -- a review belongs to one translation."""
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    survivor, _rows = scratch
+    other, other_rows = _merge_victim(
+        db, name="translated.pdf", sha="pairtr", folders=("Scratch Gamma",), file_prefix="fidT",
+        translation_zoho_file_id="trX", translation_shareable_link="http://example/trX",
+        translation_status="done", translated_by="Translator",
+        review_zoho_file_id="rvX", review_status="done", reviewed_by="Reviewer")
     try:
         result = client.post(f"/dashboard/unique-documents/{survivor['_id']}/merge",
                              json={"absorb": [str(other["_id"])]}).json()
-        assert result["placements_repointed"] == 1
-        assert result["placement_count"] == 3
-
+        assert result["translation_taken_from"] == "translated.pdf"
+        assert result["not_trashed"] == []
         after = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": survivor["_id"]})
-        assert len(after["main_row_ids"]) == 3
-        # Every physical copy of the absorbed document is still reachable.
-        assert len(after["duplicate_links"]) == 3
-        assert "fidX" in [l["zoho_file_id"] for l in after["duplicate_links"]]
-        assert after["merged_from"]  # audit trail, so a bad merge is undoable by hand
-
-        assert db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": other["_id"]}) is None
-        assert db[COLL_DOCUMENTS].count_documents({}) == rows_before
-        assert db[COLL_DOCUMENTS].find_one({"_id": row["_id"]})["unique_document_id"] == survivor["_id"]
+        assert (after["translation_zoho_file_id"], after["review_zoho_file_id"]) == ("trX", "rvX")
+        assert (after["translated_by"], after["reviewed_by"]) == ("Translator", "Reviewer")
+        assert after["translation_status"] == "done"
     finally:
-        db[COLL_DOCUMENTS].delete_one({"_id": row["_id"]})
-        db[COLL_UNIQUE_DOCUMENTS].delete_one({"_id": other["_id"]})
+        _cleanup(db, [(other, other_rows)])
+
+
+def test_merge_is_refused_while_a_document_is_being_translated(client, db, scratch):
+    from dashboard.models import COLL_DOCUMENTS, COLL_TRANSLATION_JOBS, COLL_UNIQUE_DOCUMENTS
+
+    survivor, _rows = scratch
+    other, other_rows = _merge_victim(db, name="busy.pdf", sha="busyx", folders=("Scratch Gamma",),
+                                      file_prefix="fidY")
+    job = db[COLL_TRANSLATION_JOBS].insert_one({"document_id": other["_id"], "status": "running"}).inserted_id
+    try:
+        resp = client.post(f"/dashboard/unique-documents/{survivor['_id']}/merge",
+                           json={"absorb": [str(other["_id"])]})
+        assert resp.status_code == 409 and "being translated" in resp.text
+        assert db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": other["_id"]}) is not None
+        assert db[COLL_DOCUMENTS].find_one({"_id": other_rows[0]["_id"]})["unique_document_id"] == other["_id"]
+    finally:
+        db[COLL_TRANSLATION_JOBS].delete_one({"_id": job})
+        _cleanup(db, [(other, other_rows)])
+
+
+def test_unlink_splits_a_merged_group_into_a_new_document(client, db, scratch):
+    """The group's links leave and become a new document's own copies; the
+    first is its anchor; metadata is copied; no placements, no translation."""
+    from dashboard.models import COLL_DOCUMENTS, COLL_UNIQUE_DOCUMENTS
+
+    survivor, _rows = scratch
+    db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": survivor["_id"]}, {"$set": {"season": "Kharif"}})
+    other, other_rows = _merge_victim(db, name="split-me.pdf", sha="splitme",
+                                      folders=("Scratch Gamma", "Scratch Delta"), file_prefix="fidS")
+    created = None
+    try:
+        assert client.post(f"/dashboard/unique-documents/{survivor['_id']}/merge",
+                           json={"absorb": [str(other["_id"])], "merged_by": "M"}).status_code == 200
+        resp = client.post(f"/dashboard/unique-documents/{survivor['_id']}/unlink",
+                           json={"merged_document": "split-me.pdf"})
+        assert resp.status_code == 201, resp.text
+        created = resp.json()
+        assert created["document_id"].startswith("ANNAM_")
+        assert created["representative_file_id"] == "fidS0"
+        assert created["shareable_name"] == "split-me.pdf"
+        assert [l["zoho_file_id"] for l in created["duplicate_links"]] == ["fidS0", "fidS1"]
+        assert all(l["merged_document"] is None and l["merged_by"] == "system"
+                   for l in created["duplicate_links"])
+        assert created["placement_count"] == 0 and created["season"] == "Kharif"
+        assert created["sha256"] == other["sha256"]  # its fingerprint comes back
+        assert db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": survivor["_id"]})["merged_sha256s"] == []
+        assert created["translation_file_id"] is None and created["translation_status"] == "not_started"
+
+        left = client.get(f"/dashboard/unique-documents/{survivor['_id']}").json()
+        assert not any(l["merged_document"] for l in left["duplicate_links"])
+        assert left["placement_count"] == 4  # the moved placements stay
+
+        again = client.post(f"/dashboard/unique-documents/{survivor['_id']}/unlink",
+                            json={"merged_document": "split-me.pdf"})
+        assert again.status_code == 404
+    finally:
+        db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": survivor["_id"]}, {"$unset": {"season": ""}})
+        if created:
+            from bson import ObjectId
+            db[COLL_UNIQUE_DOCUMENTS].delete_one({"_id": ObjectId(created["id"])})
+        _cleanup(db, [(other, other_rows)])
+
+
+def test_a_copy_delete_refuses_the_anchor_and_keeps_the_list_if_workdrive_refuses(client, db, scratch):
+    """The anchor is never deletable. And WorkDrive goes first: a file it will
+    not trash (here, an id that does not exist) leaves the list untouched."""
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    doc, _rows = scratch
+    before = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc["_id"]})
+    anchor = before["representative_file_id"] or before["duplicate_links"][0]["zoho_file_id"]
+    if not before["representative_file_id"]:
+        db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": doc["_id"]}, {"$set": {"representative_file_id": anchor}})
+    other = next(l["zoho_file_id"] for l in before["duplicate_links"] if l["zoho_file_id"] != anchor)
+    base = f"/dashboard/unique-documents/{doc['_id']}/duplicate-links"
+    assert client.delete(f"{base}/{anchor}").status_code == 400
+    assert client.delete(f"{base}/no-such-file").status_code == 404
+    assert client.delete(f"{base}/{other}").status_code == 502  # a fake id: WorkDrive refuses
+    after = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc["_id"]})
+    assert len(after["duplicate_links"]) == len(before["duplicate_links"])
 
 
 def test_merge_validates_before_it_writes(client, scratch):
@@ -1708,7 +1882,7 @@ def test_documents_carry_only_the_agreed_fields(db):
         "review_status", "review_zoho_file_id", "review_shareable_link",
         "translated_by", "translated_at", "reviewed_by", "reviewed_at",
         "approved_by_approver", "approved_by_admin",
-        "chunk_embeddings", "main_row_ids", "duplicate_links", "merged_from",
+        "chunk_embeddings", "main_row_ids", "duplicate_links",
         "representative_file_id", "district_id", "kvk_id",
         "created_at", "updated_at",
         # DEAD DATA, tolerated until someone clears it: the anchor PLACEMENT
@@ -1717,6 +1891,9 @@ def test_documents_carry_only_the_agreed_fields(db):
         # is still stored on every migrated document, and clearing it is a
         # one-off $unset nobody has run.
         "representative_row_id",
+        # Likewise: ANNAM ids of merged documents, never filled and no longer
+        # written or served -- duplicate_links tags merged files now.
+        "merged_from",
     }
     # `state`/`crop` name strings are tolerated only until
     # dashboard/migrate_vocabulary_refs.py phase 2 removes them; nothing writes

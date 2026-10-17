@@ -159,6 +159,9 @@ _INDEXES: dict[str, list[dict]] = {
         # unhashed documents possible.
         {"keys": [("sha256", ASCENDING)], "unique": True, "name": "uq_sha256",
          "partialFilterExpression": {"sha256": {"$type": "string"}}},
+        # A merged fingerprint belongs to one document, like an own one.
+        {"keys": [("merged_sha256s", ASCENDING)], "unique": True, "name": "uq_merged_sha256s",
+         "partialFilterExpression": {"merged_sha256s": {"$type": "string"}}},
         {"keys": [("translation_status", ASCENDING)], "name": "translation_status"},
         {"keys": [("review_status", ASCENDING)], "name": "review_status"},
         # Finding the document behind a given physical copy -- used by the

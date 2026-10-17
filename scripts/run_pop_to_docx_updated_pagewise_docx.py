@@ -8,7 +8,7 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import anthropic
@@ -311,6 +311,31 @@ def _sleep_cancellable(seconds: float):
         time.sleep(min(1.0, left))
 
 
+class ApiLimitReached(BaseException):
+    """Gemini refused because the credits are used up (402) or the daily
+    request limit is reached (429 ...PerDay). Retrying, or moving on to the
+    next page, only burns more refused calls, so this stops the whole job.
+    A BaseException, like a cancel, so the per-page `except Exception`
+    handlers let it through."""
+
+
+def _api_limit_message(e: BaseException) -> str | None:
+    text, code = str(e), getattr(e, "code", None)
+    if code == 402:
+        return "Gemini credits are used up -- add credit in AI Studio, then translate again"
+    if code == 429 and ("PerDay" in text or "per_day" in text):
+        # Google says how long until the cap resets ('retryDelay': '52715s');
+        # turned into a wall-clock time in IST, where the team works.
+        m = re.search(r"retryDelay'?\"?:\s*'?\"?(\d+)s", text)
+        if m:
+            ist = datetime.now(timezone(timedelta(hours=5, minutes=30))) + timedelta(seconds=int(m.group(1)) + 59)
+            when = ist.strftime("%-I:%M %p IST on %d %b")
+        else:
+            when = "about 5:30 AM IST"
+        return f"Gemini daily request limit reached -- it resets at {when}; translate again after that"
+    return None
+
+
 def _run_with_deadline(fn, timeout_seconds: float):
     """Run fn() in a helper thread; return its result, re-raise its error, or
     raise TimeoutError after timeout_seconds. A cancel raises at once. A
@@ -490,6 +515,8 @@ def translate_page_pdf_to_html_gemini(
                 f"{pname} | attempt {attempt}/{max_retries} failed | "
                 f"duration={format_duration(attempt_elapsed)} | error={e}"
             )
+            if (why := _api_limit_message(e)) is not None:
+                raise ApiLimitReached(why) from e
 
             if attempt < max_retries:
                 log(f"{pname} | waiting {retry_wait_seconds}s before retry")

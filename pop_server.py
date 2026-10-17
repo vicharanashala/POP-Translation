@@ -604,6 +604,9 @@ def _run_job_sync(job_id: str, fn):
     except ctl.JobCancelled:
         _jobs[job_id]["status"] = "stopped"
         _jobs[job_id]["stderr"] = "stopped by user"
+    except _pop_script.ApiLimitReached as e:  # out of credits / daily limit: stop, say why
+        _jobs[job_id]["status"] = "failed"
+        _jobs[job_id]["stderr"] = str(e)
     except Exception:
         _jobs[job_id]["status"] = "stopped" if ctl.is_cancelled(job_id) else "failed"
         _jobs[job_id]["stderr"] = "stopped by user" if ctl.is_cancelled(job_id) else traceback.format_exc()

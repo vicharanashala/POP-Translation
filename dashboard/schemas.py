@@ -263,6 +263,15 @@ class CopyLink(BaseModel):
     state: str | None = None
     crop: str | None = None
     row_id: int | None = None
+    # WHERE THE FILE CAME FROM. "system" for every copy the document was built
+    # with (the corpus load, an upload) -- stored or not, which is why it is a
+    # default here rather than a backfill. A merge tags each file it brings in
+    # with the merged document's NAME (not its ANNAM id, which is handed out
+    # again once that document is gone), who merged it and when; the frontend
+    # groups the links by `merged_document`, null being the document's own.
+    merged_document: str | None = None
+    merged_by: str = "system"
+    merged_at: UTCDatetime | None = None
 
 
 _STORED_INTS = ("month_of_release", "year_of_release", "month_of_collection", "year_of_collection")
@@ -350,7 +359,6 @@ class UniqueDocumentOut(DocumentMetadata):
     district_id: str | None = None
     kvk_id: str | None = None
     duplicate_links: list[CopyLink] = []
-    merged_from: list[str] = []  # ANNAM ids absorbed by a team-approved merge
     created_at: UTCDatetime
     updated_at: UTCDatetime
 
@@ -494,21 +502,39 @@ class DuplicateCandidatesOut(BaseModel):
 
 
 class MergeRequest(BaseModel):
-    """Absorb these documents into the one being POSTed to.
+    """Merge these documents into the one being POSTed to.
 
-    ObjectId hex or ANNAM ids. The absorbed documents are deleted; their
-    placements are repointed and NEVER deleted, because each one is a real file
-    in a real folder.
+    ObjectId hex or ANNAM ids. The merged documents are deleted; their
+    placements move to this document unless it is already filed in that state +
+    folder, and their files stay in WorkDrive, listed in this document's
+    duplicate_links. `merged_by` is the display name to record on those links,
+    as the frontend sends `translated_by`; blank falls back to the caller's id.
     """
 
     absorb: list[str]
+    merged_by: str | None = None
 
 
 class MergeResult(BaseModel):
     document_id: str  # the surviving ANNAM id
-    absorbed: list[str]  # ANNAM ids that were merged in
-    placements_repointed: int
+    absorbed: list[str]  # the merged documents' file names
+    placements_moved: int  # filed under this document now, POP id kept
+    placements_dropped: int  # this document was already filed there
+    links_added: int  # copy links added to duplicate_links
+    # Whose translation + review this document took, when it had none; null if
+    # it kept its own or nobody had one.
+    translation_taken_from: str | None = None
     placement_count: int  # of the survivor, after the merge
+    # Translation/review files WorkDrive refused to trash. The merge itself is
+    # complete; these are only left over.
+    not_trashed: list[str] = []
+
+
+class UnlinkRequest(BaseModel):
+    """Which merged group to split back out: the `merged_document` value its
+    links carry in duplicate_links."""
+
+    merged_document: str
 
 
 # -- Upload queue --------------------------------------------------------------

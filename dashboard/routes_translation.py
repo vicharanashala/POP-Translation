@@ -539,7 +539,7 @@ def _run_translation(job_id: ObjectId, document_id: ObjectId) -> None:
         _set_job(job_id, status=TranslationJobStatus.cancelled.value, error_message="Cancelled by user",
                  page_links=[], page_file_ids=[])
         _set_doc(document_id, translation_status=TranslationStatus.not_started.value)
-    except Exception as e:  # noqa: BLE001
+    except (Exception, pop.ApiLimitReached) as e:  # noqa: BLE001 -- out of credits/daily limit: stop, say why
         _set_job(job_id, status=TranslationJobStatus.failed.value, error_message=str(e))
         _set_doc(document_id, translation_status=TranslationStatus.not_started.value)
     finally:

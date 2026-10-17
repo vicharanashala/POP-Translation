@@ -326,6 +326,11 @@ def new_unique_document(*, display_id: int, sha256: str | None = None,
         # the same document by definition. Also the join key to the on-disk
         # chunk fingerprints in fix/out/.
         "sha256": sha256,
+        # The fingerprints of documents MERGED into this one. A re-upload of a
+        # merged file must still find this document, and unlink gives one back
+        # (each merged copy link carries its document's as `merged_sha256`).
+        # Kept on a copy delete: the merge still stands.
+        "merged_sha256s": [],
         "num_pages": None,
         "format_original": "pdf",
         # The document's own name and link: those of its ANCHOR copy (see
@@ -404,14 +409,16 @@ def new_unique_document(*, display_id: int, sha256: str | None = None,
         # "$exists" is what tells an unset one from a cleared one.
         **({"district_id": district_id} if district_id is not None else {}),
         **({"kvk_id": kvk_id} if kvk_id is not None else {}),
-        # ANNAM ids absorbed into this document by a team-approved merge. An
-        # audit trail, so a merge can be explained (and reversed by hand).
-        "merged_from": [],
         "created_at": now,
         "updated_at": now,
     }
     doc.update(fields)
     return doc
+
+
+def sha_match(sha: str) -> dict:
+    """The document holding this exact file: its own, or one merged into it."""
+    return {"$or": [{"sha256": sha}, {"merged_sha256s": sha}]}
 
 
 def new_copy_link(*, zoho_file_id: str | None, shareable_link: str | None,
@@ -645,7 +652,11 @@ def unlink_placement(db, unique_document_id, *, row_obj_id, row_id: int) -> None
     ) or {}
     links = doc.get("duplicate_links") or []
     placements = len(doc.get("main_row_ids") or [])
-    shared = len({c.get("zoho_file_id") for c in links}) < placements
+    # Only the document's OWN copies name placements. Links a merge brought in
+    # carry row_id null and must not be counted, or a merge that adds three
+    # files makes one shared upload file look unshared and get pulled.
+    own = [c for c in links if not c.get("merged_document")]
+    shared = len({c.get("zoho_file_id") for c in own}) < placements
     last = placements <= 1
 
     pull: dict = {"main_row_ids": row_obj_id}
