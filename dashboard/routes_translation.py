@@ -28,16 +28,31 @@ uploaded to the translations folder as soon as it is done; the job row keeps
 leaves its slot empty and the rest carry on, so the job ends one of three ways:
 done (every page filled -> merged into the document's translation, then the
 page files are trashed), failed (some slots empty, the page files KEPT), or
-cancelled (page files trashed). There is no redo endpoint: translating a
-document whose last job failed resumes that job and does only the empty pages.
+cancelled (the page files KEPT too). There is no redo endpoint: translating a
+document whose last job failed or was cancelled resumes that job and does only
+the empty pages. A job's pages are given up only by deleting the job.
 It used to be all or nothing -- one bad page out of 146 threw away the other
 145.
+
+THREE MODES, a tag on the job (`mode`): normal (one Gemini call a page, now),
+flex (the same calls on Google's half-price best-effort tier -- each page can
+take 1-15 minutes, and it still counts against the daily request limit) and
+batch (every page in ONE Gemini Batch API job: half price, outside the daily
+limit, but Google takes up to 24 hours). A batch job goes through
+_run_translation twice. The first pass cuts the pages, submits them and
+returns, leaving the job "running" with `batch_name` set and no thread holding
+it. The batch poller (_poll_batches: every 2 minutes, and on every
+GET /translation-jobs, i.e. the frontend's refresh) asks Google how it is going;
+once the batch has finished it claims the job ("finishing") and runs the second
+pass, which writes each page's HTML where the normal call would have, so the
+rest -- images, .docx, upload, merge -- is the same code for all three modes.
 
 Gated by GET /config's translation_available flag, which requires both an LLM
 API key and TRANS=on (dashboard/config.py).
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -63,6 +78,7 @@ from dashboard.models import (
     ReviewStatus,
     TranslationJobKind,
     TranslationJobStatus,
+    TranslationMode,
     TranslationStatus,
     new_translation_job,
     utcnow,
@@ -77,6 +93,9 @@ router = APIRouter()
 _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="dashboard-translate")
 
 PAGE_ATTEMPTS = 3
+# Flex is often turned away (503, no spare capacity) and waits double between
+# tries: 15s, 30s ... 4 min, about 8 minutes in all before a page gives up.
+FLEX_PAGE_ATTEMPTS = 6
 
 _DASHBOARD_WORK_ROOT = REPO_ROOT / "pop-data" / "POP_Work" / "Dashboard_Workdir"
 
@@ -98,6 +117,8 @@ def _translation_job_out(row: dict, doc: dict | None) -> TranslationJobOut:
         document_code=format_display_id(doc.get("display_id")) if doc else None,
         shareable_name=doc.get("shareable_name") if doc else None,
         kind=row["kind"],
+        mode=row.get("mode") or TranslationMode.normal.value,
+        batch_state=row.get("batch_state"),
         status=row["status"],
         progress_pct=row["progress_pct"],
         pages_done=row.get("pages_done"),
@@ -138,18 +159,26 @@ def _person(value) -> str | None:
 @router.post("/unique-documents/{document_id}/translate", status_code=202, dependencies=[Depends(require_admin)])
 def start_translation(document_id: str, body: dict | None = Body(default=None), db=Depends(get_db)):
     """Queue the pipeline for this document. Optional JSON body
-    `{"translated_by": "<display name>"}` -- recorded on the document when the
-    translation lands.
+    `{"translated_by": "<display name>", "mode": "normal" | "flex" | "batch"}`
+    -- translated_by is recorded on the document when the translation lands;
+    mode defaults to normal (see the module docstring).
 
-    There is no separate redo: if the document's last job FAILED, this picks
-    that same job up again and translates only the pages it has no link for.
+    There is no separate redo: if the document's last job FAILED or was
+    CANCELLED, this picks that same job up again and translates only the pages
+    it has no link for.
     """
-    from pop_server import LLM_API_KEY_ENV
+    from pop_server import LLM_API_KEY_ENV, LLM_PROVIDER
 
     if not TRANS_ENABLED:
         raise HTTPException(503, "translation is currently out of order")
     if not os.environ.get(LLM_API_KEY_ENV):
         raise HTTPException(400, f"{LLM_API_KEY_ENV} is not set -- translation unavailable")
+    try:
+        mode = TranslationMode((body or {}).get("mode") or TranslationMode.normal.value)
+    except ValueError:
+        raise HTTPException(422, "mode must be one of: normal, flex, batch")
+    if mode is not TranslationMode.normal and LLM_PROVIDER != "gemini":
+        raise HTTPException(400, f"{mode.value} translation needs Gemini; this server uses {LLM_PROVIDER}")
 
     oid = _to_object_id(document_id, "document")
     _expire_lost_jobs(db)
@@ -168,18 +197,23 @@ def start_translation(document_id: str, body: dict | None = Body(default=None), 
         {"$set": {"translation_status": TranslationStatus.in_progress.value, "updated_at": utcnow()}},
     )
     requested_by = _person((body or {}).get("translated_by"))
-    failed = list(db[COLL_TRANSLATION_JOBS].find(
-        {"document_id": oid, "status": TranslationJobStatus.failed.value}
-    ).sort([("created_at", DESCENDING), ("_id", DESCENDING)]))
+    failed = list(db[COLL_TRANSLATION_JOBS].find({
+        "document_id": oid,
+        "status": {"$in": [TranslationJobStatus.failed.value, TranslationJobStatus.cancelled.value]},
+    }).sort([("created_at", DESCENDING), ("_id", DESCENDING)]))
     if failed:
-        # The newest failed job carries on; any older failed one (two documents
-        # merged, each with its own failed run) is given up, its pages trashed.
+        # The newest failed/cancelled job carries on; any older one still
+        # holding pages (two documents merged, each with its own run) is given
+        # up, its pages trashed. Older ones with nothing left are history.
         job_id = failed[0]["_id"]
         db[COLL_TRANSLATION_JOBS].update_one({"_id": job_id}, {"$set": {
-            "status": TranslationJobStatus.queued.value, "error_message": None,
+            "status": TranslationJobStatus.queued.value, "error_message": None, "mode": mode.value,
+            "batch_name": None, "batch_state": None,
             "requested_by": requested_by, "heartbeat_at": utcnow(), "updated_at": utcnow(),
         }})
         for old in failed[1:]:
+            if old["status"] != TranslationJobStatus.failed.value and not any(old.get("page_file_ids") or []):
+                continue
             _end_job_pages(db, old)
             db[COLL_TRANSLATION_JOBS].update_one({"_id": old["_id"]}, {"$set": {
                 "status": TranslationJobStatus.cancelled.value,
@@ -187,7 +221,7 @@ def start_translation(document_id: str, body: dict | None = Body(default=None), 
             }})
             events.translation_changed(old["_id"])
     else:
-        job = new_translation_job(document_id=oid, kind=TranslationJobKind.translate)
+        job = new_translation_job(document_id=oid, kind=TranslationJobKind.translate, mode=mode)
         job["requested_by"] = requested_by
         job_id = db[COLL_TRANSLATION_JOBS].insert_one(job).inserted_id
     events.translation_changed(job_id)
@@ -208,6 +242,7 @@ def start_translation(document_id: str, body: dict | None = Body(default=None), 
 @router.get("/translation-jobs", response_model=list[TranslationJobOut], dependencies=[Depends(require_admin)])
 def list_translation_jobs(status: TranslationJobStatus | None = None, db=Depends(get_db)):
     _expire_lost_jobs(db)
+    _poll_batches(db, min_gap=15)  # the frontend's refresh asks Google too
     if status is not None:
         query = {"status": status.value}
     else:
@@ -229,15 +264,15 @@ def cancel_translation_job(job_id: str, db=Depends(get_db)):
     "cancelled" asynchronously once the background thread observes it; poll
     GET /translation-jobs to see it land.
 
-    A FAILED job can be cancelled too -- that is how its pages are given up:
-    it turns cancelled at once and its page files are trashed."""
+    The pages already done are KEPT, as on a failed job: translating the
+    document again resumes this job. A FAILED job can be cancelled too; it
+    just turns cancelled. Deleting the job is what gives its pages up."""
     oid = _to_object_id(job_id, "job")
     _expire_lost_jobs(db)
     job = db[COLL_TRANSLATION_JOBS].find_one({"_id": oid})
     if job is None:
         raise HTTPException(404, "job not found")
     if job["status"] == TranslationJobStatus.failed.value:
-        _end_job_pages(db, job)
         db[COLL_TRANSLATION_JOBS].update_one({"_id": oid}, {"$set": {
             "status": TranslationJobStatus.cancelled.value, "error_message": "Cancelled by user", "updated_at": utcnow(),
         }})
@@ -245,6 +280,19 @@ def cancel_translation_job(job_id: str, db=Depends(get_db)):
         return {"cancelling": True}
     if job["status"] not in (TranslationJobStatus.queued.value, TranslationJobStatus.running.value):
         raise HTTPException(409, f"job is already {job['status']!r}")
+    if job.get("batch_name") and db[COLL_TRANSLATION_JOBS].update_one(
+        {"_id": oid, "status": TranslationJobStatus.running.value, "batch_state": {"$ne": _FINISHING}},
+        {"$set": {"status": TranslationJobStatus.cancelled.value, "error_message": "Cancelled by user",
+                  "updated_at": utcnow()}},
+    ).modified_count:
+        # A batch Google is still working on: no thread here to signal, so it
+        # is cancelled at Google and marked cancelled at once.
+        _cancel_batch(job["batch_name"])
+        db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": job["document_id"]}, {"$set": {
+            "translation_status": TranslationStatus.not_started.value, "updated_at": utcnow()}})
+        events.translation_changed(oid)
+        events.document_changed(job["document_id"])
+        return {"cancelling": True}
     ctl.cancel(str(oid))
     return {"cancelling": True}
 
@@ -318,6 +366,8 @@ def _expire_lost_jobs(db) -> None:
     lost = list(db[COLL_TRANSLATION_JOBS].find({
         "status": {"$in": active},
         "_id": {"$nin": list(_held_jobs)},
+        # A batch Google is working on is held by no thread; the poller has it.
+        "$nor": [{"batch_name": {"$type": "string"}, "batch_state": {"$ne": _FINISHING}}],
         # Rows from before the heartbeat existed have only updated_at.
         "$or": [{"heartbeat_at": {"$lt": cutoff}},
                 {"heartbeat_at": {"$exists": False}, "updated_at": {"$lt": cutoff}}],
@@ -379,9 +429,11 @@ class _PagesFailed(Exception):
     pass
 
 
-def _translate_one_page(pdf_path: Path, docx_path: Path, doc_name: str, req, api_key: str, prompt: str) -> str | None:
+def _translate_one_page(pdf_path: Path, docx_path: Path, doc_name: str, req, api_key: str, prompt: str,
+                        tier: str | None = None) -> str | None:
     """Translate -> images -> one-page .docx for one page. Returns None on
-    success, else why it failed."""
+    success, else why it failed. A page whose translated.html is already there
+    (a batch result) skips the translate step."""
     from pop_server import LLM_PROVIDER
     import run_pop_to_docx_updated_pagewise_docx as pop
 
@@ -389,7 +441,7 @@ def _translate_one_page(pdf_path: Path, docx_path: Path, doc_name: str, req, api
     result = pop.process_translation_for_page(
         page_pdf_path=pdf_path, prompt=prompt, model=req.model, api_key=api_key,
         overwrite_existing=False, max_retries=req.max_retries, retry_wait_seconds=req.retry_wait_seconds,
-        enable_google_search=not req.disable_google_search, provider=LLM_PROVIDER,
+        enable_google_search=not req.disable_google_search, provider=LLM_PROVIDER, gemini_service_tier=tier,
     )
     if result.get("status") == "failed":
         return f"translation: {result.get('error') or 'failed'}"
@@ -461,23 +513,39 @@ def _run_translation(job_id: ObjectId, document_id: ObjectId) -> None:
         page_dir.mkdir(parents=True, exist_ok=True)
         docx_paths = [page_dir / f"{safe_name}_{pop.page_name(i + 1)}.docx" for i in range(total)]
         todo = [i for i in range(total) if not links[i]]
+        mode = job.get("mode") or TranslationMode.normal.value
+        errors: dict[int, str] = {}
 
-        # Three attempts a page, each cut off after a minute without a full
+        # Three attempts a page, each cut off after two minutes without a full
         # reply (GEMINI_ATTEMPT_TIMEOUT_SECONDS in the script); then the page is
         # left "" and the job moves on to the next one.
         req = PopRequest(state="_dashboard", crop=str(document_id), model=DEFAULT_MODEL,
-                         max_retries=PAGE_ATTEMPTS)
+                         max_retries=FLEX_PAGE_ATTEMPTS if job.get("mode") == TranslationMode.flex.value
+                         else PAGE_ATTEMPTS)
         api_key = os.environ[LLM_API_KEY_ENV]
         prompt = PROMPT_FILE.read_text(encoding="utf-8")
+        if mode == TranslationMode.batch.value and todo:
+            if not job.get("batch_name"):
+                _submit_batch(job_id, todo, page_pdfs, req, api_key, prompt, doc_root)
+                return  # Google has the pages now; the batch poller takes it from here
+            # Second pass: the batch is done. Each result becomes the page's
+            # translated.html, exactly where the normal call would put it.
+            htmls, errors = _collect_batch(job["batch_name"], api_key)
+            for i in todo:
+                if i in htmls:
+                    (page_pdfs[i].parent / "translated.html").write_text(htmls[i], encoding="utf-8")
+                else:
+                    errors.setdefault(i, "translation: no result in the Gemini batch")
+            todo = [i for i in todo if i in htmls]
+        tier = "flex" if mode == TranslationMode.flex.value else None
         stdout_buf = getattr(_tl_stdout, "buf", None)
         lock = threading.Lock()
-        errors: dict[int, str] = {}
 
         def one(i: int) -> None:
             ctl.set_job_id(str(job_id))
             _tl_stdout.buf = stdout_buf
             try:
-                why = _translate_one_page(page_pdfs[i], docx_paths[i], doc_name, req, api_key, prompt)
+                why = _translate_one_page(page_pdfs[i], docx_paths[i], doc_name, req, api_key, prompt, tier)
                 if why is None:
                     ctl.check_cancel()
                     fid = zoho_layout.upload_translation(
@@ -533,11 +601,12 @@ def _run_translation(job_id: ObjectId, document_id: ObjectId) -> None:
         _set_job(job_id, status=TranslationJobStatus.done.value, progress_pct=100,
                  page_links=[], page_file_ids=[])
     except ctl.JobCancelled:
+        # The pages done so far stay, like a failed job's: translating again resumes.
         with get_session() as db:
-            job = db[COLL_TRANSLATION_JOBS].find_one({"_id": job_id}, {"page_file_ids": 1})
-        _trash_files((job or {}).get("page_file_ids") or [])
-        _set_job(job_id, status=TranslationJobStatus.cancelled.value, error_message="Cancelled by user",
-                 page_links=[], page_file_ids=[])
+            job = db[COLL_TRANSLATION_JOBS].find_one({"_id": job_id}, {"batch_name": 1})
+        if (job or {}).get("batch_name"):
+            _cancel_batch(job["batch_name"])
+        _set_job(job_id, status=TranslationJobStatus.cancelled.value, error_message="Cancelled by user")
         _set_doc(document_id, translation_status=TranslationStatus.not_started.value)
     except (Exception, pop.ApiLimitReached) as e:  # noqa: BLE001 -- out of credits/daily limit: stop, say why
         _set_job(job_id, status=TranslationJobStatus.failed.value, error_message=str(e))
@@ -547,6 +616,174 @@ def _run_translation(job_id: ObjectId, document_id: ObjectId) -> None:
         ctl.cleanup(str(job_id))
         shutil.rmtree(doc_root, ignore_errors=True)
         tmp_pdf.unlink(missing_ok=True)
+
+
+# -- Batch mode ----------------------------------------------------------------
+# Submitting, collecting and cancelling a Gemini batch, and the poller that
+# watches the batches in flight. Several servers share the staging database, so
+# every one polls; the "finishing" claim is a conditional update, and only the
+# server whose update lands runs the second pass.
+
+_FINISHING = "finishing"
+_BATCH_DONE = {"JOB_STATE_SUCCEEDED", "JOB_STATE_PARTIALLY_SUCCEEDED"}
+_BATCH_DEAD = {"JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"}
+_POLL_EVERY = 120  # seconds
+_poll_lock = threading.Lock()
+_last_poll = 0.0
+
+
+def _gemini(api_key: str):
+    from google import genai
+
+    return genai.Client(api_key=api_key)
+
+
+def _batch_state(batch) -> str | None:
+    return getattr(batch.state, "value", batch.state) if batch.state is not None else None
+
+
+def _submit_batch(job_id: ObjectId, todo: list[int], page_pdfs, req, api_key: str, prompt: str, workdir: Path) -> None:
+    """One JSONL line per page still to do, keyed by its index; uploaded, then
+    submitted as one batch. Images go inline, so the file can run to a few
+    hundred MB for a long document -- far under the 2 GB limit."""
+    from google.genai import types
+    import run_pop_to_docx_updated_pagewise_docx as pop
+
+    lines = workdir / "batch_input.jsonl"
+    with lines.open("w", encoding="utf-8") as f:
+        for i in todo:
+            ctl.check_cancel()
+            request = pop.gemini_batch_request(page_pdfs[i], prompt, not req.disable_google_search)
+            f.write(json.dumps({"key": str(i), "request": request}) + "\n")
+    client = _gemini(api_key)
+    uploaded = client.files.upload(file=lines, config=types.UploadFileConfig(
+        display_name=f"pop-translate-{job_id}", mime_type="jsonl"))
+    ctl.check_cancel()
+    try:
+        batch = client.batches.create(model=req.model, src=uploaded.name,
+                                      config=types.CreateBatchJobConfig(display_name=f"pop-translate-{job_id}"))
+    except Exception as e:
+        # Out of credits / spending cap: the same plain message the page calls give.
+        if (why := pop._api_limit_message(e)) is not None:
+            raise pop.ApiLimitReached(why) from e
+        raise
+    # Written before anything else can fail, so a cancel can always reach it.
+    _set_job(job_id, batch_name=batch.name, batch_state=_batch_state(batch))
+    print(f"[translate] job {job_id}: {len(todo)} page(s) submitted as {batch.name}", flush=True)
+    ctl.check_cancel()
+
+
+def _collect_batch(batch_name: str, api_key: str) -> tuple[dict[int, str], dict[int, str]]:
+    """The finished batch's pages: {index: html} and {index: why it failed}."""
+    import run_pop_to_docx_updated_pagewise_docx as pop
+
+    client = _gemini(api_key)
+    batch = client.batches.get(name=batch_name)
+    if batch.dest is None or not batch.dest.file_name:
+        raise RuntimeError(f"the Gemini batch {batch_name} has no results file")
+    htmls: dict[int, str] = {}
+    errors: dict[int, str] = {}
+    for line in client.files.download(file=batch.dest.file_name).decode("utf-8").splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        i = int(row["key"])
+        try:
+            if row.get("error"):
+                raise RuntimeError((row["error"] or {}).get("message") or row["error"])
+            htmls[i] = pop.gemini_batch_html(row.get("response") or {})
+        except Exception as e:  # noqa: BLE001 -- one page's failure is that page's
+            errors[i] = f"translation: {e}"
+    return htmls, errors
+
+
+def _cancel_batch(batch_name: str) -> None:
+    """Best effort: a batch that already finished cannot be cancelled, and that
+    must not stop the job being marked cancelled here."""
+    from pop_server import LLM_API_KEY_ENV
+
+    try:
+        # Held in a variable: a Client nobody references closes its connection
+        # before the call it was created for is sent.
+        client = _gemini(os.environ[LLM_API_KEY_ENV])
+        client.batches.cancel(name=batch_name)
+    except Exception as e:  # noqa: BLE001
+        print(f"[translate] could not cancel {batch_name}: {type(e).__name__}: {e}", flush=True)
+
+
+def start_batch_poller() -> None:
+    """Called once at startup (pop_server's lifespan), so a batch submitted
+    before a restart is still collected after it."""
+    threading.Thread(target=_poll_loop, daemon=True, name="translate-batch-poll").start()
+
+
+def _poll_loop() -> None:
+    while True:
+        try:
+            with get_session() as db:
+                _poll_batches(db)
+        except Exception as e:  # noqa: BLE001
+            print(f"[translate] batch poll failed: {type(e).__name__}: {e}", flush=True)
+        time.sleep(_POLL_EVERY)
+
+
+def _poll_batches(db, *, min_gap: float = 0) -> None:
+    """Ask Google about every batch in flight. Done -> claim and run the second
+    pass; failed/expired/cancelled at Google -> the job fails (translate again
+    to resubmit the pages still missing). Each poll also refreshes the job's
+    heartbeat, so a server that does not know about batches does not expire it."""
+    global _last_poll
+    from pop_server import LLM_API_KEY_ENV
+
+    api_key = os.environ.get(LLM_API_KEY_ENV)
+    if not api_key:
+        return
+    with _poll_lock:
+        if time.monotonic() - _last_poll < min_gap:
+            return
+        _last_poll = time.monotonic()
+        running = TranslationJobStatus.running.value
+        waiting = list(db[COLL_TRANSLATION_JOBS].find({
+            "status": running, "batch_name": {"$type": "string"}, "batch_state": {"$ne": _FINISHING}}))
+        if not waiting:
+            return
+        client = _gemini(api_key)
+        for job in waiting:
+            try:
+                batch = client.batches.get(name=job["batch_name"])
+            except Exception as e:  # noqa: BLE001 -- try again next poll
+                print(f"[translate] could not check {job['batch_name']}: {type(e).__name__}: {e}", flush=True)
+                continue
+            state = _batch_state(batch)
+            unclaimed = {"_id": job["_id"], "status": running, "batch_state": {"$ne": _FINISHING}}
+            if state in _BATCH_DONE:
+                if db[COLL_TRANSLATION_JOBS].update_one(unclaimed, {"$set": {
+                    "batch_state": _FINISHING, "heartbeat_at": utcnow(), "updated_at": utcnow(),
+                }}).modified_count:
+                    events.translation_changed(job["_id"])
+                    ctl.make_event(str(job["_id"]))
+                    _held_jobs.add(job["_id"])
+                    _start_heartbeat()
+                    _executor.submit(_run_translation, job["_id"], job["document_id"])
+            elif state in _BATCH_DEAD:
+                why = getattr(batch.error, "message", None) if batch.error else None
+                if db[COLL_TRANSLATION_JOBS].update_one(unclaimed, {"$set": {
+                    "status": TranslationJobStatus.failed.value, "batch_state": state,
+                    "error_message": f"the Gemini batch ended {state.removeprefix('JOB_STATE_').lower()}"
+                                     f"{f' ({why})' if why else ''} -- translate again to resubmit",
+                    "updated_at": utcnow(),
+                }}).modified_count:
+                    db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": job["document_id"]}, {"$set": {
+                        "translation_status": TranslationStatus.not_started.value, "updated_at": utcnow()}})
+                    events.translation_changed(job["_id"])
+                    events.document_changed(job["document_id"])
+            else:
+                fields = {"heartbeat_at": utcnow()}
+                if state != job.get("batch_state"):
+                    fields.update(batch_state=state, updated_at=utcnow())
+                db[COLL_TRANSLATION_JOBS].update_one(unclaimed, {"$set": fields})
+                if state != job.get("batch_state"):
+                    events.translation_changed(job["_id"])
 
 
 @router.post("/unique-documents/{document_id}/translation", status_code=201, dependencies=[Depends(require_admin)])

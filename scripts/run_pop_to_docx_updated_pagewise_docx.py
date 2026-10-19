@@ -291,7 +291,10 @@ def split_pdf_to_page_folders(
 # giving up once the attempt has run GEMINI_ATTEMPT_TIMEOUT_SECONDS.
 # ---------------------------------------------------------------------
 
-GEMINI_ATTEMPT_TIMEOUT_SECONDS = int(os.environ.get("GEMINI_ATTEMPT_TIMEOUT_SECONDS") or 60)
+GEMINI_ATTEMPT_TIMEOUT_SECONDS = int(os.environ.get("GEMINI_ATTEMPT_TIMEOUT_SECONDS") or 120)
+# Flex (service_tier="flex": half price, best-effort capacity) answers in 1-15
+# minutes, so a Flex attempt gets Google's recommended 15 instead of two.
+GEMINI_FLEX_TIMEOUT_SECONDS = int(os.environ.get("GEMINI_FLEX_TIMEOUT_SECONDS") or 900)
 
 try:  # present when run inside pop_server; absent when the script runs alone
     import _job_ctl as _ctl
@@ -323,6 +326,8 @@ def _api_limit_message(e: BaseException) -> str | None:
     text, code = str(e), getattr(e, "code", None)
     if code == 402:
         return "Gemini credits are used up -- add credit in AI Studio, then translate again"
+    if code == 429 and "spending cap" in text:
+        return "Gemini monthly spending cap reached -- raise it in AI Studio, then translate again"
     if code == 429 and ("PerDay" in text or "per_day" in text):
         # Google says how long until the cap resets ('retryDelay': '52715s');
         # turned into a wall-clock time in IST, where the team works.
@@ -363,7 +368,8 @@ def _run_with_deadline(fn, timeout_seconds: float):
     return box["value"]
 
 
-def make_generate_content_config(enable_google_search: bool = True, thinking_level: str = "HIGH"):
+def make_generate_content_config(enable_google_search: bool = True, thinking_level: str = "HIGH",
+                                 service_tier: str | None = None):
     tools = []
 
     if enable_google_search:
@@ -378,7 +384,38 @@ def make_generate_content_config(enable_google_search: bool = True, thinking_lev
             thinking_level=thinking_level.upper(),
         ),
         tools=tools,
+        service_tier=service_tier,
     )
+
+
+# -- Gemini Batch API ----------------------------------------------------------
+# The same request translate_page_pdf_to_html_gemini sends, written out as one
+# line of a Batch API input file instead of sent at once. Google runs the lines
+# later (hours, not seconds) at half price and outside the daily request limit;
+# the caller (dashboard/routes_translation.py) submits, polls and collects.
+
+def gemini_batch_request(pdf_path: Path, prompt: str, enable_google_search: bool,
+                         thinking_level: str = "HIGH") -> dict:
+    png_bytes = render_pdf_page_to_png_bytes(pdf_path)
+    request = {
+        "contents": [{"role": "user", "parts": [
+            {"text": prompt},
+            {"inline_data": {"mime_type": "image/png", "data": base64.b64encode(png_bytes).decode("ascii")}},
+        ]}],
+        "generation_config": {"thinking_config": {"thinking_level": thinking_level.upper()}},
+    }
+    if enable_google_search:
+        request["tools"] = [{"google_search": {}}]
+    return request
+
+
+def gemini_batch_html(response: dict) -> str:
+    """The page's HTML out of one batch result's `response`; raises if empty."""
+    parts = (((response.get("candidates") or [{}])[0].get("content") or {}).get("parts")) or []
+    text = "".join(p.get("text") or "" for p in parts if not p.get("thought")).strip()
+    if not text:
+        raise RuntimeError("Empty response received from Gemini batch.")
+    return clean_html(text)
 
 
 def translate_page_pdf_to_html_gemini(
@@ -390,6 +427,7 @@ def translate_page_pdf_to_html_gemini(
     retry_wait_seconds: int,
     enable_google_search: bool,
     thinking_level: str = "HIGH",
+    service_tier: str | None = None,
 ) -> tuple[str, dict | None]:
     """
     Sends the same 300 DPI rendered page PNG the MiniMax/OpenAI paths get,
@@ -403,15 +441,17 @@ def translate_page_pdf_to_html_gemini(
     """
     png_bytes = render_pdf_page_to_png_bytes(pdf_path)
     last_error = None
+    time_limit = GEMINI_FLEX_TIMEOUT_SECONDS if service_tier == "flex" else GEMINI_ATTEMPT_TIMEOUT_SECONDS
 
     # The HTTP timeout only frees a helper thread _run_with_deadline gave up on.
     client = genai.Client(
         api_key=api_key,
-        http_options=types.HttpOptions(timeout=GEMINI_ATTEMPT_TIMEOUT_SECONDS * 1000),
+        http_options=types.HttpOptions(timeout=time_limit * 1000),
     )
     generate_content_config = make_generate_content_config(
         enable_google_search=enable_google_search,
         thinking_level=thinking_level,
+        service_tier=service_tier,
     )
 
     pname = pdf_path.parent.name
@@ -425,7 +465,7 @@ def translate_page_pdf_to_html_gemini(
             log(
                 f"{pname} | attempt {attempt}/{max_retries} | "
                 f"request sent to Gemini | image_size={image_size_kb:.1f} KB | thinking_level={thinking_level} | "
-                f"time_limit={GEMINI_ATTEMPT_TIMEOUT_SECONDS}s"
+                f"tier={service_tier or 'standard'} | time_limit={time_limit}s"
             )
 
             def stream(attempt=attempt, attempt_start=attempt_start):
@@ -471,7 +511,7 @@ def translate_page_pdf_to_html_gemini(
                 return collected, usage_metadata, chunk_count, text_chunk_count
 
             collected, usage_metadata, chunk_count, text_chunk_count = _run_with_deadline(
-                stream, GEMINI_ATTEMPT_TIMEOUT_SECONDS)
+                stream, time_limit)
 
             full_text = "".join(collected).strip()
             attempt_elapsed = time.perf_counter() - attempt_start
@@ -519,9 +559,15 @@ def translate_page_pdf_to_html_gemini(
                 raise ApiLimitReached(why) from e
 
             if attempt < max_retries:
-                log(f"{pname} | waiting {retry_wait_seconds}s before retry")
-                _sleep_cancellable(retry_wait_seconds)
+                # Flex runs on spare capacity and answers 503 when there is none;
+                # Google's advice is to back off, so each wait doubles there.
+                wait = retry_wait_seconds * (2 ** (attempt - 1) if service_tier == "flex" else 1)
+                log(f"{pname} | waiting {wait}s before retry")
+                _sleep_cancellable(wait)
 
+    if service_tier == "flex" and getattr(last_error, "code", None) == 503:
+        raise RuntimeError(f"Flex had no spare capacity at Google (503 on all {max_retries} tries) "
+                           f"-- try again later, or use normal or batch") from last_error
     raise RuntimeError(f"Failed after {max_retries} attempts for {pdf_path}") from last_error
 
 
@@ -913,6 +959,7 @@ def translate_page_pdf_to_html(
     provider: str = "gemini",
     openai_reasoning_effort: str | None = None,
     gemini_thinking_level: str = "HIGH",
+    gemini_service_tier: str | None = None,
 ) -> tuple[str, dict | None]:
     if provider == "claude":
         return translate_page_pdf_to_html_claude(
@@ -954,6 +1001,7 @@ def translate_page_pdf_to_html(
         retry_wait_seconds=retry_wait_seconds,
         enable_google_search=enable_google_search,
         thinking_level=gemini_thinking_level,
+        service_tier=gemini_service_tier,
     )
 
 
@@ -969,6 +1017,7 @@ def process_translation_for_page(
     provider: str = "gemini",
     openai_reasoning_effort: str | None = None,
     gemini_thinking_level: str = "HIGH",
+    gemini_service_tier: str | None = None,
 ):
     page_start = time.perf_counter()
 
@@ -1003,6 +1052,7 @@ def process_translation_for_page(
             provider=provider,
             openai_reasoning_effort=openai_reasoning_effort,
             gemini_thinking_level=gemini_thinking_level,
+            gemini_service_tier=gemini_service_tier,
         )
 
         html_path.write_text(translated_html, encoding="utf-8")

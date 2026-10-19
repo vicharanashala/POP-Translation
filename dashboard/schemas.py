@@ -28,7 +28,9 @@ from typing import Annotated, Generic, TypeVar
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, model_validator
 
-from dashboard.models import ReviewStatus, TranslationJobKind, TranslationJobStatus, TranslationStatus, UploadQueueStatus
+from dashboard.models import (
+    ReviewStatus, TranslationJobKind, TranslationJobStatus, TranslationMode, TranslationStatus, UploadQueueStatus,
+)
 
 T = TypeVar("T")
 
@@ -720,13 +722,17 @@ class TranslationJobOut(BaseModel):
     unique_document_id: str | None = None  # same as document_id; the name the frontend keys the modal on
     shareable_name: str | None = None
     kind: TranslationJobKind
+    mode: TranslationMode = TranslationMode.normal  # normal / flex / batch -- the tag on the queue item
+    # Batch only: Google's state for the batch (JOB_STATE_PENDING, _RUNNING,
+    # ...), "finishing" while its pages are made into the .docx; null otherwise.
+    batch_state: str | None = None
     status: TranslationJobStatus
     progress_pct: int
     pages_done: int | None = None
     total_pages: int | None = None
     error_message: str | None = None
     # One per page: the WorkDrive link of the page's translated .docx, "" for a
-    # page not translated yet. Kept on a failed job; empty once done/cancelled.
+    # page not translated yet. Kept on a failed or cancelled job; empty once done.
     page_links: list[str] = []
     created_at: UTCDatetime
     updated_at: UTCDatetime

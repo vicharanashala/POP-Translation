@@ -984,6 +984,8 @@ async def lifespan(app: FastAPI):
         init_db()
     except Exception as e:
         print(f"[WARN] dashboard DB init failed at startup: {e}")
+    from dashboard.routes_translation import start_batch_poller
+    start_batch_poller()  # Gemini batches submitted before a restart are still collected
     yield
 
 

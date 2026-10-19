@@ -154,6 +154,16 @@ class TranslationJobKind(str, enum.Enum):
     review_upload = "review_upload"
 
 
+class TranslationMode(str, enum.Enum):
+    """How the pages go to Gemini. normal: one call a page, now. flex: the same
+    calls on Google's half-price best-effort tier (each answers in 1-15
+    minutes). batch: every page in one Batch API job, run by Google within 24
+    hours at half price and outside the daily request limit."""
+    normal = "normal"
+    flex = "flex"
+    batch = "batch"
+
+
 class TranslationJobStatus(str, enum.Enum):
     queued = "queued"
     running = "running"
@@ -530,7 +540,8 @@ def new_upload_candidate(*, document, score: float, match_type: str,
     }
 
 
-def new_translation_job(*, document_id, kind: TranslationJobKind) -> dict:
+def new_translation_job(*, document_id, kind: TranslationJobKind,
+                        mode: TranslationMode = TranslationMode.normal) -> dict:
     """DB-backed version of pop_server.py's in-memory `_jobs` dict pattern --
     same shape, but survives a server restart.
 
@@ -542,6 +553,7 @@ def new_translation_job(*, document_id, kind: TranslationJobKind) -> dict:
     return {
         "document_id": document_id,
         "kind": kind.value if isinstance(kind, TranslationJobKind) else kind,
+        "mode": TranslationMode(mode).value,
         "status": TranslationJobStatus.queued.value,
         "progress_pct": 0,
         # Page-level progress -- set once the source PDF is split (see
@@ -552,14 +564,20 @@ def new_translation_job(*, document_id, kind: TranslationJobKind) -> dict:
         "error_message": None,
         # One entry per page, in page order: the WorkDrive link of that page's
         # translated .docx once it is finished, "" until then. Set once the PDF
-        # is split; a failed job keeps them, so translating again only redoes
-        # the "" pages. Emptied when the job ends done or cancelled (the page
-        # files are trashed then). page_file_ids is the same list as file ids.
+        # is split; a failed or cancelled job keeps them, so translating again
+        # only redoes the "" pages. Emptied when the job ends done or is deleted
+        # (the page files are trashed then). page_file_ids is the same list as file ids.
         "page_links": [],
         "page_file_ids": [],
         # The original the pages were cut from -- if the document's file has
         # changed since, the stored pages are not its pages any more.
         "source_file_id": None,
+        # Batch mode only: the Gemini batch job's name ("batches/...") once the
+        # pages are submitted, and its last known state (JOB_STATE_PENDING ...,
+        # or "finishing" once a server has claimed the results). No thread
+        # holds a job while Google works on it; the batch poller looks after it.
+        "batch_name": None,
+        "batch_state": None,
         # Bumped every few seconds while this server holds the job (queued or
         # running); a job whose heartbeat stops was lost to a restart.
         "heartbeat_at": now,
