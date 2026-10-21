@@ -460,10 +460,14 @@ def _finish(item_id: ObjectId, document_id: ObjectId | None) -> None:
                         "language": metadata.get("language"),
                         "language_source": "manual",
                         **{k: metadata.get(k) for k in _METADATA_FIELDS},
-                        # Who passed it through the approval chain, as the
-                        # queue recorded them (routes_uploads).
+                        # Who uploaded it and passed it through the approval
+                        # chain, as the queue recorded them (routes_uploads):
+                        # names for showing, agriai.users ids beside them.
+                        "uploaded_by_id": item.get("expert"),
                         "approved_by_approver": item.get("approved_by_approver"),
+                        "approved_by_approver_id": item.get("approved_by_approver_id"),
                         "approved_by_admin": item.get("approved_by_admin"),
+                        "approved_by_admin_id": item.get("approved_by_admin_id"),
                         # Where the document applies, re-read from the ids the
                         # submit verified. Omitted when unset, like every other
                         # optional reference.

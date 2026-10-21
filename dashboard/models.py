@@ -505,9 +505,12 @@ def new_upload_queue_item(*, filename: str, placements: list[dict], metadata: di
         "upload_level": upload_level,
         "approver_note": None,
         "admin_note": None,
-        # Who approved it at each stage; written onto the document by /new.
+        # Who approved it at each stage, by name and by agriai.users id;
+        # written onto the document by /new.
         "approved_by_approver": None,
+        "approved_by_approver_id": None,
         "approved_by_admin": None,
+        "approved_by_admin_id": None,
         "created_at": now,
         "updated_at": now,
     }

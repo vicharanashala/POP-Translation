@@ -48,8 +48,9 @@ cancelling leaves nothing behind in WorkDrive.
 WHO APPROVED IT. /approve, /add and /new take an optional body
 `{"approved_by": "<display name>"}` (/add also its `document_id`), like
 `translated_by` on a translation. The names wait on the item as
-`approved_by_approver` / `approved_by_admin` and are written onto the document
-when /new creates it. /add files more places for a document that already
+`approved_by_approver` / `approved_by_admin`, each with the person's account id
+beside it (`..._id`, from X-User-Id), and are written onto the document when
+/new creates it, together with the uploader's id (`expert`) as `uploaded_by_id`. /add files more places for a document that already
 exists, and leaves its approvals as they were -- as it leaves `uploaded_by`.
 
 ONE DECISION PER ITEM. Requests run in parallel, not in turn, so every move
@@ -614,7 +615,8 @@ def approve_upload(item_id: str, body: dict = Body(default=None), who: Caller = 
     # The approvers' own note asked the uploader for something that has now
     # been passed; left on, the admins would read a settled reason as current.
     return _move(db, oid, UploadStage.approver, who, level=2, approver_note=None,
-                 approved_by_approver=_approver_name(db, body, who, UPLOAD_LIST))
+                 approved_by_approver=_approver_name(db, body, who, UPLOAD_LIST),
+                 approved_by_approver_id=who.user_id)
 
 
 @router.post("/uploads/{item_id}/resubmit", response_model=UploadQueueItemOut)
@@ -655,7 +657,8 @@ def decline_upload(item_id: str, body: UploadDecline, who: Caller = Depends(call
     if stage is UploadStage.approver:
         # Back to the uploader unapproved: an approval from an earlier pass
         # (before an admin sent it back) no longer stands.
-        return _move(db, oid, stage, who, level=0, approver_note=note, approved_by_approver=None)
+        return _move(db, oid, stage, who, level=0, approver_note=note,
+                     approved_by_approver=None, approved_by_approver_id=None)
     return _move(db, oid, stage, who, level=1, admin_note=note)
 
 
@@ -714,7 +717,8 @@ def _start(db, oid: ObjectId, document_id: ObjectId | None, who: Caller,
     result = db[COLL_UPLOAD_QUEUE_ITEMS].update_one(
         {"$and": [{"_id": oid, "status": {"$in": list(_REVIEWABLE)}}, _AT_STAGE[UploadStage.admin]]},
         {"$set": {"status": UploadQueueStatus.uploading.value, "error_message": None,
-                  "progress_pct": 55, "approved_by_admin": approved_by, "updated_at": utcnow()}},
+                  "progress_pct": 55, "approved_by_admin": approved_by,
+                  "approved_by_admin_id": who.user_id, "updated_at": utcnow()}},
     )
     if result.matched_count == 0:
         raise HTTPException(409, "this upload was just acted on by someone else -- refresh")

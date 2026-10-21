@@ -345,6 +345,11 @@ class UniqueDocumentOut(DocumentMetadata):
     # where a stage was skipped (an admin's or approver's own upload).
     approved_by_approver: str | None = None
     approved_by_admin: str | None = None
+    # The same three people by agriai.users id. Null on documents filed before
+    # the ids were stored.
+    uploaded_by_id: str | None = None
+    approved_by_approver_id: str | None = None
+    approved_by_admin_id: str | None = None
 
     placement_count: int = 0  # how many main-table rows point here
     # THE ANCHOR: which entry of duplicate_links is this document, as opposed to
@@ -638,10 +643,12 @@ class UploadQueueItemOut(BaseModel):
     upload_level: int = 0
     approver_note: str | None = None
     admin_note: str | None = None
-    # Who approved it at each stage so far; copied onto the document when it
-    # is filed as a new one.
+    # Who approved it at each stage so far, by name and by agriai.users id;
+    # copied onto the document when it is filed as a new one.
     approved_by_approver: str | None = None
+    approved_by_approver_id: str | None = None
     approved_by_admin: str | None = None
+    approved_by_admin_id: str | None = None
     stage: UploadStage
     # What THIS caller may do with the item. Empty on SSE events, which have no
     # caller; the frontend refetches the queue on those.

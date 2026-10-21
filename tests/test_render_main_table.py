@@ -1882,6 +1882,7 @@ def test_documents_carry_only_the_agreed_fields(db):
         "review_status", "review_zoho_file_id", "review_shareable_link",
         "translated_by", "translated_at", "reviewed_by", "reviewed_at",
         "approved_by_approver", "approved_by_admin",
+        "uploaded_by_id", "approved_by_approver_id", "approved_by_admin_id",
         "chunk_embeddings", "main_row_ids", "duplicate_links",
         "representative_file_id", "district_id", "kvk_id",
         "created_at", "updated_at",
@@ -3348,8 +3349,9 @@ def test_who_approved_an_upload_is_recorded_on_its_new_document(client, db, memb
     from dashboard import queue_worker, zoho_layout
     from dashboard.models import COLL_DOCUMENTS, COLL_UNIQUE_DOCUMENTS, COLL_UPLOAD_QUEUE_ITEMS
 
-    expert = _as(str(ObjectId()))
-    approver = _as(members("upload"))  # listed as "Render Test"
+    expert_id, approver_id, admin_id = str(ObjectId()), members("upload"), str(ObjectId())
+    expert = _as(expert_id)
+    approver = _as(approver_id)  # listed as "Render Test"
     item_id = _submit(client, headers=expert, placements_json=_placements(client, ("Karnataka", ["Paddy"])))
     doc_id = None
     try:
@@ -3362,12 +3364,13 @@ def test_who_approved_an_upload_is_recorded_on_its_new_document(client, db, memb
         out = client.post(f"/dashboard/uploads/{item_id}/approve", headers=approver,
                           json={"approved_by": "Approver Person"}).json()
         assert out["approved_by_approver"] == "Approver Person"
+        assert out["approved_by_approver_id"] == approver_id
 
         # The admin's claim, as POST /new makes it -- then the worker's filing,
         # run here so the Zoho upload can be stubbed.
         oid = ObjectId(item_id)
         db[COLL_UPLOAD_QUEUE_ITEMS].update_one({"_id": oid}, {"$set": {
-            "status": "uploading", "approved_by_admin": "Admin Person"}})
+            "status": "uploading", "approved_by_admin": "Admin Person", "approved_by_admin_id": admin_id}})
         monkeypatch.setitem(sys.modules, "pop_server", types.SimpleNamespace(_get_zoho=lambda: None))
         monkeypatch.setattr(zoho_layout, "upload_original", lambda *_a, **_k: "render-test-file")
         queue_worker._finish(oid, None)
@@ -3376,6 +3379,8 @@ def test_who_approved_an_upload_is_recorded_on_its_new_document(client, db, memb
         doc = db[COLL_UNIQUE_DOCUMENTS].find_one({"representative_file_id": "render-test-file"})
         doc_id = doc["_id"]
         assert (doc["approved_by_approver"], doc["approved_by_admin"]) == ("Approver Person", "Admin Person")
+        assert (doc["uploaded_by_id"], doc["approved_by_approver_id"], doc["approved_by_admin_id"]) == \
+            (expert_id, approver_id, admin_id)
         served = client.get(f"/dashboard/unique-documents/{doc_id}").json()
         assert (served["approved_by_approver"], served["approved_by_admin"]) == ("Approver Person", "Admin Person")
         page = client.get("/dashboard/unique-documents",
