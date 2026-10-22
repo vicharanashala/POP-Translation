@@ -603,7 +603,7 @@ def test_domain_is_a_list_picked_from_the_fixed_names(client, db, scratch):
     doc, _rows = scratch
     names = client.get("/dashboard/domains").json()
     comma = "Capacity Building, Extension and Communication"
-    assert len(names) == 19 and comma in names
+    assert len(names) == 20 and comma in names
     assert client.get(f"/dashboard/unique-documents/{doc['_id']}").json()["domain"] == []
 
     url = f"/dashboard/unique-documents/{doc['_id']}"

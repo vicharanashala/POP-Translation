@@ -299,6 +299,7 @@ DOMAINS = (
     "Animal Husbandry and Livestock",
     "Fisheries and Aquaculture",
     "Allied Agricultural Activities",
+    "All",
 )
 
 
