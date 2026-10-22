@@ -26,10 +26,10 @@ import enum
 from datetime import datetime, timezone
 from typing import Annotated, Generic, TypeVar
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, model_validator
+from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, model_validator
 
 from dashboard.models import (
-    ReviewStatus, TranslationJobKind, TranslationJobStatus, TranslationMode, TranslationStatus, UploadQueueStatus,
+    DOMAINS, ReviewStatus, TranslationJobKind, TranslationJobStatus, TranslationMode, TranslationStatus, UploadQueueStatus,
 )
 
 T = TypeVar("T")
@@ -43,6 +43,30 @@ def _as_utc(value: datetime) -> datetime:
 
 
 UTCDatetime = Annotated[datetime, AfterValidator(_as_utc)]
+
+
+def as_domain_list(value):
+    """`domain` is a list. None is the empty list, and a bare string -- every
+    value stored before it became one, and what an older client still sends --
+    is a list of that one name."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    return value
+
+
+def _known_domains(value: list[str]) -> list[str]:
+    unknown = [d for d in value if d not in DOMAINS]
+    if unknown:
+        raise ValueError(f"unknown domain {unknown[0]!r} -- pick from GET /dashboard/domains")
+    return list(dict.fromkeys(value))  # a name picked twice is stored once
+
+
+# What is served (tolerant: always a list) and what is accepted (checked
+# against DOMAINS as well).
+DomainsOut = Annotated[list[str] | None, BeforeValidator(as_domain_list)]
+Domains = Annotated[list[str] | None, BeforeValidator(as_domain_list), AfterValidator(_known_domains)]
 
 
 class Paginated(BaseModel, Generic[T]):
@@ -242,7 +266,7 @@ class DocumentMetadata(BaseModel):
     advisory_released_org: str | None = None
     advisory_org_address: str | None = None
     live_source_link: str | None = None
-    domain: str | None = None
+    domain: Domains = None  # several of models.DOMAINS; [] for none
     verification_status: str | None = None
     document_status: str | None = None
 
@@ -282,6 +306,7 @@ _STORED_INTS = ("month_of_release", "year_of_release", "month_of_collection", "y
 class UniqueDocumentOut(DocumentMetadata):
     model_config = ConfigDict(from_attributes=True)
     id: str  # ObjectId, 24-char hex
+    domain: DomainsOut = []  # served as stored, not re-checked
 
     @model_validator(mode="before")
     @classmethod
@@ -683,7 +708,7 @@ class UploadEdit(BaseModel):
     advisory_released_org: str | None = None
     advisory_org_address: str | None = None
     live_source_link: str | None = None
-    domain: str | None = None
+    domain: Domains = None
     verification_status: str | None = None
     document_status: str | None = None
 

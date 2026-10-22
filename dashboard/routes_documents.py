@@ -45,6 +45,7 @@ from dashboard.display_id import (
 from dashboard.languages import LANGUAGES, TESSDATA_BEST
 from dashboard.models import (
     COLL_DISTRICTS,
+    DOMAINS,
     COLL_DOCUMENTS,
     COLL_KVKS,
     COLL_LANGUAGES,
@@ -127,6 +128,7 @@ DATE = "date"          # ISO "YYYY-MM-DD" string, plus <key>_from / <key>_to
 DATETIME = "datetime"  # real BSON date; a whole day, plus _from / _to
 ANNAM = "annam"        # ANNAM_00042 or 42
 POP = "pop"            # POP_00042 or 42
+NAMES = "names"        # whole names from a fixed list, "|"-separated = has ANY
 
 
 def _icontains(value: str) -> dict:
@@ -212,6 +214,15 @@ def _match_for(kind: str, raw: str):
         # commas -- a shareable name can contain one ("Paddy, Kharif").
         phrase = raw.strip()
         return _icontains(phrase) if phrase else _NO_MATCH
+
+    if kind == NAMES:
+        # Split on "|", not ",": domain names contain commas. Matched whole
+        # (case-insensitively) against a LIST field -- Mongo's $in on an array
+        # matches a document holding any one of them.
+        names = [v.strip() for v in raw.split("|") if v.strip()]
+        if not names:
+            return _NO_MATCH
+        return {"$in": [re.compile(f"^{re.escape(n)}$", re.IGNORECASE) for n in names]}
 
     values = _split(raw)
     if not values:
@@ -423,7 +434,7 @@ _JOINED_FILTERS = {
     "edition_revision_volume": ("edition_revision_volume", PHRASE),
     "live_source_link": ("live_source_link", PHRASE),
     "season": ("season", TEXT),
-    "domain": ("domain", TEXT),
+    "domain": ("domain", NAMES),
     "verification_status": ("verification_status", TEXT),
     "uploaded_by": ("uploaded_by", TEXT),
     "document_status": ("document_status", TEXT),
@@ -1644,6 +1655,13 @@ def list_folders(request: Request, db=Depends(get_db)):
 # admin tool; it refuses every kind while the fourth column of KINDS is False,
 # which is the seam to reopen if folder standardisation needs organisation
 # merges back.
+
+
+@router.get("/domains", response_model=list[str])
+def list_domains():
+    """The domain names a document's `domain` list is picked from -- fixed, in
+    models.DOMAINS."""
+    return list(DOMAINS)
 
 
 @router.get("/languages", response_model=list[LanguageOut])

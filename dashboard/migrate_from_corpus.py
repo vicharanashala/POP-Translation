@@ -214,6 +214,7 @@ def load_rows(include_non_state: bool = False) -> list[dict]:
                 continue  # collection date already taken from report_true
             value = p.get(name)
             fields[name] = _int_or_none(value) if name.startswith(("month_", "year_")) else _str_or_none(value)
+        fields["domain"] = [fields["domain"]] if fields.get("domain") else []
 
         # -- overlay, by file id --------------------------------------------
         bf = backfill.get(c["file_id"])

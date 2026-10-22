@@ -586,12 +586,61 @@ def test_embeddings_are_never_serialised(client, scratch):
 def test_patch_metadata_goes_to_the_document(client, scratch):
     """One write, not one per placement."""
     doc, rows = scratch
-    resp = client.patch(f"/dashboard/documents/{rows[0]['_id']}", json={"season": "Rabi", "domain": "Agri"})
+    resp = client.patch(f"/dashboard/documents/{rows[0]['_id']}",
+                        json={"season": "Rabi", "domain": ["Weed Management"]})
     assert resp.status_code == 200
     out = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()
-    assert out["season"] == "Rabi" and out["domain"] == "Agri"
+    assert out["season"] == "Rabi" and out["domain"] == ["Weed Management"]
     # ...and therefore visible from the OTHER placement too.
     assert client.get(f"/dashboard/documents/{rows[1]['_id']}").status_code == 200
+
+
+def test_domain_is_a_list_picked_from_the_fixed_names(client, db, scratch):
+    """Several domains per document, each one of GET /dashboard/domains; the
+    filter takes whole names separated by "|", because names contain commas."""
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    doc, _rows = scratch
+    names = client.get("/dashboard/domains").json()
+    comma = "Capacity Building, Extension and Communication"
+    assert len(names) == 19 and comma in names
+    assert client.get(f"/dashboard/unique-documents/{doc['_id']}").json()["domain"] == []
+
+    url = f"/dashboard/unique-documents/{doc['_id']}"
+    out = client.patch(url, json={"domain": [comma, "Weed Management", comma]}).json()
+    assert out["domain"] == [comma, "Weed Management"]  # a repeat is stored once
+    assert client.patch(url, json={"domain": ["Agri"]}).status_code == 422
+    assert db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc["_id"]})["domain"] == [comma, "Weed Management"]
+
+    def found(value):
+        page = client.get("/dashboard/unique-documents",
+                          params={"filter[domain]": value, "filter[sha256]": doc["sha256"]}).json()
+        return [d["id"] for d in page["items"]] == [str(doc["_id"])]
+    assert found(comma)  # the comma does not split it
+    assert found("disease management|weed management")  # any of them, any case
+    assert not found("Disease Management")
+    assert not found("Weed")  # whole names, not substrings
+
+    # A string as stored before the change is served as a one-name list.
+    db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": doc["_id"]}, {"$set": {"domain": "Weed Management"}})
+    assert client.get(url).json()["domain"] == ["Weed Management"]
+    assert client.patch(url, json={"domain": None}).json()["domain"] == []
+
+
+def test_upload_form_takes_the_domains_as_json(client, db):
+    from dashboard.models import COLL_UPLOAD_QUEUE_ITEMS
+
+    placements = _placements(client, ("Karnataka", ["Paddy"]))
+    bad = client.post("/dashboard/uploads", files={"file": ("render_test.pdf", _unique_pdf(), "application/pdf")},
+                      data={"language": "eng", "placements_json": placements, "domain_json": '["Agri"]'})
+    assert bad.status_code == 400 and "unknown domain" in bad.text
+    item_id = _submit(client, placements_json=placements,
+                      domain_json='["Credit, Loan and Insurance", "Rural Infrastructure"]')
+    try:
+        item = db[COLL_UPLOAD_QUEUE_ITEMS].find_one({"_id": ObjectId(item_id)})
+        assert item["metadata"]["domain"] == ["Credit, Loan and Insurance", "Rural Infrastructure"]
+    finally:
+        _drop_upload(item_id)
 
 
 def test_patch_placement_stays_on_the_row(client, db, scratch):

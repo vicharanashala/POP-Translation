@@ -64,6 +64,7 @@ from dashboard.models import (
     new_upload_candidate,
     utcnow,
 )
+from dashboard.schemas import as_domain_list
 
 # Two workers, as before: the work per item is one Zoho upload plus a handful
 # of inserts, and keeping the pool small avoids competing for bandwidth with
@@ -460,6 +461,8 @@ def _finish(item_id: ObjectId, document_id: ObjectId | None) -> None:
                         "language": metadata.get("language"),
                         "language_source": "manual",
                         **{k: metadata.get(k) for k in _METADATA_FIELDS},
+                        # A list; an item queued while it was one string holds that.
+                        "domain": as_domain_list(metadata.get("domain")),
                         # Who uploaded it and passed it through the approval
                         # chain, as the queue recorded them (routes_uploads):
                         # names for showing, agriai.users ids beside them.

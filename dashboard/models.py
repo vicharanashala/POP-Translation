@@ -273,6 +273,35 @@ MANUAL_METADATA_FIELDS = (
 )
 
 
+# The advisory domains a document can be tagged with -- the `domain` field, a
+# LIST of these names (a document often covers several). Fixed here, served at
+# GET /dashboard/domains for the frontend's multi-select, and checked on every
+# write, so a typo cannot become a filter value nobody can pick. Names, not ids:
+# no other system owns this list, and nothing renames them. Several contain a
+# comma, which is why filter[domain] separates names with "|".
+DOMAINS = (
+    "Soil Health and Nutrient Management",
+    "Irrigation and Water Management",
+    "Insect and Pest Management",
+    "Disease Management",
+    "Seed and Variety Selection",
+    "Cultural and Crop Management Practices",
+    "Organic and Natural Farming",
+    "Weed Management",
+    "Climate, Weather and Stress Management",
+    "Farm Tools and Mechanisation",
+    "Post-Harvest Management and Storage",
+    "Market Prices, MSP and Marketing",
+    "Agricultural Schemes and Subsidies",
+    "Credit, Loan and Insurance",
+    "Capacity Building, Extension and Communication",
+    "Rural Infrastructure",
+    "Animal Husbandry and Livestock",
+    "Fisheries and Aquaculture",
+    "Allied Agricultural Activities",
+)
+
+
 def new_document(*, row_id: int, unique_document_id, state_id, state_raw: str,
                  crop_raw: str, crop_id=None, organization_id=None, **fields) -> dict:
     """One row of the main table: this document, filed under this state and crop.
@@ -364,6 +393,7 @@ def new_unique_document(*, display_id: int, sha256: str | None = None,
         "language_source": None,
         # -- manual metadata: what a human fills in through the dashboard --
         **{name: None for name in MANUAL_METADATA_FIELDS},
+        "domain": [],  # a list of DOMAINS names, empty when none is set
         # -- translation / review: ONCE per document --
         # This is the point of the split. Previously the corpus's most-placed
         # file would have been translated 66 times.

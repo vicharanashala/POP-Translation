@@ -104,6 +104,7 @@ from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
+from pydantic import TypeAdapter, ValidationError
 from pymongo import ASCENDING, DESCENDING
 
 from dashboard import events, queue_worker, vocabulary
@@ -121,7 +122,7 @@ from dashboard.models import (
     normalize_format,
     utcnow,
 )
-from dashboard.schemas import UploadActions, UploadDecline, UploadEdit, UploadQueueItemOut, UploadStage
+from dashboard.schemas import Domains, UploadActions, UploadDecline, UploadEdit, UploadQueueItemOut, UploadStage
 
 router = APIRouter()
 
@@ -273,6 +274,16 @@ def _item_out(item: dict, who: Caller | None = None) -> UploadQueueItemOut:
     data["stage"] = stage
     data["actions"] = _actions(item, who)
     return UploadQueueItemOut(**data)
+
+
+def _parse_domains(domain_json: str | None) -> list[str]:
+    """The upload form's `domain_json`, checked like a PATCH's `domain`."""
+    try:
+        return TypeAdapter(Domains).validate_python(json.loads(domain_json) if domain_json else None)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "domain_json must be a JSON list of names")
+    except ValidationError as e:
+        raise HTTPException(400, f"domain_json: {e.errors()[0]['msg']}")
 
 
 def _parse_placements(db, placements_json: str | None) -> list[dict]:
@@ -428,7 +439,9 @@ async def create_upload(
     advisory_released_org: str | None = Form(None),
     advisory_org_address: str | None = Form(None),
     live_source_link: str | None = Form(None),
-    domain: str | None = Form(None),
+    # The domains as a JSON list of names from GET /dashboard/domains -- JSON
+    # because several names contain a comma.
+    domain_json: str | None = Form(None),
     verification_status: str | None = Form(None),
     uploaded_by: str | None = Form(None),
     document_status: str | None = Form(None),
@@ -454,6 +467,7 @@ async def create_upload(
     sha = hashlib.sha256(pdf_bytes).hexdigest()
     _refuse_if_queued(db, sha)
 
+    domain = _parse_domains(domain_json)
     local = locals()
     metadata = {"language": language, **{name: local.get(name) for name in MANUAL_METADATA_FIELDS},
                 "format_original": normalize_format(format_original),
