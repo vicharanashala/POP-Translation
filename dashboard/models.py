@@ -100,6 +100,8 @@ COLL_DISTRICTS = "pop_districts"
 COLL_KVKS = "pop_kvks"
 COLL_LANGUAGES = "pop_languages"
 COLL_UPLOAD_QUEUE_ITEMS = "pop_upload_queue_items"
+# Finished uploads, moved here from the queue once filed (queue_worker._finish).
+COLL_UPLOAD_TRAIL = "pop_upload_trail"
 COLL_TRANSLATION_JOBS = "pop_translation_jobs"
 COLL_CONFIG = "pop_config"
 # The two permission lists an admin manages: "edit" (may change documents) and

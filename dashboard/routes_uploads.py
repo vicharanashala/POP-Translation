@@ -116,6 +116,7 @@ from dashboard.models import (
     COLL_LANGUAGES,
     COLL_UNIQUE_DOCUMENTS,
     COLL_UPLOAD_QUEUE_ITEMS,
+    COLL_UPLOAD_TRAIL,
     MANUAL_METADATA_FIELDS,
     UploadQueueStatus,
     new_upload_queue_item,
@@ -496,8 +497,9 @@ def list_uploads(who: Caller = Depends(caller), db=Depends(get_db)):
     """The queue: uploads still being checked, waiting on a decision, or failed.
 
     Nothing finished is here. Once a person picks add/new and the work
-    completes, the item deletes itself -- the outcome is the document and its
-    rows, which the main table already shows. Cancel deletes it too. So an item
+    completes, the item moves to the trail (GET /uploads/history) -- the
+    outcome is the document and its rows, which the main table already shows.
+    Cancel deletes it. So an item
     disappearing from this list IS the success signal; poll it, and refresh the
     main table when something goes.
 
@@ -507,6 +509,25 @@ def list_uploads(who: Caller = Depends(caller), db=Depends(get_db)):
     rows = db[COLL_UPLOAD_QUEUE_ITEMS].find(_visible_filter(who)).sort(
         [("created_at", DESCENDING), ("_id", ASCENDING)])
     return [_item_out(item, who) for item in rows]
+
+
+@router.get("/uploads/history", response_model=list[UploadQueueItemOut])
+def upload_history(who: Caller = Depends(caller), db=Depends(get_db)):
+    """Finished uploads (pop_upload_trail), newest first: the ones this caller
+    uploaded, and, for an upload approver or admin, the ones they approved at
+    their stage. Read-only -- `actions` is always empty.
+
+    Declared before /uploads/{item_id}, which would otherwise take "history" as
+    an id.
+    """
+    clauses = [{"expert": who.user_id}]
+    if who.can_approve_uploads or who.is_admin:
+        clauses.append({"approved_by_approver_id": who.user_id})
+    if who.is_admin:
+        clauses.append({"approved_by_admin_id": who.user_id})
+    rows = db[COLL_UPLOAD_TRAIL].find({"$or": clauses}).sort(
+        [("created_at", DESCENDING), ("_id", ASCENDING)])
+    return [_item_out(item) for item in rows]
 
 
 @router.get("/uploads/{item_id}", response_model=UploadQueueItemOut)

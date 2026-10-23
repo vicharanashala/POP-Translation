@@ -54,6 +54,7 @@ from dashboard.models import (
     COLL_DOCUMENTS,
     COLL_UNIQUE_DOCUMENTS,
     COLL_UPLOAD_QUEUE_ITEMS,
+    COLL_UPLOAD_TRAIL,
     MANUAL_METADATA_FIELDS,
     UploadQueueStatus,
     link_placement,
@@ -493,16 +494,21 @@ def _finish(item_id: ObjectId, document_id: ObjectId | None) -> None:
             rows = create_placements(db, document=document, placements=placements, copy=copy)
             code = format_display_id(document["display_id"])
             row_codes = [format_row_id(r["row_id"]) for r in rows]
-            # The decision is carried out, so the item leaves the queue. The
-            # queue holds work that is in flight or waiting on a person -- a
-            # finished upload is not either, and leaving a `done` row behind
-            # just makes someone clear it by hand. The result is not lost: it
-            # is the document and the rows themselves, which the main table
-            # shows at the top (it sorts created_at DESC).
+            # The decision is carried out, so the item leaves the queue for the
+            # trail. The queue holds work that is in flight or waiting on a
+            # person -- a finished upload is not either, and leaving a `done`
+            # row behind just makes someone clear it by hand. The trail keeps
+            # it, with what it became, for the history view (GET
+            # /uploads/history).
             #
             # `failed` items are the one thing that stays: they carry the error
             # and are retryable via the same add/new endpoints.
-            db[COLL_UPLOAD_QUEUE_ITEMS].delete_one({"_id": item_id})
+            done = db[COLL_UPLOAD_QUEUE_ITEMS].find_one_and_delete({"_id": item_id})
+            if done is not None:
+                db[COLL_UPLOAD_TRAIL].insert_one({
+                    **done, "status": UploadQueueStatus.done.value, "progress_pct": 100,
+                    "error_message": None, "created_document_id": code,
+                    "created_row_ids": row_codes, "updated_at": utcnow()})
             # The item is gone, so the event says where it went: the frontend
             # opens that document, and refreshes the tables for the new rows.
             events.upload_removed(item_id, unique_document_id=str(document["_id"]),

@@ -50,6 +50,7 @@ from dashboard.models import (
     COLL_TRANSLATION_JOBS,
     COLL_UNIQUE_DOCUMENTS,
     COLL_UPLOAD_QUEUE_ITEMS,
+    COLL_UPLOAD_TRAIL,
 )
 
 # Client/database are constructed lazily on first real use, not at import
@@ -236,6 +237,9 @@ _INDEXES: dict[str, list[dict]] = {
         # The same file may not be queued twice (routes_uploads._refuse_if_queued).
         # Not unique: items queued before that check may already share one.
         {"keys": [("sha256", ASCENDING)], "name": "sha256"},
+    ],
+    COLL_UPLOAD_TRAIL: [
+        {"keys": [("created_at", DESCENDING), ("_id", ASCENDING)], "name": "created_at_id"},
     ],
     COLL_APPROVERS: [
         {"keys": [("list", ASCENDING), ("user_id", ASCENDING)], "unique": True, "name": "uq_list_user"},
