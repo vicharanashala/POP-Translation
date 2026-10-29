@@ -3142,7 +3142,7 @@ def _queue_ids(client, headers) -> list[str]:
 def test_an_expert_upload_goes_through_the_approvers_to_the_admins(client, db, members):
     """The whole chain, both declines included:
 
-        expert -> approver -(approve)-> admin -(decline)-> approver -(decline)-> expert
+        expert -(approve)-> approver -(approve)-> admin -(decline)-> approver -(decline)-> expert
     """
     expert, other = _as(str(ObjectId())), _as(str(ObjectId()))
     approver = _as(members("upload"))
@@ -3150,6 +3150,15 @@ def test_an_expert_upload_goes_through_the_approvers_to_the_admins(client, db, m
                       placements_json=_placements(client, ("Karnataka", ["Paddy"])))
     try:
         item = _await_review(client, item_id, headers=expert)
+        # It starts with its uploader, who may edit, approve or remove it --
+        # and nobody else sees it yet.
+        assert (item["stage"], item["level"], item["upload_level"]) == ("expert", 0, 0)
+        assert item["actions"] == {"can_edit": True, "can_approve": True, "can_decline": False,
+                                   "can_decide": False, "can_discard": False, "can_resubmit": False,
+                                   "can_remove": True}
+        assert item_id not in _queue_ids(client, approver)
+        assert client.post(f"/dashboard/uploads/{item_id}/approve", headers=other).status_code == 404
+        item = client.post(f"/dashboard/uploads/{item_id}/approve", headers=expert).json()
         assert (item["stage"], item["level"], item["upload_level"]) == ("approver", 1, 0)
         # The uploader sees it but can no longer withdraw or decide it.
         assert not any(item["actions"].values()), item["actions"]
@@ -3245,16 +3254,22 @@ def test_an_expert_upload_goes_through_the_approvers_to_the_admins(client, db, m
         _drop_upload(item_id)
 
 
-def test_an_approver_or_admin_upload_starts_with_the_admins(client, members):
-    """Their own uploads skip the approvers, and are never declined below the
-    level they came from: an admin's has nobody to go back to, an approver's
-    goes back to the approvers once and stops there."""
+def test_an_approver_or_admin_upload_starts_at_their_own_level(client, members):
+    """An approver's own upload waits on them until they approve it on to the
+    admins; an admin's starts with the admins. Neither is ever declined below
+    the level it came from: an admin's has nobody to go back to, an
+    approver's goes back to the approvers once and stops there."""
     approver = _as(members("upload"))
     for headers, upload_level in ((approver, 1), (None, 2)):
         item_id = _submit(client, headers=headers,
                           placements_json=_placements(client, ("Karnataka", ["Paddy"])))
         try:
             item = _await_review(client, item_id, headers=headers)
+            if upload_level == 1:
+                assert (item["stage"], item["level"]) == ("approver", 1)
+                assert (item["actions"]["can_approve"], item["actions"]["can_remove"],
+                        item["actions"]["can_decline"], item["actions"]["can_decide"]) == (True, True, False, False)
+                item = client.post(f"/dashboard/uploads/{item_id}/approve", headers=approver).json()
             assert (item["stage"], item["level"], item["upload_level"]) == ("admin", 2, upload_level)
             assert item_id in _queue_ids(client, None)
             mine = client.get(f"/dashboard/uploads/{item_id}").json()
@@ -3285,6 +3300,7 @@ def test_a_concurrent_decision_on_one_upload_lands_once(client, db, members):
     item_id = _submit(client, headers=expert, placements_json=_placements(client, ("Karnataka", ["Paddy"])))
     try:
         _await_review(client, item_id, headers=expert)
+        client.post(f"/dashboard/uploads/{item_id}/approve", headers=expert)
         assert client.post(f"/dashboard/uploads/{item_id}/approve", headers=first).status_code == 200
         late = client.post(f"/dashboard/uploads/{item_id}/approve", headers=second)
         assert late.status_code == 409 and late.json()["detail"].startswith("already approved"), late.text
@@ -3405,6 +3421,7 @@ def test_who_approved_an_upload_is_recorded_on_its_new_document(client, db, memb
     doc_id = None
     try:
         _await_review(client, item_id, headers=expert)
+        client.post(f"/dashboard/uploads/{item_id}/approve", headers=expert)
         # No name sent: the approval list's stored name is used.
         out = client.post(f"/dashboard/uploads/{item_id}/approve", headers=approver).json()
         assert out["approved_by_approver"] == "Render Test"

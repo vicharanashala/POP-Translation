@@ -21,7 +21,8 @@ admin files it. Who may act is checked against dashboard/access.py:
       |                          (note required)             (note required)
       +-- declined: PATCH edit, /resubmit -> approvers, or DELETE
 
-An admin's or an upload approver's own upload starts at the admins, and is
+Every upload starts at its uploader's own level and goes up one when they
+/approve it (since 2026-10-29; before, it started one level up). It is
 never declined below the level it came from (`level` / `upload_level`, see
 _stage). A declined item goes back one level with a note; at the uploader it can be corrected
 (PATCH) and resubmitted to the approvers, or removed (DELETE) and uploaded
@@ -30,7 +31,8 @@ which stage it is at and what THIS caller may do with it (`stage`, `actions`),
 and `GET /uploads` lists only the caller's own uploads plus what waits on them.
 
     PATCH  /uploads/{id}           whoever holds it corrects the form fields
-    POST   /uploads/{id}/approve   approver -> admins
+    POST   /uploads/{id}/approve   up one level: uploader -> approvers (own fresh
+                                   upload), approver -> admins
     POST   /uploads/{id}/decline   back one stage, {"note": "..."}
     POST   /uploads/{id}/resubmit  uploader -> approvers, after a decline
     GET    /uploads/{id}/file      the staged file, for the queue's preview
@@ -152,9 +154,10 @@ def _stringify_ids(placements: list[dict] | None) -> list[dict]:
 #     upload_level   who UPLOADED it:     0 anyone else, 1 an upload
 #                                         approver, 2 an admin
 #
-# An upload starts one level above its uploader's own -- an approver's or an
-# admin's upload skips the approvers, who would only be approving themselves --
-# and a decline moves it down one. It never goes below `upload_level`: there is
+# An upload starts AT its uploader's own level, and they /approve it up one
+# when they are ready -- the same move an approver makes. (Until 2026-10-29 it
+# started one level up, so an upload went to the next people the moment it
+# was sent.) A decline moves it down one. It never goes below `upload_level`: there is
 # nobody down there who ever saw it, so at `level == upload_level` there is no
 # decline. That replaced two booleans (`approver`, `admin`) which could not say
 # where an admin's own upload should go when declined, and sent it to approvers
@@ -215,14 +218,18 @@ def _actions(item: dict, who: Caller | None) -> UploadActions:
     holds = _holds(who, stage, item)
     waiting = status == UploadQueueStatus.awaiting_review.value
     not_filing = status != UploadQueueStatus.uploading.value
+    # At the uploader's stage, a fresh upload (no decline note) is approved up
+    # like any other; one declined back to them is resubmitted.
+    declined = bool(item.get("approver_note"))
     return UploadActions(
         can_edit=holds and waiting,
-        can_approve=holds and stage is UploadStage.approver and waiting,
+        can_approve=holds and waiting and (stage is UploadStage.approver
+                                           or (stage is UploadStage.expert and not declined)),
         # Down one level, never below where it was uploaded from.
         can_decline=holds and _level(item) > _upload_level(item) and status in _REVIEWABLE,
         can_decide=holds and stage is UploadStage.admin and status in _REVIEWABLE,
         can_discard=holds and stage is UploadStage.admin and not_filing,
-        can_resubmit=holds and stage is UploadStage.expert and waiting,
+        can_resubmit=holds and stage is UploadStage.expert and waiting and declined,
         # The uploader may drop their own upload once it is back at their own
         # level: an expert's declined upload, or an approver's own upload that
         # an admin sent back. (An admin's is the admins' to discard anyway.)
@@ -474,8 +481,7 @@ async def create_upload(
                 "format_original": normalize_format(format_original),
                 **{k: v for k, v in where.items() if v is not None}}
 
-    # Starts one level above the uploader's own: an admin's or an upload
-    # approver's upload skips the approvers, who would only approve themselves.
+    # Starts at the uploader's own level; they /approve it up from there.
     item = new_upload_queue_item(filename=file.filename, placements=placements, metadata=metadata,
                                  expert=who.user_id, upload_level=upload_level_of(who))
     # Stored now rather than when the worker gets to it, so a second copy sent
@@ -643,10 +649,14 @@ def _approver_name(db, body: dict | None, who: Caller, list_name: str | None = N
 @router.post("/uploads/{item_id}/approve", response_model=UploadQueueItemOut)
 def approve_upload(item_id: str, body: dict = Body(default=None), who: Caller = Depends(caller),
                    db=Depends(get_db)):
-    """An upload approver passes it on to the admins, with any edits they made.
-    Optional body `{"approved_by": "<display name>"}` -- see _approver_name."""
-    oid, _ = _held_item(db, item_id, who, UploadStage.approver,
-                        statuses=(UploadQueueStatus.awaiting_review.value,))
+    """Up one level. An upload approver passes it on to the admins, with any
+    edits they made; an uploader sends their own fresh upload to the approvers
+    (a declined one goes back with /resubmit). Optional body
+    `{"approved_by": "<display name>"}` -- see _approver_name."""
+    oid, item = _held_item(db, item_id, who, UploadStage.approver, UploadStage.expert,
+                           statuses=(UploadQueueStatus.awaiting_review.value,))
+    if _stage(item) is UploadStage.expert:
+        return _move(db, oid, UploadStage.expert, who, level=1)
     # The approvers' own note asked the uploader for something that has now
     # been passed; left on, the admins would read a settled reason as current.
     return _move(db, oid, UploadStage.approver, who, level=2, approver_note=None,

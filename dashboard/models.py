@@ -503,9 +503,8 @@ def new_upload_queue_item(*, filename: str, placements: list[dict], metadata: di
 
     The approval chain (see dashboard/routes_uploads): `expert` is whoever
     uploaded it and `upload_level` what they are (0 anyone, 1 an upload
-    approver, 2 an admin). `level` is where it waits: one above the uploader's
-    own -- the approvers (1) for anyone, the admins (2) for an approver or an
-    admin.
+    approver, 2 an admin). `level` is where it waits: it starts at the
+    uploader's own, and goes up one when they approve it.
     """
     now = utcnow()
     return {
@@ -534,7 +533,7 @@ def new_upload_queue_item(*, filename: str, placements: list[dict], metadata: di
         # 1 approvers, 2 admins) and what its uploader is (`upload_level`, same
         # numbers), and the latest decline note from each stage.
         "expert": expert,
-        "level": 1 if upload_level == 0 else 2,
+        "level": upload_level,
         "upload_level": upload_level,
         "approver_note": None,
         "admin_note": None,
