@@ -452,13 +452,17 @@ class DocumentOut(BaseModel):
     # -- joined from unique_documents --
     unique_document_id: str
     document_id: str  # ANNAM_#####
-    shareable_name: str | None = None
+    # No shareable_name or language_source: the main table names a row by its
+    # advisory_name. Both stay on /unique-documents and stay filterable here.
     shareable_link: str | None = None
+    # The document's manual fields the main table shows and edits inline.
+    advisory_type: str | None = None
+    advisory_scope: str | None = None
+    advisory_name: str | None = None
     sha256: str | None = None
     num_pages: int | None = None
     format_original: str | None = None
     language: str | None = None
-    language_source: str | None = None
     # The three downloadable files, all keyed for
     # GET /dashboard/files/{id}/download. representative_file_id is the anchor:
     # the copy that IS this document, the one translation acts on.

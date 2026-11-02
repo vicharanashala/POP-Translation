@@ -301,9 +301,11 @@ def test_row_is_served_joined(client):
     without a second request."""
     row = client.get("/dashboard/documents?page=1").json()["items"][0]
     for field in ("state", "crop", "row_id", "document_id", "unique_document_id",
-                  "shareable_name", "shareable_link", "sha256", "placement_count"):
+                  "advisory_name", "advisory_scope", "shareable_link", "sha256", "placement_count"):
         assert field in row, field
     assert row["placement_count"] >= 1
+    assert "shareable_name" not in row and "language_source" not in row
+    assert "season" not in row and "domain" not in row
 
 
 @pytest.mark.parametrize("key,lookup,name,where", [
@@ -737,7 +739,6 @@ def test_every_document_has_a_language(client):
 
     for row in client.get("/dashboard/documents?page=1").json()["items"]:
         assert row["language"] in LANGUAGES, row
-        assert row["language_source"] in ("detected", "state", "manual")
 
 
 def test_no_document_is_left_without_a_language(db):
@@ -750,8 +751,8 @@ def test_state_language_inference_is_marked_as_such(client):
     """Most of the corpus is inferred from the state, not measured. If that
     distinction is ever lost, a guess becomes indistinguishable from a
     detection -- which is how the wrong OCR model gets trusted."""
-    inferred = client.get("/dashboard/documents?filter[language_source]=state").json()
-    detected = client.get("/dashboard/documents?filter[language_source]=detected").json()
+    inferred = client.get("/dashboard/unique-documents?filter[language_source]=state").json()
+    detected = client.get("/dashboard/unique-documents?filter[language_source]=detected").json()
     assert inferred["total"] > 0 and detected["total"] > 0
     assert all(r["language_source"] == "state" for r in inferred["items"])
 
@@ -1981,6 +1982,22 @@ def test_search_keeps_the_spaces_inside_a_phrase(client, scratch):
     assert str(doc["_id"]) in hits("  crop dan something ")
     assert str(doc["_id"]) not in hits("crop something")
     assert str(doc["_id"]) not in hits("cropdan")
+
+
+def test_a_row_carries_the_documents_manual_fields(client, scratch):
+    """The main table shows them and seeds its inline edit boxes from them, so
+    a row has to carry what its document holds."""
+    doc, rows = scratch
+    fields = {"advisory_name": "Scratch advisory name", "advisory_type": "Scratch type",
+              "advisory_scope": "Scratch scope"}
+    client.patch(f"/dashboard/documents/{rows[0]['_id']}", json=fields)
+    page = client.get("/dashboard/documents",
+                      params={"filter[advisory_name]": fields["advisory_name"]}).json()
+    assert page["items"]
+    for row in page["items"]:
+        assert {f: row[f] for f in fields} == fields
+    one = client.get(f"/dashboard/documents/{page['items'][0]['id']}").json()
+    assert {f: one[f] for f in fields} == fields
 
 
 def test_search_boxes_take_commas_as_part_of_the_phrase(client, scratch):
