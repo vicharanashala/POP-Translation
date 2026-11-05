@@ -104,6 +104,19 @@ ORG_MASTER_COLLECTION = _env("ORG_MASTER_COLLECTION") or "organizations"
 # Pages a dashboard translation sends to the LLM at once.
 DASHBOARD_TRANSLATE_CONCURRENCY = max(1, int(_env("DASHBOARD_TRANSLATE_CONCURRENCY") or 3))
 
+# The two-step translation (pipeline 1): a self-hosted OCR service reads each
+# page, then Gemini Flash translates the transcript. Without OCR_URL pipeline 1
+# is simply unavailable and every translation runs as pipeline 0, as before.
+OCR_URL = _env("OCR_URL")
+FLASH_MODEL = _env("GEMINI_FLASH_MODEL") or "gemini-3.8-flash"
+TRANSCRIPT_PROMPT_FILE = REPO_ROOT / "prompts" / "transcript_to_english.txt"
+
+
+def flash_api_key() -> str:
+    """Flash's own key when it is billed apart from the main one, else the main
+    Gemini key. Read at call time, like every key here."""
+    return _env("GEMINI_FLASH_API_KEY") or _env("GEMINI_API_KEY")
+
 # Fixed, pre-created Zoho WorkDrive subfolder IDs for the dashboard's three
 # upload kinds -- see dashboard/zoho_layout.py.
 ZOHO_DASHBOARD_ORIGINALS_FOLDER_ID = os.environ.get("ZOHO_DASHBOARD_ORIGINALS_FOLDER_ID")

@@ -2216,6 +2216,71 @@ def test_translation_jobs_carry_the_unique_document_id(client, db, scratch):
         db[COLL_TRANSLATION_JOBS].delete_one({"_id": job_id})
 
 
+@pytest.mark.parametrize("stage,pipeline,action", [
+    (2, 0, "skip"), (2, 1, "skip"),
+    (1, 0, "single_call"), (1, 1, "translate_transcript"),
+    (0, 0, "single_call"), (0, 1, "ocr_then_translate"),
+])
+def test_what_a_run_does_with_a_page_follows_its_stage_and_the_pipeline(stage, pipeline, action):
+    from dashboard.routes_translation import _page_action
+
+    assert _page_action(stage, pipeline) == action
+
+
+def test_a_calls_cost_is_its_tokens_at_the_models_price():
+    from dashboard.routes_translation import _cost_usd
+
+    usage = {"input_tokens": 1_000_000, "output_tokens": 1_000_000}
+    assert _cost_usd("gemini-3.1-pro-preview", usage) == pytest.approx(14.0)
+    assert _cost_usd("gemini-3.1-flash-lite", usage) == pytest.approx(1.75)
+    assert _cost_usd("gemini-3.5-flash-lite", usage) == pytest.approx(2.80)
+    assert _cost_usd("gemini-3.1-pro-preview", usage, 0.5) == pytest.approx(7.0)  # flex and batch
+    assert _cost_usd("MiniMax-M3", usage) is None and _cost_usd("gemini-3.8-flash", None) is None
+
+
+def test_page_stages_come_from_the_links_when_none_are_stored():
+    from dashboard.routes_translation import _page_stages
+
+    # A job from before page_stage: a link means translated.
+    assert _page_stages(None, ["l", "", "l"], ["a", "", "c"]) == [2, 0, 2]
+    assert _page_stages([], ["l", ""], ["a", ""]) == [2, 0]
+    # Stored: a link beats the digit, a transcript is kept, one with no file is nothing.
+    assert _page_stages([1, 1, 1, 0], ["l", "", "", ""], ["a", "t", "", ""]) == [2, 1, 0, 0]
+
+
+def test_a_job_is_served_with_its_pipeline_and_page_stages(client, db, scratch):
+    from dashboard.models import COLL_TRANSLATION_JOBS, TranslationJobKind, new_translation_job
+
+    doc, _ = scratch
+    ids = []
+    try:
+        new = new_translation_job(document_id=doc["_id"], kind=TranslationJobKind.translate, pipeline=1)
+        new.update(status="failed", page_links=["l", "", ""], page_file_ids=["a", "t", ""], page_stage=[2, 1, 0])
+        # The shape of a job written before either field existed.
+        old = new_translation_job(document_id=doc["_id"], kind=TranslationJobKind.translate)
+        old.update(status="failed", page_links=["l", ""], page_file_ids=["a", ""])
+        del old["pipeline"], old["page_stage"]
+        for job in (new, old):
+            ids.append(db[COLL_TRANSLATION_JOBS].insert_one(job).inserted_id)
+        jobs = {j["id"]: j for j in client.get("/dashboard/translation-jobs", params={"status": "failed"}).json()}
+        assert (jobs[str(ids[0])]["pipeline"], jobs[str(ids[0])]["page_stage"]) == (1, [2, 1, 0])
+        assert (jobs[str(ids[1])]["pipeline"], jobs[str(ids[1])]["page_stage"]) == (0, [2, 0])
+    finally:
+        db[COLL_TRANSLATION_JOBS].delete_many({"_id": {"$in": ids}})
+
+
+@pytest.mark.parametrize("body,status", [
+    ({"pipeline": 2}, 422), ({"pipeline": "1"}, 422), ({"pipeline": True}, 422), ({"model": "gpt-4"}, 422),
+    ({"pipeline": 1, "mode": "flex"}, 400), ({"pipeline": 1, "mode": "batch"}, 400),
+])
+def test_pipeline_is_zero_or_one_and_one_is_normal_mode_only(client, body, status):
+    """Refused before any document or job is looked at, so nothing is queued."""
+    resp = client.post(f"/dashboard/unique-documents/{'0' * 24}/translate", json=body)
+    if resp.status_code == 503:
+        pytest.skip("translation is switched off on this server (TRANS=off)")
+    assert resp.status_code == status, resp.text
+
+
 def test_events_stream_pushes_queue_changes(client, db, scratch):
     """Open the stream, delete a finished job, and see the event arrive."""
     import threading

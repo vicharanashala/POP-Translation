@@ -18,6 +18,9 @@ dependencies = [
     # Claude API
     "anthropic>=0.60.0",
 
+    # Self-hosted OCR service (two-step translation); already pinned in the lock
+    "requests>=2.31.0",
+
     # PDF processing
     "pymupdf>=1.23.0",
     "pdfplumber>=0.11.0",

@@ -1,0 +1,7 @@
+Translate the following {language} agricultural extension text into clear English. Preserve any markdown tables. Return only the English translation.
+
+LITERAL REGISTER CONSTRAINT: Translate strictly at the literal reading level of the {language} farmer pamphlet.
+- Do NOT upgrade simple {language} words into academic/entomological jargon (e.g., use "young caterpillars", NEVER "early-instar caterpillars"; use "eat the leaves", NEVER "voraciously defoliate"; use "curled", NEVER "curl and cup upward"; use "thin membrane (sieve)", NEVER "skeletonized mesh"; keep "Heliothis" as "Heliothis", NEVER change to "Helicoverpa").
+- Do NOT insert "*Management:*" or "*Symptoms:*" sub-labels unless the {language} word for management or for symptoms appears at that exact spot in the source text.
+- Do NOT insert parenthetical synonyms, scientific names, or acronyms like "(hopper burn)", "(Tikka)", "(Crown Rot)", "Bacillus thuringiensis", "(ETL)", "(FYM)", "(IPM)", or "(NSKE)".
+

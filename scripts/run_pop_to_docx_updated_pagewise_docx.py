@@ -1,5 +1,6 @@
 import argparse
 import base64
+import html
 import json
 import os
 import re
@@ -13,6 +14,7 @@ from pathlib import Path
 
 import anthropic
 import fitz  # PyMuPDF
+import requests
 from bs4 import BeautifulSoup, NavigableString
 from google import genai
 from google.genai import types
@@ -946,6 +948,118 @@ def translate_page_pdf_to_html_claude(
                 _sleep_cancellable(retry_wait_seconds)
 
     raise RuntimeError(f"Failed after {max_retries} attempts for {pdf_path}") from last_error
+
+
+# ---------------------------------------------------------------------
+# Two-step translation: self-hosted OCR, then a text-only Gemini call
+# ---------------------------------------------------------------------
+# translate_page_pdf_to_html below sends the page IMAGE to one model that reads
+# and translates in a single call. This path splits the work: a self-hosted OCR
+# service reads the page (one POST per page) and Gemini Flash only translates
+# the text. The caller (dashboard/routes_translation.py) keeps the transcript in
+# between, so a failed translation never costs the OCR again. What comes out is
+# the same translated.html the one-call path writes, so the images, .docx and
+# merge stages cannot tell which path made a page.
+
+# The service takes one page at a time, so a request can wait behind others.
+OCR_TIMEOUT_SECONDS = 900
+OCR_DPI = 300
+# The service returns the tokenizer's word marker where a space belongs.
+OCR_SPACE_MARKER = "\u2581"
+
+def ocr_page_to_transcript(pdf_path: Path, ocr_url: str) -> str:
+    """One page through the OCR service, as text. Any failure raises; the HTTP
+    status is what says it failed, because the body of a 500 is plain text."""
+    png_bytes = render_pdf_page_to_png_bytes(pdf_path, dpi=OCR_DPI)
+    try:
+        resp = requests.post(
+            ocr_url,
+            files={"image": ("page.png", png_bytes, "image/png")},
+            timeout=(10, OCR_TIMEOUT_SECONDS),
+        )
+    except requests.RequestException as e:
+        raise RuntimeError(f"OCR service unreachable: {type(e).__name__}: {e}") from e
+    if resp.status_code != 200:
+        raise RuntimeError(f"OCR service returned HTTP {resp.status_code}: {resp.text[:200]}")
+    try:
+        markdown = resp.json()["markdown"]
+    except (ValueError, KeyError, TypeError) as e:
+        raise RuntimeError(f"OCR service returned an unreadable reply: {e}") from e
+    return markdown.replace(OCR_SPACE_MARKER, " ").strip()
+
+
+def transcript_to_html(text: str) -> str:
+    """Translated page text -> the HTML fragment the later stages read. The
+    OCR writes tables as HTML, so those pass through; everything else becomes
+    paragraphs split on blank lines, a single newline inside one a <br/>."""
+    parts = []
+    for chunk in re.split(r"(<table>.*?</table>)", text, flags=re.S):
+        if chunk.startswith("<table>"):
+            parts.append(chunk.replace("<table>", '<table border="1">', 1))
+            continue
+        for para in re.split(r"\n\s*\n", chunk.strip()):
+            if para.strip():
+                lines = "<br/>".join(html.escape(line) for line in para.strip().split("\n"))
+                parts.append(f"<p>{lines}</p>")
+    return "\n".join(parts) + "\n"
+
+
+def translate_transcript_to_html_gemini(
+    transcript: str,
+    prompt: str,
+    model: str,
+    api_key: str,
+    max_retries: int,
+    retry_wait_seconds: int,
+    pname: str,
+) -> tuple[str, dict | None]:
+    """The transcript of one page -> its English HTML. Same attempt limit,
+    cancel check and credit/daily-limit handling as the one-call Gemini path;
+    no thinking level and no Google Search, which is how it was measured."""
+    if not transcript.strip():
+        return "<p></p>\n", None  # a blank page: nothing to translate
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=GEMINI_ATTEMPT_TIMEOUT_SECONDS * 1000),
+    )
+    contents = prompt.rstrip() + "\n\n" + transcript
+    last_error = None
+
+    for attempt in range(1, max_retries + 1):
+        _check_cancel()
+        attempt_start = time.perf_counter()
+        try:
+            log(f"{pname} | attempt {attempt}/{max_retries} | transcript sent to {model} | chars={len(transcript)}")
+            response = _run_with_deadline(
+                lambda: client.models.generate_content(model=model, contents=contents),
+                GEMINI_ATTEMPT_TIMEOUT_SECONDS,
+            )
+            full_text = (response.text or "").strip()
+            if not full_text:
+                raise RuntimeError("Empty response received from Gemini.")
+
+            usage = None
+            if meta := getattr(response, "usage_metadata", None):
+                in_tok = getattr(meta, "prompt_token_count", None) or 0
+                out_tok = (getattr(meta, "candidates_token_count", None) or 0) + (
+                    getattr(meta, "thoughts_token_count", None) or 0)
+                usage = {"input_tokens": in_tok, "output_tokens": out_tok,
+                         "total_tokens": getattr(meta, "total_token_count", None) or (in_tok + out_tok)}
+            log(f"{pname} | attempt {attempt} | translation completed | "
+                f"duration={format_duration(time.perf_counter() - attempt_start)} | chars={len(full_text)}")
+            return transcript_to_html(clean_html(full_text)), usage
+
+        except Exception as e:
+            last_error = e
+            log(f"{pname} | attempt {attempt}/{max_retries} failed | "
+                f"duration={format_duration(time.perf_counter() - attempt_start)} | error={e}")
+            if (why := _api_limit_message(e)) is not None:
+                raise ApiLimitReached(why) from e
+            if attempt < max_retries:
+                log(f"{pname} | waiting {retry_wait_seconds}s before retry")
+                _sleep_cancellable(retry_wait_seconds)
+
+    raise RuntimeError(f"Failed after {max_retries} attempts translating {pname}") from last_error
 
 
 def translate_page_pdf_to_html(

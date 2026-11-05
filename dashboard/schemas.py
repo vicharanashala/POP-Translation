@@ -759,6 +759,15 @@ class TranslationJobOut(BaseModel):
     shareable_name: str | None = None
     kind: TranslationJobKind
     mode: TranslationMode = TranslationMode.normal  # normal / flex / batch -- the tag on the queue item
+    # 0: one model call per page does the reading and the translation. 1: OCR
+    # reads the page, then Gemini Flash translates the text. The one the job
+    # last ran with; a restart may change it.
+    pipeline: int = 0
+    # The Gemini model picked for this job, null for the default; and what its
+    # calls have cost so far in USD (null until a priced call comes back). Kept
+    # on a failed or cancelled job, so it is what the finished pages cost.
+    model: str | None = None
+    cost_usd: float | None = None
     # Batch only: Google's state for the batch (JOB_STATE_PENDING, _RUNNING,
     # ...), "finishing" while its pages are made into the .docx; null otherwise.
     batch_state: str | None = None
@@ -770,6 +779,10 @@ class TranslationJobOut(BaseModel):
     # One per page: the WorkDrive link of the page's translated .docx, "" for a
     # page not translated yet. Kept on a failed or cancelled job; empty once done.
     page_links: list[str] = []
+    # One per page: 0 nothing yet, 1 the OCR transcript is stored but not
+    # translated, 2 translated. A page is done ONLY at 2 -- a page_links entry
+    # is the link of whichever file the page holds, so it is not a test of that.
+    page_stage: list[int] = []
     created_at: UTCDatetime
     updated_at: UTCDatetime
 

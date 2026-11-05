@@ -576,7 +576,8 @@ def new_upload_candidate(*, document, score: float, match_type: str,
 
 
 def new_translation_job(*, document_id, kind: TranslationJobKind,
-                        mode: TranslationMode = TranslationMode.normal) -> dict:
+                        mode: TranslationMode = TranslationMode.normal, pipeline: int = 0,
+                        model: str | None = None) -> dict:
     """DB-backed version of pop_server.py's in-memory `_jobs` dict pattern --
     same shape, but survives a server restart.
 
@@ -589,6 +590,14 @@ def new_translation_job(*, document_id, kind: TranslationJobKind,
         "document_id": document_id,
         "kind": kind.value if isinstance(kind, TranslationJobKind) else kind,
         "mode": TranslationMode(mode).value,
+        # How a page is translated: 0 one model call on the page image, 1 OCR
+        # first, then a text-only Gemini call. Set by each start, so a resumed
+        # job may change it.
+        "pipeline": pipeline,
+        # The Gemini model the person picked, or None for the default of the
+        # pipeline. cost_usd, the running total of what the job's calls cost, is
+        # not here: it appears with the first priced call ($inc needs a number).
+        "model": model,
         "status": TranslationJobStatus.queued.value,
         "progress_pct": 0,
         # Page-level progress -- set once the source PDF is split (see
@@ -602,8 +611,15 @@ def new_translation_job(*, document_id, kind: TranslationJobKind,
         # is split; a failed or cancelled job keeps them, so translating again
         # only redoes the "" pages. Emptied when the job ends done or is deleted
         # (the page files are trashed then). page_file_ids is the same list as file ids.
+        #
+        # page_stage says what each page's file_id IS: 0 nothing yet, 1 the OCR
+        # transcript (the translation is still to do; the link stays ""), 2 the
+        # translated .docx (link set). A page is done only at 2. A page moves
+        # 0 -> 1 -> 2, or 0 -> 2 on the one-call path; reaching 2 replaces the
+        # transcript in its slot, which is then trashed.
         "page_links": [],
         "page_file_ids": [],
+        "page_stage": [],
         # The original the pages were cut from -- if the document's file has
         # changed since, the stored pages are not its pages any more.
         "source_file_id": None,
