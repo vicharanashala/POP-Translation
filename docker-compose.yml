@@ -44,10 +44,8 @@ services:
       - TRANS=${TRANS:-on}
       # Two-step translation (pipeline 1): OCR_URL is the self-hosted OCR
       # service's /parse endpoint. Left empty, every translation runs as
-      # pipeline 0. Flash uses GEMINI_FLASH_API_KEY if set, else GEMINI_API_KEY.
+      # pipeline 0. Gemini calls use GEMINI_API_KEY, as for pipeline 0.
       - OCR_URL=${OCR_URL:-}
-      - GEMINI_FLASH_API_KEY=${GEMINI_FLASH_API_KEY:-}
-      - GEMINI_FLASH_MODEL=${GEMINI_FLASH_MODEL:-}
 
       # -- MongoDB Atlas --
       # POP_ENV picks the deployment: staging (default) or prod. dashboard/
