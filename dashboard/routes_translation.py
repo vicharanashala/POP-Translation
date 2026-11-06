@@ -67,8 +67,15 @@ transcript (page_links stays ""), 2 the translated .docx. A page is done ONLY at
     0      one call on the image     OCR, store it, translate it
 
 so a job may be stopped and carried on with either pipeline. Reaching stage 2
-replaces the transcript in the slot, and the transcript is trashed. Normal mode
-only for now: flex and batch are the one-call path (pipeline 0).
+replaces the transcript in the slot, and the transcript is trashed.
+
+Pipeline 1 runs in all three modes. Flex is the same Flash call on the
+half-price tier. Batch cannot batch the OCR (our own service, a page at a
+time), so its first pass reads every page not yet read, one after another, and
+stores the transcripts; then ONE batch of text requests goes to Google, and the
+pass returns as for pipeline 0. The second pass turns each result into the
+page's translated.html and finishes the page as usual. A page whose OCR failed
+in the first pass has no request, and is reported failed after the second.
 
 A start may also name `model`, one of GEMINI_MODELS, for either pipeline: the
 one-call path then goes to that Gemini model whatever LLM_PROVIDER is, and the
@@ -222,22 +229,18 @@ def _pipeline_one_missing() -> str | None:
     return None
 
 
-def _pipeline_of(body, mode: TranslationMode) -> int:
-    """The pipeline a start asks for. Left out, it is 1 wherever pipeline 1 can
-    run and the mode supports it (normal only, for now); otherwise 0, so a
-    server without the OCR service, and flex / batch, behave as they always did.
-    Asking for 1 outright where it cannot run is an error, not a quiet 0."""
+def _pipeline_of(body) -> int:
+    """The pipeline a start asks for, in any mode. Left out, it is 1 wherever
+    pipeline 1 can run, else 0, so a server without the OCR service behaves as
+    it always did. Asking for 1 outright where it cannot run is an error, not
+    a quiet 0."""
     raw = (body or {}).get("pipeline")
     if raw is None:
-        return 1 if mode is TranslationMode.normal and _pipeline_one_missing() is None else 0
+        return 1 if _pipeline_one_missing() is None else 0
     if isinstance(raw, bool) or raw not in (0, 1):
         raise HTTPException(422, "pipeline must be 0 or 1")
-    if raw == 1:
-        if mode is not TranslationMode.normal:
-            raise HTTPException(400, f"{mode.value} translation is not available with pipeline 1 yet -- "
-                                     "use pipeline 0")
-        if (why := _pipeline_one_missing()) is not None:
-            raise HTTPException(400, f"pipeline 1 is unavailable: {why}")
+    if raw == 1 and (why := _pipeline_one_missing()) is not None:
+        raise HTTPException(400, f"pipeline 1 is unavailable: {why}")
     return int(raw)
 
 
@@ -309,8 +312,8 @@ def start_translation(document_id: str, body: dict | None = Body(default=None), 
     "pipeline": 0 | 1, "model": "<one of GEMINI_MODELS>"}` -- translated_by is
     recorded on the document when the translation lands; mode defaults to
     normal; pipeline picks how a page is translated (see the module docstring)
-    and defaults to 1 where it can run, else 0. Pipeline 1 is normal mode only,
-    and 400 where the server has no OCR service or no Flash key. model, left out,
+    and defaults to 1 where it can run, else 0. Pipeline 1 works in every mode,
+    and is a 400 where the server has no OCR service or no Gemini key. model, left out,
     is the server's own for pipeline 0 and Flash for pipeline 1.
 
     There is no separate redo: if the document's last job FAILED or was
@@ -328,7 +331,7 @@ def start_translation(document_id: str, body: dict | None = Body(default=None), 
     model = (body or {}).get("model")
     if model is not None and model not in GEMINI_MODELS:
         raise HTTPException(422, f"model must be one of: {', '.join(GEMINI_MODELS)}")
-    pipeline = _pipeline_of(body, mode)
+    pipeline = _pipeline_of(body)
     if pipeline == 0:
         # The original call's own key and provider -- or Gemini's, for a model
         # picked by name. Pipeline 1 is Gemini whatever model it uses, checked
@@ -726,21 +729,8 @@ def _run_translation(job_id: ObjectId, document_id: ObjectId) -> None:
         if pipeline == 1:
             transcript_prompt = TRANSCRIPT_PROMPT_FILE.read_text(encoding="utf-8").replace(
                 "{language}", LANGUAGES.get(doc.get("language")) or "Indian-language")
-        if mode == TranslationMode.batch.value and todo:
-            if not job.get("batch_name"):
-                _submit_batch(job_id, todo, page_pdfs, req, api_key, prompt, doc_root)
-                return  # Google has the pages now; the batch poller takes it from here
-            # Second pass: the batch is done. Each result becomes the page's
-            # translated.html, exactly where the normal call would put it.
-            htmls, errors, usage = _collect_batch(job["batch_name"], api_key)
-            _add_cost(job_id, _cost_usd(model_name, usage, 0.5))
-            for i in todo:
-                if i in htmls:
-                    (page_pdfs[i].parent / "translated.html").write_text(htmls[i], encoding="utf-8")
-                else:
-                    errors.setdefault(i, "translation: no result in the Gemini batch")
-            todo = [i for i in todo if i in htmls]
         tier = "flex" if mode == TranslationMode.flex.value else None
+        second_pass = mode == TranslationMode.batch.value and bool(job.get("batch_name"))
 
         def spend(usage: dict | None) -> None:
             _add_cost(job_id, _cost_usd(model_name, usage, 0.5 if tier else 1.0))
@@ -749,56 +739,67 @@ def _run_translation(job_id: ObjectId, document_id: ObjectId) -> None:
         lock = threading.Lock()
         ocr_failures = [0]  # in a row, across this job's pages
 
-        def via_ocr(i: int) -> str | None:
-            """Pipeline 1 for one page: its transcript (read now, or stored by an
-            earlier run), translated by Flash, then the shared images + .docx.
-            Returns None on success, else why."""
-            pdf = page_pdfs[i]
-            pname = pdf.parent.name
+        def get_transcript(i: int) -> tuple[str | None, str | None]:
+            """(the page's transcript, None) or (None, why not): the one stored by
+            an earlier run, or read now through the OCR queue and stored."""
             if stages[i] == 1:
                 try:
-                    text = wd.download_file(file_ids[i]).decode("utf-8")
+                    return wd.download_file(file_ids[i]).decode("utf-8"), None
                 except Exception as e:  # noqa: BLE001
-                    return f"translation: could not read the stored transcript: {type(e).__name__}: {e}"
-            else:
-                future = _ocr_executor.submit(pop.ocr_page_to_transcript, pdf, OCR_URL)
-                try:
-                    text = _wait_for(future)
-                except Exception as e:  # noqa: BLE001 -- the service failed this page; a cancel is not an Exception
-                    with lock:
-                        ocr_failures[0] += 1
-                        failed_in_a_row = ocr_failures[0]
-                    if failed_in_a_row >= OCR_FAILURES_BEFORE_STOP:
-                        raise _OcrUnavailable(f"the OCR service failed {failed_in_a_row} pages in a row "
-                                              f"(last: {e}) -- is it running? Translate again to carry on") from e
-                    return f"ocr: {e}"
+                    return None, f"translation: could not read the stored transcript: {type(e).__name__}: {e}"
+            future = _ocr_executor.submit(pop.ocr_page_to_transcript, page_pdfs[i], OCR_URL)
+            try:
+                text = _wait_for(future)
+            except Exception as e:  # noqa: BLE001 -- the service failed this page; a cancel is not an Exception
                 with lock:
-                    ocr_failures[0] = 0
-                if text:  # a blank page has nothing to keep, and nothing to translate
-                    try:
-                        fid = zoho_layout.upload_translation(
-                            wd, f"{safe_name}_{pop.page_name(i + 1)}_transcript.txt", text.encode("utf-8"))
-                    except Exception as e:  # noqa: BLE001
-                        return f"ocr: could not store the transcript: {type(e).__name__}: {e}"
-                    with lock:
-                        file_ids[i], stages[i] = fid, 1
-                        _set_job(job_id, **{f"page_file_ids.{i}": fid, f"page_stage.{i}": 1})
+                    ocr_failures[0] += 1
+                    failed_in_a_row = ocr_failures[0]
+                if failed_in_a_row >= OCR_FAILURES_BEFORE_STOP:
+                    raise _OcrUnavailable(f"the OCR service failed {failed_in_a_row} pages in a row "
+                                          f"(last: {e}) -- is it running? Translate again to carry on") from e
+                return None, f"ocr: {e}"
+            with lock:
+                ocr_failures[0] = 0
+            if text:  # a blank page has nothing to keep, and nothing to translate
+                try:
+                    fid = zoho_layout.upload_translation(
+                        wd, f"{safe_name}_{pop.page_name(i + 1)}_transcript.txt", text.encode("utf-8"))
+                except Exception as e:  # noqa: BLE001
+                    return None, f"ocr: could not store the transcript: {type(e).__name__}: {e}"
+                with lock:
+                    file_ids[i], stages[i] = fid, 1
+                    _set_job(job_id, **{f"page_file_ids.{i}": fid, f"page_stage.{i}": 1})
+            return text, None
+
+        def via_ocr(i: int, text: str | None = None) -> str | None:
+            """Pipeline 1 for one page: its transcript (given, read now, or stored
+            by an earlier run), translated by Gemini, then the shared images +
+            .docx. A batch's second pass has the translation already in
+            translated.html. Returns None on success, else why."""
+            pdf = page_pdfs[i]
+            pname = pdf.parent.name
+            if second_pass and (pdf.parent / "translated.html").exists():
+                return _images_and_docx(pdf, docx_paths[i], doc_name)
+            if text is None:
+                text, why = get_transcript(i)
+                if why is not None:
+                    return why
             ctl.check_cancel()
             try:
                 html_text, usage = pop.translate_transcript_to_html_gemini(
-                    text, transcript_prompt, model_name, api_key, req.max_retries, req.retry_wait_seconds, pname)
+                    text, transcript_prompt, model_name, api_key, req.max_retries, req.retry_wait_seconds, pname, tier)
             except Exception as e:  # noqa: BLE001 -- the transcript stays stored; ApiLimitReached is not an Exception
                 return f"translation: {e}"
             spend(usage)
             (pdf.parent / "translated.html").write_text(html_text, encoding="utf-8")
             return _images_and_docx(pdf, docx_paths[i], doc_name)
 
-        def one(i: int) -> None:
+        def one(i: int, text: str | None = None) -> None:
             ctl.set_job_id(str(job_id))
             _tl_stdout.buf = stdout_buf
             try:
                 if pipeline == 1:
-                    why = via_ocr(i)
+                    why = via_ocr(i, text)
                 else:
                     why = _translate_one_page(page_pdfs[i], docx_paths[i], doc_name, req, api_key, prompt, tier,
                                               "gemini" if gemini else LLM_PROVIDER, spend)
@@ -821,6 +822,44 @@ def _run_translation(job_id: ObjectId, document_id: ObjectId) -> None:
                 errors[i] = f"{type(e).__name__}: {e}"
             finally:
                 _tl_stdout.buf = None
+
+        if mode == TranslationMode.batch.value and todo:
+            if not job.get("batch_name"):
+                if pipeline == 1:
+                    # First pass: the OCR cannot be batched, so read the pages that
+                    # are not read yet, one after another, then batch the text.
+                    transcripts: dict[int, str] = {}
+                    for i in todo:
+                        ctl.check_cancel()
+                        text, why = get_transcript(i)
+                        if why is not None:
+                            errors[i] = why
+                        elif text:
+                            transcripts[i] = text
+                        else:
+                            one(i, "")  # a blank page needs no model call: finish it now
+                    if transcripts:
+                        _submit_batch(job_id, list(transcripts), page_pdfs, req, api_key, transcript_prompt,
+                                      doc_root, transcripts)
+                        return  # Google has the text now; the batch poller takes it from here
+                    todo = []  # nothing to batch: on to the failures, or the merge
+                else:
+                    _submit_batch(job_id, todo, page_pdfs, req, api_key, prompt, doc_root)
+                    return  # Google has the pages now; the batch poller takes it from here
+            else:
+                # Second pass: the batch is done. Each result becomes the page's
+                # translated.html, exactly where the normal call would put it.
+                htmls, errors, usage = _collect_batch(job["batch_name"], api_key)
+                _add_cost(job_id, _cost_usd(model_name, usage, 0.5))
+                for i in todo:
+                    if i in htmls:
+                        html_text = pop.transcript_to_html(htmls[i]) if pipeline == 1 else htmls[i]
+                        (page_pdfs[i].parent / "translated.html").write_text(html_text, encoding="utf-8")
+                    elif pipeline == 1 and stages[i] == 0:
+                        errors.setdefault(i, "ocr: this page had no transcript when the batch was submitted")
+                    else:
+                        errors.setdefault(i, "translation: no result in the Gemini batch")
+                todo = [i for i in todo if i in htmls]
 
         pool = ThreadPoolExecutor(max_workers=DASHBOARD_TRANSLATE_CONCURRENCY, thread_name_prefix="translate-page")
         try:
@@ -900,10 +939,12 @@ def _batch_state(batch) -> str | None:
     return getattr(batch.state, "value", batch.state) if batch.state is not None else None
 
 
-def _submit_batch(job_id: ObjectId, todo: list[int], page_pdfs, req, api_key: str, prompt: str, workdir: Path) -> None:
+def _submit_batch(job_id: ObjectId, todo: list[int], page_pdfs, req, api_key: str, prompt: str, workdir: Path,
+                  transcripts: dict[int, str] | None = None) -> None:
     """One JSONL line per page still to do, keyed by its index; uploaded, then
     submitted as one batch. Images go inline, so the file can run to a few
-    hundred MB for a long document -- far under the 2 GB limit."""
+    hundred MB for a long document -- far under the 2 GB limit. With
+    `transcripts` (pipeline 1) each line is the prompt plus that page's text."""
     from google.genai import types
     import run_pop_to_docx_updated_pagewise_docx as pop
 
@@ -911,7 +952,8 @@ def _submit_batch(job_id: ObjectId, todo: list[int], page_pdfs, req, api_key: st
     with lines.open("w", encoding="utf-8") as f:
         for i in todo:
             ctl.check_cancel()
-            request = pop.gemini_batch_request(page_pdfs[i], prompt, not req.disable_google_search)
+            request = (pop.gemini_batch_text_request(prompt, transcripts[i]) if transcripts is not None
+                       else pop.gemini_batch_request(page_pdfs[i], prompt, not req.disable_google_search))
             f.write(json.dumps({"key": str(i), "request": request}) + "\n")
     client = _gemini(api_key)
     uploaded = client.files.upload(file=lines, config=types.UploadFileConfig(

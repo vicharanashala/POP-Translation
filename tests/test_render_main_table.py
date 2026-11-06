@@ -2271,14 +2271,38 @@ def test_a_job_is_served_with_its_pipeline_and_page_stages(client, db, scratch):
 
 @pytest.mark.parametrize("body,status", [
     ({"pipeline": 2}, 422), ({"pipeline": "1"}, 422), ({"pipeline": True}, 422), ({"model": "gpt-4"}, 422),
-    ({"pipeline": 1, "mode": "flex"}, 400), ({"pipeline": 1, "mode": "batch"}, 400),
 ])
-def test_pipeline_is_zero_or_one_and_one_is_normal_mode_only(client, body, status):
+def test_pipeline_is_zero_or_one(client, body, status):
     """Refused before any document or job is looked at, so nothing is queued."""
     resp = client.post(f"/dashboard/unique-documents/{'0' * 24}/translate", json=body)
     if resp.status_code == 503:
         pytest.skip("translation is switched off on this server (TRANS=off)")
     assert resp.status_code == status, resp.text
+
+
+def test_pipeline_one_is_allowed_in_every_mode_where_the_server_can_run_it(monkeypatch):
+    from fastapi import HTTPException
+
+    from dashboard import routes_translation as rt
+
+    monkeypatch.setattr(rt, "OCR_URL", "http://ocr/parse")
+    monkeypatch.setattr(rt, "flash_api_key", lambda: "key")
+    assert rt._pipeline_of(None) == 1 and rt._pipeline_of({"mode": "batch"}) == 1
+    assert rt._pipeline_of({"pipeline": 1, "mode": "flex"}) == 1 and rt._pipeline_of({"pipeline": 0}) == 0
+    monkeypatch.setattr(rt, "OCR_URL", "")  # no OCR service: the default falls back, an explicit 1 is refused
+    assert rt._pipeline_of(None) == 0
+    with pytest.raises(HTTPException) as err:
+        rt._pipeline_of({"pipeline": 1, "mode": "batch"})
+    assert err.value.status_code == 400
+
+
+def test_a_batch_line_for_a_transcript_is_the_prompt_and_the_text_only():
+    from scripts.run_pop_to_docx_updated_pagewise_docx import gemini_batch_html, gemini_batch_text_request
+
+    line = gemini_batch_text_request("Translate.\n", "page text")
+    assert line == {"contents": [{"role": "user", "parts": [{"text": "Translate.\n\npage text"}]}]}
+    reply = {"candidates": [{"content": {"parts": [{"text": "hidden", "thought": True}, {"text": "<p>Hi</p>"}]}}]}
+    assert gemini_batch_html(reply).strip() == "<p>Hi</p>"
 
 
 def test_events_stream_pushes_queue_changes(client, db, scratch):

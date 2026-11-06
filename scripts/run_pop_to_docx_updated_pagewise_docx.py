@@ -411,6 +411,13 @@ def gemini_batch_request(pdf_path: Path, prompt: str, enable_google_search: bool
     return request
 
 
+def gemini_batch_text_request(prompt: str, transcript: str) -> dict:
+    """One line of a batch input file for the transcript path: the same text
+    translate_transcript_to_html_gemini sends, with no thinking level and no
+    tools, as there."""
+    return {"contents": [{"role": "user", "parts": [{"text": prompt.rstrip() + "\n\n" + transcript}]}]}
+
+
 def gemini_batch_html(response: dict) -> str:
     """The page's HTML out of one batch result's `response`; raises if empty."""
     parts = (((response.get("candidates") or [{}])[0].get("content") or {}).get("parts")) or []
@@ -1012,16 +1019,21 @@ def translate_transcript_to_html_gemini(
     max_retries: int,
     retry_wait_seconds: int,
     pname: str,
+    service_tier: str | None = None,
 ) -> tuple[str, dict | None]:
     """The transcript of one page -> its English HTML. Same attempt limit,
     cancel check and credit/daily-limit handling as the one-call Gemini path;
-    no thinking level and no Google Search, which is how it was measured."""
+    no thinking level and no Google Search, which is how it was measured.
+    service_tier="flex" is the half-price best-effort tier, with the longer
+    time limit and doubling back-off the one-call path gives it."""
     if not transcript.strip():
         return "<p></p>\n", None  # a blank page: nothing to translate
+    time_limit = GEMINI_FLEX_TIMEOUT_SECONDS if service_tier == "flex" else GEMINI_ATTEMPT_TIMEOUT_SECONDS
     client = genai.Client(
         api_key=api_key,
-        http_options=types.HttpOptions(timeout=GEMINI_ATTEMPT_TIMEOUT_SECONDS * 1000),
+        http_options=types.HttpOptions(timeout=time_limit * 1000),
     )
+    config = types.GenerateContentConfig(service_tier=service_tier) if service_tier else None
     contents = prompt.rstrip() + "\n\n" + transcript
     last_error = None
 
@@ -1031,8 +1043,8 @@ def translate_transcript_to_html_gemini(
         try:
             log(f"{pname} | attempt {attempt}/{max_retries} | transcript sent to {model} | chars={len(transcript)}")
             response = _run_with_deadline(
-                lambda: client.models.generate_content(model=model, contents=contents),
-                GEMINI_ATTEMPT_TIMEOUT_SECONDS,
+                lambda: client.models.generate_content(model=model, contents=contents, config=config),
+                time_limit,
             )
             full_text = (response.text or "").strip()
             if not full_text:
@@ -1056,9 +1068,13 @@ def translate_transcript_to_html_gemini(
             if (why := _api_limit_message(e)) is not None:
                 raise ApiLimitReached(why) from e
             if attempt < max_retries:
-                log(f"{pname} | waiting {retry_wait_seconds}s before retry")
-                _sleep_cancellable(retry_wait_seconds)
+                wait = retry_wait_seconds * (2 ** (attempt - 1) if service_tier == "flex" else 1)
+                log(f"{pname} | waiting {wait}s before retry")
+                _sleep_cancellable(wait)
 
+    if service_tier == "flex" and getattr(last_error, "code", None) == 503:
+        raise RuntimeError(f"Flex had no spare capacity at Google (503 on all {max_retries} tries) "
+                           f"-- try again later, or use normal or batch") from last_error
     raise RuntimeError(f"Failed after {max_retries} attempts translating {pname}") from last_error
 
 
