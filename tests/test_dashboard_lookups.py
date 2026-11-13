@@ -3,12 +3,15 @@ def test_list_states(client):
     assert resp.status_code == 200
     states = resp.json()
     assert isinstance(states, list)
-    # 32 states from STATE_LANG + "Central Advisories", seeded by the
+    # 32 states from STATE_LANG plus the all-India category, seeded by the
     # pops.csv/main.csv migration -- fixed enumeration, shouldn't drift.
     assert len(states) == 33
     names = {s["name"] for s in states}
-    assert "Central Advisories" in names
-    assert "State Karnataka" in names
+    # Names are standardised: the "State " prefix and the "Advisories" suffix
+    # were stripped (see scripts/standardize_names.py), so "State Karnataka"
+    # is now "Karnataka" and "Central Advisories" is "Central".
+    assert "Central" in names
+    assert "Karnataka" in names
     for s in states:
         assert isinstance(s["id"], int)
         assert s["name"]

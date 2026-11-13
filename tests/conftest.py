@@ -15,6 +15,11 @@ then run:
 
 If the server isn't reachable, every test using the `client` fixture is
 skipped (not failed) with a clear reason.
+
+These run against whichever database the SERVER was started with -- by default
+`pop_dashboard`, the staging catalogue on the free-tier Atlas cluster (the
+paid production cluster is separate). Tests that write create their own
+seed data and remove it in a fixture; they never mutate migrated rows.
 """
 from __future__ import annotations
 

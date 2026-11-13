@@ -47,6 +47,12 @@ services:
       # pipeline 0. Gemini calls use GEMINI_API_KEY, as for pipeline 0.
       - OCR_URL=${OCR_URL:-}
 
+      # -- Access --
+      # Shared secret every request must carry as `X-Service-Key` (see
+      # helpers/service_key.py). Empty = no gate. Comma-separated = any of them,
+      # for rotation. At least 32 characters: `openssl rand -hex 32`.
+      - POP_SERVICE_KEY=${POP_SERVICE_KEY:-}
+
       # -- MongoDB Atlas --
       # POP_ENV picks the deployment: staging (default) or prod. dashboard/
       # config.py reads <PREFIX>_DB_URL / <PREFIX>_DB_NAME accordingly. DB_URL /
@@ -84,8 +90,10 @@ services:
     healthcheck:
       # Python, not curl: the python:3.11-slim base image has no curl, so a
       # curl-based check reports unhealthy no matter what the server is doing.
+      # It sends the service key (the first, if there are several), or the gate
+      # would answer it 401 and mark a healthy server unhealthy.
       test: ["CMD", "python", "-c",
-             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8032/dashboard/config', timeout=5).status==200 else 1)"]
+             "import os,urllib.request,sys; k=(os.environ.get('POP_SERVICE_KEY') or '').split(',')[0].strip(); r=urllib.request.Request('http://localhost:8032/dashboard/config', headers={'X-Service-Key': k} if k else {}); sys.exit(0 if urllib.request.urlopen(r, timeout=5).status==200 else 1)"]
       interval: 30s
       timeout: 10s
       retries: 3

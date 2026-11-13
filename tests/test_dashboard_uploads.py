@@ -7,7 +7,7 @@ id for the same reason -- resolving a real pending duplicate is a manual QA
 action, not something an automated run should do to shared queue state.
 """
 
-import uuid
+from bson import ObjectId
 
 
 def test_list_uploads_returns_a_list(client):
@@ -28,7 +28,7 @@ def test_upload_requires_exactly_one_state(client):
     resp = client.post(
         "/dashboard/uploads",
         data={
-            "states_json": '["State Karnataka", "State Kerala"]',
+            "states_json": '["Karnataka", "Kerala"]',
             "crops_json": '["Onion"]',
             "language": "kan",
         },
@@ -41,7 +41,7 @@ def test_upload_requires_at_least_one_crop(client):
     resp = client.post(
         "/dashboard/uploads",
         data={
-            "states_json": '["State Karnataka"]',
+            "states_json": '["Karnataka"]',
             "crops_json": "[]",
             "language": "kan",
         },
@@ -54,7 +54,7 @@ def test_upload_requires_language(client):
     resp = client.post(
         "/dashboard/uploads",
         data={
-            "states_json": '["State Karnataka"]',
+            "states_json": '["Karnataka"]',
             "crops_json": '["Onion"]',
         },
         files={"file": ("test.pdf", b"%PDF-1.4 fake", "application/pdf")},
@@ -66,7 +66,7 @@ def test_upload_rejects_unknown_language(client):
     resp = client.post(
         "/dashboard/uploads",
         data={
-            "states_json": '["State Karnataka"]',
+            "states_json": '["Karnataka"]',
             "crops_json": '["Onion"]',
             "language": "xx-not-a-real-language",
         },
@@ -84,15 +84,15 @@ def test_list_languages_returns_known_codes(client):
 
 
 def test_add_upload_404_for_random_id(client):
-    resp = client.post(f"/dashboard/uploads/{uuid.uuid4()}/add")
+    resp = client.post(f"/dashboard/uploads/{ObjectId()}/add")
     assert resp.status_code == 404
 
 
 def test_new_upload_404_for_random_id(client):
-    resp = client.post(f"/dashboard/uploads/{uuid.uuid4()}/new")
+    resp = client.post(f"/dashboard/uploads/{ObjectId()}/new")
     assert resp.status_code == 404
 
 
 def test_cancel_upload_duplicate_404_for_random_id(client):
-    resp = client.post(f"/dashboard/uploads/{uuid.uuid4()}/cancel")
+    resp = client.post(f"/dashboard/uploads/{ObjectId()}/cancel")
     assert resp.status_code == 404
