@@ -1,4 +1,4 @@
-import uuid
+from bson import ObjectId
 
 ASSOC_FIELDS = {
     "id", "unique_document_id", "document_id", "state", "crop", "shareable_name", "language",
@@ -21,8 +21,8 @@ def test_list_documents_paginated(client):
     assert ASSOC_FIELDS <= set(row.keys())
     assert row["state"]["name"]
     assert row["crop"]["name"]
-    uuid.UUID(row["id"])  # well-formed uuid
-    uuid.UUID(row["unique_document_id"])
+    ObjectId(row["id"])  # well-formed ObjectId (24-char hex, was a UUID pre-MongoDB)
+    ObjectId(row["unique_document_id"])
     assert row["document_id"].startswith("ANNAM_")
 
 
@@ -61,12 +61,12 @@ def test_get_document_by_id(client):
 
 
 def test_get_document_404_for_random_id(client):
-    resp = client.get(f"/dashboard/documents/{uuid.uuid4()}")
+    resp = client.get(f"/dashboard/documents/{ObjectId()}")
     assert resp.status_code == 404
 
 
 def test_get_document_422_for_malformed_id(client):
-    resp = client.get("/dashboard/documents/not-a-uuid")
+    resp = client.get("/dashboard/documents/not-an-objectid")
     assert resp.status_code == 422
 
 
@@ -83,7 +83,7 @@ def test_filter_documents_by_document_id(client):
 def test_filter_documents_bad_values_dont_500(client):
     for params in (
         {"filter[document_id]": "not-annam"},
-        {"filter[unique_document_id]": "not-a-uuid"},
+        {"filter[unique_document_id]": "not-an-objectid"},
         {"filter[created_at]": "not-a-date"},
     ):
         resp = client.get("/dashboard/documents", params=params)
@@ -92,5 +92,5 @@ def test_filter_documents_bad_values_dont_500(client):
 
 
 def test_delete_original_404_for_random_id(client):
-    resp = client.delete(f"/dashboard/unique-documents/{uuid.uuid4()}/original")
+    resp = client.delete(f"/dashboard/unique-documents/{ObjectId()}/original")
     assert resp.status_code == 404

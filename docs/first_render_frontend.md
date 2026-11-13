@@ -247,7 +247,8 @@ POST /uploads
   POST /uploads/{id}/cancel discard
 ```
 
-Poll `GET /uploads/{id}`. `status` and `progress_pct` drive the box; `note` is a
+Follow the item through `GET /dashboard/events` (see *Live updates*), or fetch
+`GET /uploads/{id}`. `status` and `progress_pct` drive the box; `note` is a
 sentence you can show verbatim.
 
 ### The form
@@ -265,8 +266,9 @@ placements_json = [ {"state": "State Karnataka",
                     {"state": "State Kerala", "crops": ["Coconut"]} ]
 ```
 
-Take the options from `GET /folders?advisory_type=<form's Advisory Type>&state=<group's state>`
-(see *The Folder dropdown follows the advisory type*). Each group needs at least
+Take the options from `GET /folders?advisory_type=<form's Advisory Type>` — not
+narrowed by the group's state (see *The Folder dropdown follows the advisory
+type*). Each group needs at least
 one entry across the four lists. A name under
 `"crops"` must be a crop master crop (an existing organisation's name is also
 accepted there) — anything else is a **400** telling the user to pick from
@@ -425,8 +427,13 @@ Wherever a Folder is picked — the **Add Document** form and the table's
 Don't reimplement the rule: **`GET /folders?advisory_type=<the selected type>`**
 returns exactly those options, each with its `kind`. Send an option's `id` as
 `crop_ids`/`organization_ids` (upload) or `crop_id`/`organization_id` (PATCH,
-filters) according to `kind`. Add `&state=`/`&state_id=` to narrow to folders
-used under a state, as in the upload form. The type is matched on letters only,
+filters) according to `kind`.
+
+**Do not narrow the pickers by state.** `&state=`/`&state_id=` returns only the
+folders *already used* under that state — right for the table's Folder column
+filter, wrong for the Add Document form and the row editor. A crop cannot be
+created here, so a narrowed picker would make it impossible to file a document
+under a master crop nobody has filed in that state yet. The type is matched on letters only,
 so `"Crop Advisory"` and `"crop-advisory"` are the same; anything unrecognised
 behaves like General. When the Advisory Type changes in the form, re-fetch and
 clear a selected folder that is no longer offered. In the table, filter the
@@ -492,6 +499,21 @@ plain `<a download>` is ignored for it. The backend proxies instead, and it send
 GET /dashboard/files/{zoho_file_id}/download    attachment
 GET /dashboard/files/{zoho_file_id}/link        inline (view in a tab)
 ```
+
+### Translation and review, named after the document
+
+```
+GET /dashboard/unique-documents/{id}/translation/download[?inline=1]   → <shareable name>_translation.<ext>
+GET /dashboard/unique-documents/{id}/review/download[?inline=1]        → <shareable name>_reviewed.<ext>
+```
+
+Use these for the translation and review icons: the file is named after the
+document (`Paddy_KA_2021.pdf` → `Paddy_KA_2021_translation.docx`) rather than
+whatever it is called in WorkDrive. The name is in `Content-Disposition`
+(`filename*=UTF-8''…`), and `Access-Control-Expose-Headers` includes it so a
+blob download can read it. `404` when the document has no translation / review.
+Same streaming, `Content-Length` and Range behaviour as the proxy below. The
+original keeps using `/files/{representative_file_id}/download`.
 
 ### The three file ids
 
@@ -588,10 +610,71 @@ first), and replacing an existing translation deletes the old file from
 WorkDrive, so a document does not collect copies nobody can reach.
 
 When a job finishes, the document's `translation_status` becomes `"done"` and
-`translation_file_id` is filled in — poll `/translation-jobs` or refetch the row,
+`translation_file_id` is filled in — a `translation` and a `document` event arrive (see *Live updates*); refetch the row,
 then render the download icon from that id (see "The three file ids").
 `POST /documents/{row_id}/review` returns `{"review_file_id": "…"}` for the file
 it just stored, and sets `review_status` to `"done"` on the document.
+
+### Who translated / reviewed, and when
+
+Send the signed-in user's display name with the action:
+
+```
+POST /unique-documents/{id}/translate      JSON  {"translated_by": "Asha K"}
+POST /unique-documents/{id}/translation    multipart field  translated_by
+POST /unique-documents/{id}/review         multipart field  reviewed_by
+```
+
+(The `/documents/{row_id}/…` forms take the same fields.) All optional. The
+document then carries four fields, on both the main-table row and the unique
+document:
+
+| field | set when | cleared when |
+|---|---|---|
+| `translated_by`, `translated_at` | a pipeline job finishes (by = who started it), or a translation is attached | the translation is deleted |
+| `reviewed_by`, `reviewed_at` | a review is uploaded | the review is deleted |
+
+`*_at` is an ISO datetime (UTC). Null on every document translated before
+2026-09-16. The name is whatever the frontend sent — `/api/pop` has no auth yet,
+so it is not verified.
+
+Filters: `filter[translated_by]` / `filter[reviewed_by]` (text, like
+`verified_by`), `filter[translated_at]` / `filter[reviewed_at]` for one day, and
+`filter[translated_at_from|_to]` / `filter[reviewed_at_from|_to]` (YYYY-MM-DD) for
+a range.
+
+**Sorting** — `sort=translated_at`, `sort=-translated_at`, `sort=reviewed_at`,
+`sort=-reviewed_at` on `GET /documents` and `GET /unique-documents`. `-` is
+newest first. Documents with no value come **last in both directions**. Without
+`sort` the order is the usual newest-created first. Anything else is `400`.
+
+Translation runs 3 pages at a time now; `pages_done` still counts up one page at
+a time.
+
+## Live updates
+
+```
+GET /dashboard/events        text/event-stream, no auth — new EventSource(url)
+```
+
+One stream for everything; replaces polling the queues.
+
+| event | data |
+|---|---|
+| `upload` | a full upload item (same as `GET /uploads/{id}`) on every status/progress change. When it leaves the queue: `{"id", "deleted": true}`, plus `unique_document_id`, `document_code`, `row_ids` when it left because it was filed |
+| `translation` | a full translation job (same as a `GET /translation-jobs` row) on every status/page change; `{"id", "deleted": true}` when removed |
+| `document` | `{"unique_document_id": "<hex>"}` when a document's translation/review (or a new upload's rows) changed — refetch it / the visible table |
+
+- A comment line (`: keep-alive`) arrives every 15 s; ignore it.
+- **Nothing is replayed.** On the EventSource `open` event (first connect and
+  every reconnect) refetch `GET /uploads` and `GET /translation-jobs`.
+- EventSource reconnects by itself (the stream sets `retry: 3000`). Keep a slow
+  fallback poll: a proxy or Cloud Run may cut long connections.
+- Don't set `withCredentials` — the proxy answers `Access-Control-Allow-Origin: *`.
+
+Translation jobs carry `unique_document_id` (the same hex as `document_id`) — the
+id the document modal opens with. Upload candidates' `document_id` is already
+that hex.
 
 ## Things that will bite
 

@@ -15,13 +15,26 @@ All secrets are read from environment or a `.env` file (loaded via `python-doten
 | `ZOHO_CLIENT_SECRET` | Yes | Zoho OAuth app client secret |
 | `ZOHO_REFRESH_TOKEN` | Yes | Zoho long-lived refresh token |
 | `ZOHO_ROOT_FOLDER_ID` | Yes | ID of the root WorkDrive folder (parent of `Data/` and `Workdir/`) |
-| `DATABASE_URL` | Yes, for the dashboard (`/dashboard/*` routes) | Postgres connection string, e.g. `postgresql+psycopg://pop_dashboard:<password>@localhost:5432/pop_dashboard` |
-| `ZOHO_DASHBOARD_ROOT_FOLDER_ID` | Yes, for the dashboard | Root WorkDrive folder for the dashboard's own `originals/`/`translations/`/`reviews/` layout — separate from `ZOHO_ROOT_FOLDER_ID` |
+| `DB_URL` | Yes, for the dashboard (`/dashboard/*` routes) | MongoDB Atlas connection string, e.g. `mongodb+srv://<user>:<password>@cluster0.xxxxx.mongodb.net/` |
+| `DASHBOARD_DB_NAME` | No (defaults to `pop_dashboard`) | Database on that cluster. Note `DB_NAME` is a *different* application's database on the same cluster and is deliberately not used by the dashboard |
+| `ZOHO_DASHBOARD_ORIGINALS_FOLDER_ID` / `ZOHO_DASHBOARD_TRANSLATIONS_FOLDER_ID` / `ZOHO_DASHBOARD_REVIEWS_FOLDER_ID` | Yes, for the dashboard | Three fixed, pre-created WorkDrive subfolder IDs the dashboard uploads into directly — separate from `ZOHO_ROOT_FOLDER_ID`. **Not** a single root folder ID — `dashboard/config.py` reads these three names specifically (fixed 2026-08-30: `docker-compose.yml` previously passed through an unused `ZOHO_DASHBOARD_ROOT_FOLDER_ID` instead, so these three never reached the container and every upload's `/new` step failed with `"... is not set in .env"`) |
 | `DUPLICATE_EMBEDDING_THRESHOLD` | No | Cosine similarity cutoff for flagging a duplicate upload (default `0.95`) |
 | `TRANS` | No | `on` (default) or `off` — kill switch for the dashboard's per-document translate button, independent of whether an LLM key is set. Current production deploy uses `off`: document management only, translate button reads "out of order" (see `docs/dashboard_backend_plan.md` §7) |
-| `POSTGRES_USER` / `POSTGRES_PASSWORD` | Yes, for the `db` compose service | Credentials for the containerized Postgres instance |
 
-The server fails to connect to Zoho on startup if these are missing, but it does not crash — a warning is logged and the Zoho singleton is retried on first request. The same applies to the dashboard's Postgres connection: `dashboard/db.py` only connects lazily, on first actual use, so a missing `DATABASE_URL` doesn't prevent the rest of the server from starting — only `/dashboard/*` routes fail until it's set. See `docs/dashboard_backend_plan.md` for the full dashboard design.
+The server fails to connect to Zoho on startup if these are missing, but it does not crash — a warning is logged and the Zoho singleton is retried on first request. The same applies to the dashboard's MongoDB connection: `dashboard/db.py` only connects lazily, on first actual use, so a missing `DB_URL` doesn't prevent the rest of the server from starting — only `/dashboard/*` routes fail until it's set. See `docs/dashboard_backend_plan.md` for the full dashboard design.
+
+### Database
+
+The dashboard runs on **hosted MongoDB Atlas** — there is no database container to
+operate, back up, or upgrade. `init_db()` creates every collection index at
+startup, including the **Atlas Vector Search** index that powers duplicate
+detection; that one takes roughly 25 seconds to build the first time and reports
+`PENDING` until it is queryable.
+
+Atlas limits how many search indexes a cluster may hold (this cluster allows
+**two**, and another application already uses one). If duplicate detection ever
+reports no candidates on a non-empty catalogue, check that
+`unique_documents.embedding_vector_index` still exists and is `queryable`.
 
 ---
 
@@ -58,6 +71,13 @@ Key points:
 ### docker-compose.yml
 
 ```yaml
+# The dashboard's database is hosted MongoDB Atlas (DB_URL) rather than a
+# container: the previous pgvector/Postgres `db` service and its `pgdata`
+# volume are gone, along with DATABASE_URL/POSTGRES_USER/POSTGRES_PASSWORD.
+#
+# Duplicate detection now runs on an Atlas Vector Search index, which is
+# created by the application at startup (dashboard/db.py::init_db) and takes
+# ~25s to build the first time.
 services:
   pipeline:
     image: vicharanashala/pop-translation:latest
@@ -74,8 +94,14 @@ services:
       - ZOHO_CLIENT_SECRET=${ZOHO_CLIENT_SECRET}
       - ZOHO_REFRESH_TOKEN=${ZOHO_REFRESH_TOKEN}
       - ZOHO_ROOT_FOLDER_ID=${ZOHO_ROOT_FOLDER_ID}
-      - DATABASE_URL=${DATABASE_URL}
-      - ZOHO_DASHBOARD_ROOT_FOLDER_ID=${ZOHO_DASHBOARD_ROOT_FOLDER_ID}
+      # MongoDB Atlas. DB_URL is the cluster connection string; the dashboard
+      # uses its own database on it (DB_NAME in .env belongs to a different
+      # application on the same cluster and is deliberately not used here).
+      - DB_URL=${DB_URL}
+      - DASHBOARD_DB_NAME=${DASHBOARD_DB_NAME:-pop_dashboard}
+      - ZOHO_DASHBOARD_ORIGINALS_FOLDER_ID=${ZOHO_DASHBOARD_ORIGINALS_FOLDER_ID}
+      - ZOHO_DASHBOARD_TRANSLATIONS_FOLDER_ID=${ZOHO_DASHBOARD_TRANSLATIONS_FOLDER_ID}
+      - ZOHO_DASHBOARD_REVIEWS_FOLDER_ID=${ZOHO_DASHBOARD_REVIEWS_FOLDER_ID}
       - DUPLICATE_EMBEDDING_THRESHOLD=${DUPLICATE_EMBEDDING_THRESHOLD:-0.95}
       - TRANS=${TRANS:-on}
     healthcheck:
@@ -86,28 +112,98 @@ services:
       start_period: 15s
     restart: unless-stopped
 
-  db:
-    image: pgvector/pgvector:pg16
-    network_mode: host
-    environment:
-      - POSTGRES_DB=pop_dashboard
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-
 volumes:
   pop-data:
-  pgdata:
 ```
 
-`network_mode: host` is used so both containers share the host network stack (common for internal deployments without a reverse proxy) — `pipeline` reaches Postgres via `localhost:5432`, not the compose service name `db`, since host networking means there's no compose-internal DNS between them.
+`network_mode: host` is used so the container shares the host network stack (common for internal deployments without a reverse proxy). There is only one service now — the database is hosted Atlas, reached over the internet via `DB_URL`.
+
+## Database setup (first run on a new environment)
+
+The dashboard's catalogue is loaded from the CSVs it was originally built from,
+so setting up a fresh environment needs no database dump and no Postgres. There
+was never any dashboard-authored data in Postgres beyond what these CSVs
+contain, so this load is complete, not a partial restore.
+
+**1. Load the catalogue** (~7,500 documents, ~8,600 placements, a few minutes):
+
+```bash
+DASHBOARD_DB_NAME=pop_dashboard .venv/bin/python3 -m dashboard.migrate_from_pops_csv
+```
+
+Reads `results/pops.csv`, `results/main.csv` and
+`results/report_true_embeddings.json`. Resumable — documents already present by
+`sha256`, and placements already present by (document, state, crop), are skipped
+rather than duplicated, so it is safe to re-run.
+
+**2. Confirm the vector index is queryable.** `init_db()` creates it at startup,
+but it takes ~25 seconds to build and reports `PENDING` until ready:
+
+```bash
+DASHBOARD_DB_NAME=pop_dashboard .venv/bin/python3 -c \
+  "from dashboard.db import get_database, vector_index_ready; \
+   print('queryable:', vector_index_ready(get_database()))"
+```
+
+> **M0 caps the number of Atlas Search indexes (3 on this tier), and they are
+> shared cluster-wide with other applications.** All three slots are currently
+> in use — `pop_dashboard`, `pop_dashboard_test`, and another application's
+> `prod_copy_db.questions` — so creating a fourth will fail with
+> `"The maximum number of FTS indexes has been reached for this instance size"`.
+> If that happens, drop one you no longer need:
+>
+> ```bash
+> DASHBOARD_DB_NAME=<db> .venv/bin/python3 -c \
+>   "from dashboard.db import get_database; \
+>    get_database().unique_documents.drop_search_index('embedding_vector_index')"
+> ```
+>
+> Note that dropping a collection drops its search index with it, so a
+> drop-and-reload cycle frees the slot automatically.
+
+Without a queryable index, exact-SHA duplicate detection still works but
+embedding similarity silently returns no candidate. Check this before opening
+uploads.
+
+**3. Deploy** with `DB_URL` and `DASHBOARD_DB_NAME` set in `.env`.
+
+### Cluster capacity — read before loading a second copy
+
+The Atlas cluster is an **M0 free tier: 512 MB total, shared with unrelated
+applications** (`prod_copy_db` alone uses ~310 MB, roughly 60% of the quota).
+Exceeding it blocks writes **cluster-wide**, including for those other
+applications — not just for the dashboard.
+
+Two things keep the dashboard inside its share:
+
+- **Embeddings are stored as Atlas float32 binary vectors**, not BSON arrays of
+  doubles: ~3,095 bytes per document instead of ~9,895. `new_unique_document()`
+  applies this on every write path, so the migration and the upload queue both
+  produce the compact form. It is not a precision change — pgvector stored
+  float4 (32-bit), so this is exactly what Postgres held.
+  `scripts/convert_embeddings_to_float32.py` converts a legacy collection in
+  place (it refuses to run against any database outside the dashboard's own).
+- **A full catalogue is ~35 MB** (30 MB data + ~5 MB indexes). Two copies
+  (`pop_dashboard` + `pop_dashboard_test`) fit with roughly 110 MB to spare.
+
+**Freed space is not returned automatically.** WiredTiger keeps it, and Atlas
+blocks the `compact` command on M0, so deleting or rewriting a lot of documents
+leaves `storageSize` high even though `dataSize` has dropped. The only way to
+reclaim it on this tier is to drop the collection (or database) and re-run the
+migration — which is cheap, since the load is reproducible from the CSVs.
+
+Check usage with:
+
+```bash
+.venv/bin/python3 -c "
+from dashboard.config import DB_URL; from pymongo import MongoClient
+c = MongoClient(DB_URL)
+for n in sorted(c.list_database_names()):
+    if n in ('admin','local','config'): continue
+    s = c[n].command('dbStats')
+    print(f\"{n:24} {s['storageSize']/1e6:7.1f}M storage  {s['indexSize']/1e6:6.1f}M idx\")"
+```
+
 
 ### Starting with docker-compose
 
@@ -144,10 +240,11 @@ ZOHO_CLIENT_ID=your_id
 ZOHO_CLIENT_SECRET=your_secret
 ZOHO_REFRESH_TOKEN=your_token
 ZOHO_ROOT_FOLDER_ID=your_folder_id
-DATABASE_URL=postgresql+psycopg://pop_dashboard:your_password@localhost:5432/pop_dashboard
-ZOHO_DASHBOARD_ROOT_FOLDER_ID=your_dashboard_folder_id
-POSTGRES_USER=pop_dashboard
-POSTGRES_PASSWORD=your_password
+DB_URL="mongodb+srv://<user>:<password>@cluster0.xxxxx.mongodb.net/"
+DASHBOARD_DB_NAME=pop_dashboard
+ZOHO_DASHBOARD_ORIGINALS_FOLDER_ID=your_originals_subfolder_id
+ZOHO_DASHBOARD_TRANSLATIONS_FOLDER_ID=your_translations_subfolder_id
+ZOHO_DASHBOARD_REVIEWS_FOLDER_ID=your_reviews_subfolder_id
 EOF
 
 # 5. Start server

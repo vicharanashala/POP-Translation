@@ -4,7 +4,7 @@ translation job, exactly the kind of side-effecting action meant to be
 checked manually rather than by an automated test run.
 """
 
-import uuid
+from bson import ObjectId
 
 
 def test_list_translation_jobs_returns_a_list(client):
@@ -28,5 +28,5 @@ def test_list_translation_jobs_by_status(client):
 
 
 def test_cancel_translation_job_404_for_random_id(client):
-    resp = client.post(f"/dashboard/translation-jobs/{uuid.uuid4()}/cancel")
+    resp = client.post(f"/dashboard/translation-jobs/{ObjectId()}/cancel")
     assert resp.status_code == 404

@@ -1,4 +1,4 @@
-import uuid
+from bson import ObjectId
 
 UNIQUE_DOC_FIELDS = {
     "id", "document_id", "sha256", "shareable_name", "shareable_link", "states", "crops",
@@ -20,7 +20,7 @@ def test_list_unique_documents_paginated(client):
     row = body["items"][0]
     assert UNIQUE_DOC_FIELDS <= set(row.keys())
     assert "zoho_file_id" not in row  # internal Zoho id -- shareable_link is the public equivalent
-    uuid.UUID(row["id"])
+    ObjectId(row["id"])
     assert len(row["sha256"]) == 64  # sha256 hex digest
     assert row["document_id"].startswith("ANNAM_")
 
@@ -71,7 +71,7 @@ def test_get_unique_document_by_id(client):
 
 
 def test_get_unique_document_404_for_random_id(client):
-    resp = client.get(f"/dashboard/unique-documents/{uuid.uuid4()}")
+    resp = client.get(f"/dashboard/unique-documents/{ObjectId()}")
     assert resp.status_code == 404
 
 
