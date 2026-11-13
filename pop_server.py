@@ -24,6 +24,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+from helpers.service_key import ServiceKeyMiddleware, configured_keys
+
 # ---------------------------------------------------------------------------
 # Thread-local stdout capture: routes print() output per job thread
 # ---------------------------------------------------------------------------
@@ -990,6 +992,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="POP Translation Server", lifespan=lifespan, docs_url="/api-docs", redoc_url="/api-redoc")
+# The shared-secret gate (helpers/service_key.py). Added BEFORE the CORS
+# middleware so CORS stays the outer layer and preflights are answered as ever.
+# A set-but-weak POP_SERVICE_KEY raises here, on purpose: refuse to start
+# rather than run behind a gate that accepts a guessable key.
+_SERVICE_KEYS = configured_keys()
+if _SERVICE_KEYS:
+    app.add_middleware(ServiceKeyMiddleware, keys=_SERVICE_KEYS)
+else:
+    print("[WARN] POP_SERVICE_KEY is not set -- every request is accepted without a service key")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
