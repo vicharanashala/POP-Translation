@@ -390,6 +390,10 @@ class UniqueDocumentOut(DocumentMetadata):
     kvk: str | None = None
     district_id: str | None = None
     kvk_id: str | None = None
+    # The ministry or department it belongs to: one organisation per document,
+    # by name and by id.
+    ministry_or_department: str | None = None
+    ministry_or_department_id: str | None = None
     duplicate_links: list[CopyLink] = []
     created_at: UTCDatetime
     updated_at: UTCDatetime
@@ -413,6 +417,8 @@ class UniqueDocumentUpdate(DocumentMetadata):
     # not put it in a second district. By id; "" clears.
     district_id: str | None = None
     kvk_id: str | None = None
+    # An organisation id from GET /dashboard/organizations; "" clears.
+    ministry_or_department_id: str | None = None
 
 
 # -- The main table (documents) ------------------------------------------------
@@ -697,6 +703,7 @@ class UploadEdit(BaseModel):
     placements: list[dict] | None = None
     district_id: str | None = None
     kvk_id: str | None = None
+    ministry_or_department_id: str | None = None
     format_original: str | None = None
     advisory_type: str | None = None
     advisory_scope: str | None = None

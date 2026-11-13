@@ -128,7 +128,7 @@ def enqueue_decision(item_id: ObjectId, document_id: ObjectId | None) -> None:
     _executor.submit(_finish, item_id, document_id)
 
 
-def _optional_ref(db, source: dict, kind: str):
+def _optional_ref(db, source: dict, kind: str, field: str | None = None):
     """The district or KVK id a queued item holds, or None.
 
     Read from the item's METADATA, not from a placement: both are fields of the
@@ -140,12 +140,13 @@ def _optional_ref(db, source: dict, kind: str):
     upload rather than being silently dropped and leaving it untagged -- the
     entry could have gone in the time the item sat in the queue.
     """
-    stored = source.get(vocabulary.field(kind))
+    field = field or vocabulary.field(kind)
+    stored = source.get(field)
     if not stored:
         return None
     entry = vocabulary.get(db, kind, stored)
     if entry is None:
-        raise ValueError(f"{kind}_id {stored!r} does not name an existing {kind}")
+        raise ValueError(f"{field} {stored!r} does not name an existing {kind}")
     return entry["_id"]
 
 
@@ -478,6 +479,9 @@ def _finish(item_id: ObjectId, document_id: ObjectId | None) -> None:
                         **{vocabulary.field(kind): ref
                            for kind in ("district", "kvk")
                            if (ref := _optional_ref(db, metadata, kind)) is not None},
+                        # The ministry or department: an organisation, one per document.
+                        **({"ministry_or_department_id": ref} if (ref := _optional_ref(
+                            db, metadata, "organization", "ministry_or_department_id")) is not None else {}),
                     },
                 )
                 copy = {

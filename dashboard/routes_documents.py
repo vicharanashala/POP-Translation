@@ -779,6 +779,9 @@ def _unique_out(doc: dict, places: dict[int, tuple[str, str]], names: dict) -> U
         f = vocabulary.field(kind)
         data[kind] = names[kind].get(data.get(f))
         data[f] = str(data[f]) if data.get(f) else None
+    data["ministry_or_department"] = names["organization"].get(data.get("ministry_or_department_id"))
+    if data.get("ministry_or_department_id"):
+        data["ministry_or_department_id"] = str(data["ministry_or_department_id"])
     links = []
     for link in data.get("duplicate_links") or []:
         links.append({**link, **places.get(link.get("row_id"), {})})
@@ -909,8 +912,9 @@ def _location_refs(db, submitted: dict) -> tuple[dict, dict]:
     """
     move: dict = {}
     unset: dict = {}
-    for kind in ("district", "kvk"):
-        f = vocabulary.field(kind)
+    # (stored field, the vocabulary it names); the ministry is an organisation.
+    for f, kind in (("district_id", "district"), ("kvk_id", "kvk"),
+                    ("ministry_or_department_id", "organization")):
         sent = submitted.get(f)
         if sent is None:
             continue
@@ -1231,7 +1235,7 @@ def update_unique_document(document_id: str, body: UniqueDocumentUpdate, db=Depe
     # store as the empty string -- so these two are resolved to ids here and
     # applied as a $set/$unset pair.
     refs, unset = _location_refs(db, updates)
-    for f in _LOCATION_FIELDS:
+    for f in (*_LOCATION_FIELDS, "ministry_or_department_id"):
         updates.pop(f, None)
     updates.update(refs)
     if updates or unset:

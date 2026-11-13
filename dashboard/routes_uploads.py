@@ -376,7 +376,10 @@ _FOLDER_LISTS = ("crop_ids", "organization_ids")
 # so they arrive once per upload rather than once per state group. Absent from
 # every upload the form has ever sent, and that stays valid -- neither is
 # required, and absence already means "not specific to one".
-_LOCATION_REFS = ("district_id", "kvk_id")
+_LOCATION_REFS = ("district_id", "kvk_id", "ministry_or_department_id")
+# The vocabulary a reference names, where it is not the field name minus "_id":
+# the ministry or department is an entry of the organisation master.
+_REF_KIND = {"ministry_or_department_id": "organization"}
 
 
 def _checked_ref(db, source: dict, key: str):
@@ -389,7 +392,7 @@ def _checked_ref(db, source: dict, key: str):
     raw = source.get(key)
     if raw is None or not str(raw).strip():
         return None
-    kind = key[: -len("_id")]
+    kind = _REF_KIND.get(key) or key[: -len("_id")]
     entry = vocabulary.get(db, kind, raw)
     if entry is None:
         raise HTTPException(400, f"{key} {raw!r} does not name an existing {kind}")
@@ -460,11 +463,14 @@ async def create_upload(
     # the document -- not to a state group, which is where they used to arrive.
     district_id: str | None = Form(None),
     kvk_id: str | None = Form(None),
+    # The ministry or department: an organisation id, one per document.
+    ministry_or_department_id: str | None = Form(None),
     who: Caller = Depends(caller),
     db=Depends(get_db),
 ):
     placements = _parse_placements(db, placements_json)
-    where = {k: _checked_ref(db, {"district_id": district_id, "kvk_id": kvk_id}, k)
+    where = {k: _checked_ref(db, {"district_id": district_id, "kvk_id": kvk_id,
+                                  "ministry_or_department_id": ministry_or_department_id}, k)
              for k in _LOCATION_REFS}
     if db[COLL_LANGUAGES].count_documents({"code": language}, limit=1) == 0:
         raise HTTPException(400, "language must be a code from GET /dashboard/languages")

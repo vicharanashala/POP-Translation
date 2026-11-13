@@ -1934,7 +1934,7 @@ def test_documents_carry_only_the_agreed_fields(db):
         "approved_by_approver", "approved_by_admin",
         "uploaded_by_id", "approved_by_approver_id", "approved_by_admin_id",
         "chunk_embeddings", "main_row_ids", "duplicate_links",
-        "representative_file_id", "district_id", "kvk_id",
+        "representative_file_id", "district_id", "kvk_id", "ministry_or_department_id",
         "created_at", "updated_at",
         # DEAD DATA, tolerated until someone clears it: the anchor PLACEMENT
         # pointer. Nothing reads or writes it any more -- the anchor row is
