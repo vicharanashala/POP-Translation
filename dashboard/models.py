@@ -352,7 +352,7 @@ def new_document(*, row_id: int, unique_document_id, state_id, state_raw: str,
 
 
 def new_unique_document(*, display_id: int, sha256: str | None = None,
-                        district_id=None, kvk_id=None, **fields) -> dict:
+                        district_id=None, kvk_id=None, ministry_or_department_id=None, **fields) -> dict:
     """One distinct document: everything true of the CONTENT.
 
     date_of_release / date_of_collection are deliberately strings, not dates:
@@ -452,6 +452,10 @@ def new_unique_document(*, display_id: int, sha256: str | None = None,
         # "$exists" is what tells an unset one from a cleared one.
         **({"district_id": district_id} if district_id is not None else {}),
         **({"kvk_id": kvk_id} if kvk_id is not None else {}),
+        # The ministry or department it belongs to: one per document, an entry
+        # of the organisation master (the same list the folder dropdown offers).
+        # Omitted when unset, like district and kvk.
+        **({"ministry_or_department_id": ministry_or_department_id} if ministry_or_department_id is not None else {}),
         "created_at": now,
         "updated_at": now,
     }
