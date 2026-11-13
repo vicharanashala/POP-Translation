@@ -14,8 +14,6 @@ fastapi
 uvicorn[standard]
 python-multipart
 pandoc
-sqlalchemy
-psycopg[binary]
-pgvector
+pymongo
 sentence-transformers
 torch

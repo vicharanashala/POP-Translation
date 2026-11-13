@@ -1,0 +1,3576 @@
+"""Integration tests for the split schema: `documents` + `unique_documents`.
+
+Live-server tests, same style as the rest of tests/: they hit a REAL running
+pop_server over HTTP rather than importing the app, because pop_server's
+module-level side effects (Zoho singleton, thread pools, DB init via lifespan)
+make in-process import awkward.
+
+Deliberately does NOT use tests/conftest.py's `client` fixture: that one pins
+localhost:8032 and the previous schema's database. This file brings its own
+client so the two schemas' suites can run against different servers at once.
+
+    .venv/bin/uvicorn pop_server:app --host 127.0.0.1 --port 8047
+    POP_RENDER_BASE_URL=http://127.0.0.1:8047 .venv/bin/python3 -m pytest tests/test_render_main_table.py -v
+
+Every test that writes creates its own rows and deletes them afterwards. None
+of them mutate a migrated corpus row or document -- the assertions below read
+those, but the only writes go to fixtures this file created.
+"""
+from __future__ import annotations
+
+import json
+import os
+import time
+
+import httpx
+import pytest
+from bson import ObjectId
+
+BASE_URL = os.environ.get("POP_RENDER_BASE_URL", "http://127.0.0.1:8047")
+
+# Who the suite says it is (see dashboard/access.py). Made up per run, so no
+# test can collide with a real member of the approval lists on staging. The
+# shared client is an ADMIN, which is what every test written before the
+# approval chain assumed; tests about permissions pass `headers=_as(...)`.
+ADMIN_ID = str(ObjectId())
+
+
+# A real organisation, for tests that need one: an agriai.organizations entry,
+# which is what placements point at since 2026-10. It used to be our folder
+# "KVK Files", which the move of non-organisation folders to crop "All" deleted.
+SOME_ORG = "Central Rice Research Institute"
+
+
+def _as(user_id: str, role: str = "expert") -> dict:
+    return {"X-User-Id": user_id, "X-User-Role": role}
+
+
+@pytest.fixture(scope="session")
+def client():
+    c = httpx.Client(base_url=BASE_URL, timeout=30.0, headers=_as(ADMIN_ID, "admin"))
+    try:
+        resp = c.get("/dashboard/stats")
+        if resp.status_code != 200:
+            pytest.skip(f"pop_server not healthy at {BASE_URL} (status {resp.status_code})")
+    except httpx.ConnectError:
+        pytest.skip(f"pop_server not running at {BASE_URL} -- see this file's docstring")
+    yield c
+    c.close()
+
+
+@pytest.fixture(scope="session")
+def db():
+    """Direct handle, for creating throwaway rows and for the assertions that
+    are about storage rather than about the API -- 'is this field on the
+    placement or on the document' cannot be asked over HTTP."""
+    from dotenv import load_dotenv
+
+    load_dotenv(".env")
+    from dashboard.db import get_database
+
+    return get_database()
+
+
+@pytest.fixture
+def vocab_guard(db):
+    """Undoes what a test did to the state and organisation vocabularies: any
+    entry it seeded and left unused is deleted, and any entry it RENAMED is put
+    back, so runs do not accumulate "Scratchland" entries in the real dropdowns
+    or leave a real one under a test's spelling.
+
+    Districts and KVKs are deliberately NOT watched: they are synced from LGD
+    (scripts/sync_lgd.py), no test creates one -- the API answers 403 -- and
+    deleting one would quietly shrink a real dropdown. Crops likewise.
+    """
+    from dashboard.models import COLL_DOCUMENTS, COLL_ORG_MASTER, COLL_STATES
+
+    # (collection, placement field, the entry's name field). Organisations are
+    # staging's copy of agriai.organizations, which names entries in `org_name`.
+    watched = ((COLL_STATES, "state_id", "name"), (COLL_ORG_MASTER, "organization_id", "org_name"))
+    # NAMES, not just ids: a rename test leaves the entry renamed, and deleting
+    # only the unused new ones left it behind whenever something still pointed
+    # at it. The next test's fixture then resolved "Scratch Alpha" onto the
+    # renamed row and read back "scratch ALPHA" -- a failure that only appeared
+    # in a full run, never when the test was run on its own.
+    before = {c: {e["_id"]: e.get(nf) for e in db[c].find({}, {"_id": 1, nf: 1})}
+              for c, _f, nf in watched}
+    yield
+    for coll, field, nf in watched:
+        for e in db[coll].find({}, {"_id": 1, nf: 1}):
+            was = before[coll].get(e["_id"])
+            if e["_id"] not in before[coll]:
+                if db[COLL_DOCUMENTS].count_documents({field: e["_id"]}, limit=1) == 0:
+                    db[coll].delete_one({"_id": e["_id"]})
+            elif e.get(nf) != was:
+                db[coll].update_one({"_id": e["_id"]}, {"$set": {nf: was}})
+
+
+def _seed_entry(db, collection, name: str, name_field: str = "name", **fields) -> dict:
+    """A throwaway vocabulary entry, inserted straight through pymongo.
+
+    No API route creates a vocabulary entry and nothing resolves one by name, so
+    a fixture seeds its scratch state and folder the way it seeds a document.
+    vocab_guard removes them again if nothing ended up using them.
+    """
+    from dashboard.models import utcnow
+
+    entry = db[collection].find_one({name_field: name})
+    if entry is None:
+        now = utcnow()
+        db[collection].insert_one({name_field: name, "raw_names": [], "created_at": now,
+                                   "updated_at": now, **fields})
+        entry = db[collection].find_one({name_field: name})
+    return entry
+
+
+def _placement_row(db, *, row_id, unique_document_id, state, crop, **fields):
+    """A placement for a test fixture, referencing its state and folder by ID,
+    the way every real write path does.
+
+    The scratch folder is an ORGANISATION. A "Scratch ..." name is not in the
+    crop master, and the fixture does not ask: it seeds the entry it wants and
+    uses its id, because nothing turns a name into an id any more.
+    """
+    from dashboard.models import COLL_ORG_MASTER, COLL_STATES, new_document
+
+    return new_document(
+        row_id=row_id, unique_document_id=unique_document_id,
+        state_id=_seed_entry(db, COLL_STATES, state)["_id"],
+        organization_id=_seed_entry(db, COLL_ORG_MASTER, crop, "org_name", type="central")["_id"],
+        state_raw=state, crop_raw=crop, **fields)
+
+
+def _vocab_id(client, path: str, name: str) -> str:
+    """The id of a vocabulary entry, by the name a test writes it as.
+
+    The lookup every payload needs now that the API takes ids: a test names
+    "Paddy" for readability and sends the id, exactly as the frontend does after
+    the person picks it from the dropdown.
+    """
+    for entry in client.get(f"/dashboard/{path}").json():
+        if entry["name"].casefold() == name.casefold():
+            return entry["id"]
+    raise AssertionError(f"no {path} entry named {name!r}")
+
+
+@pytest.fixture
+def scratch(db, vocab_guard):
+    """A throwaway document with two placements, cleaned up afterwards.
+
+    Yields (document, [rows]). Ids are drawn from the live allocators, so this
+    also exercises the fact that the two series are independent.
+    """
+    from dashboard.display_id import free_display_ids, free_row_ids
+    from dashboard.models import (
+        COLL_DOCUMENTS,
+        COLL_UNIQUE_DOCUMENTS,
+        link_placement,
+        new_copy_link,
+        new_unique_document,
+    )
+
+    doc = new_unique_document(
+        display_id=free_display_ids(db, 1)[0],
+        sha256="scratch" + "0" * 57,
+        shareable_name="scratch-test.pdf",
+        num_pages=3,
+    )
+    doc["_id"] = db[COLL_UNIQUE_DOCUMENTS].insert_one(doc).inserted_id
+
+    rows = []
+    for row_id, crop in zip(free_row_ids(db, 2), ("Scratch Alpha", "Scratch Beta")):
+        row = _placement_row(db, row_id=row_id, unique_document_id=doc["_id"],
+                             state="Scratchland", crop=crop, source="upload")
+        row["_id"] = db[COLL_DOCUMENTS].insert_one(row).inserted_id
+        link_placement(db, doc["_id"], row_obj_id=row["_id"], row_id=row_id,
+                       copy_link=new_copy_link(zoho_file_id=f"fid{row_id}",
+                                               shareable_link=f"http://example/{row_id}",
+                                               shareable_name="scratch-test.pdf"))
+        rows.append(row)
+    yield db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc["_id"]}), rows
+
+    db[COLL_DOCUMENTS].delete_many({"unique_document_id": doc["_id"]})
+    db[COLL_UNIQUE_DOCUMENTS].delete_one({"_id": doc["_id"]})
+
+
+# -- shape of the split --------------------------------------------------------
+
+
+def test_placements_outnumber_documents(client):
+    """The whole reason for two collections: one document can be filed in many
+    folders, so there are more rows than documents."""
+    s = client.get("/dashboard/stats").json()
+    assert s["documents"] > s["files"] > 0
+    assert s["states"] > 0 and s["crops"] > 0
+
+
+def test_every_placement_resolves_to_a_document(db):
+    from dashboard.models import COLL_DOCUMENTS, COLL_UNIQUE_DOCUMENTS
+
+    known = {d["_id"] for d in db[COLL_UNIQUE_DOCUMENTS].find({}, {"_id": 1})}
+    dangling = [r["row_id"] for r in db[COLL_DOCUMENTS].find({}, {"row_id": 1, "unique_document_id": 1})
+                if r["unique_document_id"] not in known]
+    assert dangling == []
+
+
+def test_link_lists_match_the_placements(db):
+    """main_row_ids mirrors the placements exactly: one entry per row.
+    If they ever disagree, something wrote one without the other."""
+    from dashboard.models import COLL_DOCUMENTS, COLL_UNIQUE_DOCUMENTS
+
+    rows = db[COLL_DOCUMENTS].count_documents({})
+    totals = next(db[COLL_UNIQUE_DOCUMENTS].aggregate([{"$group": {
+        "_id": None,
+        "ids": {"$sum": {"$size": "$main_row_ids"}},
+    }}]))
+    assert totals["ids"] == rows
+
+
+def test_copy_links_count_files_not_placements(db):
+    """duplicate_links is the list of PHYSICAL files, so a file is listed once.
+
+    The corpus has one file per placement (WorkDrive copies a file into every
+    folder), so there the two counts coincide. A dashboard upload writes one
+    file and files it in several places, so it has fewer copies than
+    placements -- what must never happen is the same file listed twice, which
+    would show a document as having identical duplicates of itself and offer a
+    choice of anchor where there is only one file.
+    """
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    repeated, more_links_than_rows, stray_anchor = [], [], []
+    for d in db[COLL_UNIQUE_DOCUMENTS].find(
+        {}, {"display_id": 1, "duplicate_links": 1, "main_row_ids": 1,
+             "representative_file_id": 1}
+    ):
+        links = d.get("duplicate_links") or []
+        file_ids = [c.get("zoho_file_id") for c in links]
+        if len(file_ids) != len(set(file_ids)):
+            repeated.append(d["display_id"])
+        if len(links) > len(d.get("main_row_ids") or []):
+            more_links_than_rows.append(d["display_id"])
+        # The anchor FILE has to be one of the copies actually listed, or
+        # nothing can mark it in a list of copies -- and the anchor placement,
+        # which is read off that entry rather than stored, would not be findable
+        # at all.
+        anchor_file = d.get("representative_file_id")
+        if links and anchor_file is not None and anchor_file not in set(file_ids):
+            stray_anchor.append(d["display_id"])
+
+    assert repeated == [], f"same file listed twice: {repeated[:5]}"
+    assert more_links_than_rows == [], f"more copies than placements: {more_links_than_rows[:5]}"
+    assert stray_anchor == [], f"anchor is not one of the listed copies: {stray_anchor[:5]}"
+
+
+def test_main_table_carries_no_metadata_and_no_links(db):
+    """A row is a pure association. Metadata living on it again would mean an
+    edit has to be applied in up to 66 places."""
+    from dashboard.models import COLL_DOCUMENTS
+
+    for field in ("sha256", "shareable_link", "zoho_file_id", "num_pages",
+                  "language", "translation_status", "advisory_type", "shareable_name"):
+        assert db[COLL_DOCUMENTS].count_documents({field: {"$exists": True}}) == 0, field
+
+
+def test_two_id_series_are_independent(client):
+    row = client.get("/dashboard/documents?page=1").json()["items"][0]
+    assert row["row_id"].startswith("POP_")
+    assert row["document_id"].startswith("ANNAM_")
+
+
+# -- listing -------------------------------------------------------------------
+
+
+def test_list_is_paginated_at_100(client):
+    page = client.get("/dashboard/documents?page=1").json()
+    assert page["page_size"] == 100
+    assert len(page["items"]) == 100
+    assert page["total"] > 100
+
+
+def test_pages_do_not_overlap_or_skip(client):
+    """The sort is (created_at DESC, _id ASC). Without the _id tiebreak the
+    corpus load's identical timestamps make skip/limit repeat and drop rows."""
+    one = client.get("/dashboard/documents?page=1").json()["items"]
+    two = client.get("/dashboard/documents?page=2").json()["items"]
+    assert not ({r["id"] for r in one} & {r["id"] for r in two})
+
+
+def test_row_is_served_joined(client):
+    """Stored as an association, served complete -- the frontend renders a row
+    without a second request."""
+    row = client.get("/dashboard/documents?page=1").json()["items"][0]
+    for field in ("state", "crop", "row_id", "document_id", "unique_document_id",
+                  "advisory_name", "advisory_scope", "shareable_link", "sha256", "placement_count"):
+        assert field in row, field
+    assert row["placement_count"] >= 1
+    assert "shareable_name" not in row and "language_source" not in row
+    assert "season" not in row and "domain" not in row
+
+
+@pytest.mark.parametrize("key,lookup,name,where", [
+    ("state_id", "states", "Karnataka", "placement"),
+    ("crop_id", "crops", "Paddy", "placement"),
+    (None, None, "filter[translation_status]=done", "document"),
+    (None, None, "filter[language]=eng", "document"),
+    (None, None, "filter[format_original]=pdf", "document"),
+])
+def test_filters_hit_the_right_collection(client, key, lookup, name, where):
+    """Placement filters run before the $lookup, document filters after it.
+    Both must return rows, which is what proves the prefixing is right."""
+    query = name if key is None else f"filter[{key}]={_vocab_id(client, lookup, name)}"
+    page = client.get(f"/dashboard/documents?{query}").json()
+    assert page["total"] > 0, (query, where)
+
+
+def test_filters_combine_across_the_join(client):
+    state = f"filter[state_id]={_vocab_id(client, 'states', 'Karnataka')}"
+    combined = client.get(
+        f"/dashboard/documents?{state}&filter[translation_status]=not_started").json()
+    state_only = client.get(f"/dashboard/documents?{state}").json()
+    assert 0 < combined["total"] <= state_only["total"]
+
+
+def test_multi_select_filters_are_comma_separated(client):
+    """A repeated `filter[state_id]=A&filter[state_id]=B` silently keeps only the
+    LAST value in Starlette, so a two-state selection filtered on one state.
+    Comma is the one form with an unambiguous reading."""
+    ka = _vocab_id(client, "states", "Karnataka")
+    kl = _vocab_id(client, "states", "Keralam")
+    get = lambda v: client.get(f"/dashboard/documents?filter[state_id]={v}").json()["total"]
+    a, b, both = get(ka), get(kl), get(f"{ka},{kl}")
+    assert a > 0 and b > 0
+    assert both == a + b, "a state belongs to exactly one placement, so these add up"
+    # Whitespace and a trailing comma are a person's input, not an error.
+    assert get(f"{ka}, {kl},") == both
+
+
+def test_a_removed_or_unknown_filter_is_refused(client):
+    """An unknown `filter[...]` is a 400, not something ignored.
+
+    The name filters are gone -- every vocabulary is matched by id -- and a
+    frontend still sending `filter[state]=Kerala` would otherwise be handed all
+    9,811 placements as though it had asked for nothing. A wrong answer is worse
+    than an error, and silently worse.
+    """
+    for key, value in (("state", "Keralam"), ("crop", "Paddy"),
+                       ("district", "Wayanad"), ("kvk", "Anything")):
+        resp = client.get("/dashboard/documents", params={f"filter[{key}]": value})
+        assert resp.status_code == 400, (key, resp.status_code)
+        assert f"filter[{key}] no longer exists" in resp.json()["detail"]
+        assert f"{key}_id" in resp.json()["detail"]
+    for endpoint in ("documents", "unique-documents"):
+        resp = client.get(f"/dashboard/{endpoint}", params={"filter[nonsense]": "x"})
+        assert resp.status_code == 400 and "unknown filter" in resp.json()["detail"]
+    # A range suffix on a real key is still accepted.
+    assert client.get("/dashboard/documents",
+                      params={"filter[num_pages_min]": 5}).status_code == 200
+
+
+def test_range_filters(client):
+    """_min/_max on numbers, _from/_to on dates. Either end may be omitted --
+    "at least 10 pages" is as reasonable a filter as a bounded range."""
+    low = client.get("/dashboard/documents?filter[num_pages_min]=100").json()
+    high = client.get("/dashboard/documents?filter[num_pages_max]=2").json()
+    band = client.get("/dashboard/documents?filter[num_pages_min]=10&filter[num_pages_max]=20").json()
+    assert low["total"] > 0 and high["total"] > 0 and band["total"] > 0
+    assert all(10 <= r["num_pages"] <= 20 for r in band["items"])
+
+    dated = client.get("/dashboard/documents"
+                       "?filter[date_of_collection_from]=2026-08-01"
+                       "&filter[date_of_collection_to]=2026-08-31").json()
+    assert dated["total"] > 0
+    # Ranges work on the documents list too, not just the main table.
+    assert client.get("/dashboard/unique-documents?filter[num_pages_min]=100").json()["total"] > 0
+
+
+def test_date_and_month_fields_are_filterable(client):
+    """These were absent from the whitelist entirely, so the frontend's date and
+    month controls had nothing to talk to."""
+    for name, value in (("month_of_collection", "8"), ("date_of_collection", "2026-08-24")):
+        assert client.get(f"/dashboard/documents?filter[{name}]={value}").json()["total"] > 0
+    # The release fields are filterable and legitimately empty -- no corpus pass
+    # ever wrote them. Zero is the right answer, not a broken filter.
+    assert client.get("/dashboard/documents?filter[year_of_release]=2024").json()["total"] == 0
+
+
+def test_a_range_on_a_column_that_has_none_is_refused(client):
+    """A range suffix only exists on the number and date columns. `state_from`
+    is not a filter at all now that states are matched by id, so it is a 400 --
+    louder than the empty page it used to answer with, and for the same reason:
+    the caller has to find out the filter did not mean what they thought."""
+    assert client.get("/dashboard/documents?filter[state_from]=x").status_code == 400
+    assert client.get("/dashboard/documents?filter[state_id_from]=x").status_code == 400
+
+
+def test_unparseable_filter_returns_an_empty_page(client):
+    page = client.get("/dashboard/documents?filter[num_pages]=not-a-number").json()
+    assert page["total"] == 0 and page["items"] == []
+
+
+def test_siblings_are_the_other_placements(client, scratch):
+    doc, rows = scratch
+    first = str(rows[0]["_id"])
+    sib = client.get(f"/dashboard/documents/{first}/siblings").json()
+    assert [s["id"] for s in sib] == [str(rows[1]["_id"])]
+
+
+# -- the document behind the row -----------------------------------------------
+
+
+def test_unique_documents_list_is_paginated_and_filterable(client):
+    """The counterpart of GET /documents. A caller cannot derive this by
+    de-duplicating a page of placements -- pagination is server-side, so a page
+    of 100 placements collapses to an unpredictable number of documents."""
+    page = client.get("/dashboard/unique-documents?page=1").json()
+    assert page["page_size"] == 100 and len(page["items"]) == 100
+    placements = client.get("/dashboard/documents?page=1").json()
+    assert page["total"] < placements["total"], "documents must be fewer than placements"
+    assert page["total"] == client.get("/dashboard/stats").json()["files"]
+
+    two = client.get("/dashboard/unique-documents?page=2").json()
+    assert not ({d["id"] for d in page["items"]} & {d["id"] for d in two["items"]})
+
+    row = page["items"][0]
+    for field in ("document_id", "shareable_name", "shareable_link", "language",
+                  "placement_count", "duplicate_links", "representative_file_id"):
+        assert field in row, field
+
+
+def test_unique_documents_filters_match_the_main_tables(client):
+    """The same filter name must mean the same thing from either direction, or
+    the two tabs quietly disagree."""
+    for name, value in (("translation_status", "done"), ("language", "kan"),
+                        ("format_original", "pdf")):
+        docs = client.get(f"/dashboard/unique-documents?filter[{name}]={value}").json()
+        rows = client.get(f"/dashboard/documents?filter[{name}]={value}").json()
+        assert docs["total"] > 0, name
+        # Every matching document has at least one placement, so placements can
+        # only be >= documents.
+        assert rows["total"] >= docs["total"], name
+    exact = client.get("/dashboard/unique-documents?filter[document_id]=ANNAM_00321").json()
+    assert exact["total"] == 1
+    assert client.get("/dashboard/unique-documents?filter[num_pages]=nope").json()["total"] == 0
+
+
+def test_multi_placement_filter_finds_the_grouped_documents(client, db):
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    page = client.get("/dashboard/unique-documents?filter[multi_placement]=true").json()
+    assert page["total"] == db[COLL_UNIQUE_DOCUMENTS].count_documents(
+        {"main_row_ids.1": {"$exists": True}})
+    assert all(d["placement_count"] > 1 for d in page["items"])
+    single = client.get("/dashboard/unique-documents?filter[multi_placement]=false").json()
+    assert single["total"] + page["total"] == client.get("/dashboard/stats").json()["files"]
+
+
+def test_get_unique_document_and_its_placements(client, scratch):
+    doc, rows = scratch
+    out = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()
+    assert out["placement_count"] == 2
+    assert len(out["duplicate_links"]) == 2
+    # Every physical copy stays reachable -- that is why links live here.
+    assert all(l["shareable_link"] for l in out["duplicate_links"])
+    placements = client.get(f"/dashboard/unique-documents/{doc['_id']}/placements").json()
+    assert {p["id"] for p in placements} == {str(r["_id"]) for r in rows}
+
+
+def test_every_copy_link_points_at_its_own_file(db):
+    """The reason duplicate_links exists is that WorkDrive keeps a separate file
+    per folder. A link built from the DOCUMENT rather than the COPY silently
+    sends every placement to the same physical file -- which is what happened
+    for 1,000 of 9,811 placements, because pops.csv and report_true are keyed by
+    sha256 and hold one link per document."""
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    mismatched = [
+        (d["_id"], link["zoho_file_id"])
+        for d in db[COLL_UNIQUE_DOCUMENTS].find({}, {"duplicate_links": 1})
+        for link in (d.get("duplicate_links") or [])
+        if link.get("zoho_file_id") and link["zoho_file_id"] not in (link.get("shareable_link") or "")
+    ]
+    assert mismatched == []
+
+
+def test_every_document_is_anchored_to_one_of_its_own_copies(db):
+    """The anchor is what translation acts on. It must always name a file this
+    document actually owns -- otherwise the pipeline works on bytes the
+    document's metadata does not describe."""
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    broken = []
+    for d in db[COLL_UNIQUE_DOCUMENTS].find({}, {"representative_file_id": 1, "duplicate_links": 1}):
+        anchor = d.get("representative_file_id")
+        owned = {l.get("zoho_file_id") for l in (d.get("duplicate_links") or [])}
+        if not owned:
+            continue  # a document with no copies has nothing to anchor to
+        if anchor not in owned:
+            broken.append(d["_id"])
+    assert broken == []
+
+
+def test_translation_uses_the_anchor_not_the_first_copy(db):
+    """Today every copy is byte-identical so this is invisible. Once the merge
+    endpoint absorbs NEAR-duplicates it stops being, and translating 'whichever
+    copy is first' would work on a re-scan instead of the document."""
+    from dashboard.routes_translation import _source_file_id
+
+    doc = {
+        "representative_file_id": "anchor-file",
+        "duplicate_links": [
+            {"zoho_file_id": "some-other-copy"},
+            {"zoho_file_id": "anchor-file"},
+        ],
+    }
+    assert _source_file_id(doc) == "anchor-file"
+    # Unset or stale anchor: fall back rather than refuse to translate at all.
+    assert _source_file_id({"duplicate_links": [{"zoho_file_id": "only-copy"}]}) == "only-copy"
+    assert _source_file_id({"representative_file_id": "gone",
+                            "duplicate_links": [{"zoho_file_id": "only-copy"}]}) == "only-copy"
+    assert _source_file_id({"duplicate_links": []}) is None
+
+
+def test_the_anchor_cannot_be_changed(client, scratch):
+    """Re-anchoring is gone. Asking for it -- even onto one of the document's
+    own copies -- is a 400, not a silent 200, and the anchor stays put."""
+    doc, _rows = scratch
+    before = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()
+    other = next(c["zoho_file_id"] for c in before["duplicate_links"]
+                 if c["zoho_file_id"] != before["representative_file_id"])
+    for target in (other, "not-a-file-of-mine"):
+        resp = client.patch(f"/dashboard/unique-documents/{doc['_id']}",
+                            json={"representative_file_id": target})
+        assert resp.status_code == 400, resp.text
+    after = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()
+    assert after["representative_file_id"] == before["representative_file_id"]
+    assert after["shareable_link"] == before["shareable_link"]
+
+
+def test_merge_does_not_move_the_anchor(client, db, scratch):
+    """Absorbed copies become reachable, never promoted."""
+    from dashboard.display_id import free_display_ids, free_row_ids
+    from dashboard.models import (
+        COLL_DOCUMENTS, COLL_UNIQUE_DOCUMENTS, link_placement,
+        new_copy_link, new_unique_document,
+    )
+
+    survivor, _rows = scratch
+    before = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": survivor["_id"]})["representative_file_id"]
+    other = new_unique_document(display_id=free_display_ids(db, 1)[0],
+                                sha256="anchor" + "0" * 58, shareable_name="other.pdf",
+                                representative_file_id="fidOTHER")
+    other["_id"] = db[COLL_UNIQUE_DOCUMENTS].insert_one(other).inserted_id
+    row_id = free_row_ids(db, 1)[0]
+    row = _placement_row(db, row_id=row_id, unique_document_id=other["_id"],
+                         state="Scratchland", crop="Scratch Delta", source="upload")
+    row["_id"] = db[COLL_DOCUMENTS].insert_one(row).inserted_id
+    link_placement(db, other["_id"], row_obj_id=row["_id"], row_id=row_id,
+                   copy_link=new_copy_link(zoho_file_id="fidOTHER", shareable_link="http://example/o",
+                                           shareable_name="other.pdf"))
+    try:
+        assert client.post(f"/dashboard/unique-documents/{survivor['_id']}/merge",
+                           json={"absorb": [str(other["_id"])]}).status_code == 200
+        after = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": survivor["_id"]})
+        assert after["representative_file_id"] == before
+        assert "fidOTHER" in [l["zoho_file_id"] for l in after["duplicate_links"]]
+    finally:
+        db[COLL_DOCUMENTS].delete_one({"_id": row["_id"]})
+        db[COLL_UNIQUE_DOCUMENTS].delete_one({"_id": other["_id"]})
+
+
+def test_embeddings_are_never_serialised(client, scratch):
+    """Always empty today, thousands of floats later. A page of 100 rows must
+    not carry them."""
+    doc, _rows = scratch
+    assert "chunk_embeddings" not in client.get(f"/dashboard/unique-documents/{doc['_id']}").json()
+
+
+def test_patch_metadata_goes_to_the_document(client, scratch):
+    """One write, not one per placement."""
+    doc, rows = scratch
+    resp = client.patch(f"/dashboard/documents/{rows[0]['_id']}",
+                        json={"season": "Rabi", "domain": ["Weed Management"]})
+    assert resp.status_code == 200
+    out = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()
+    assert out["season"] == "Rabi" and out["domain"] == ["Weed Management"]
+    # ...and therefore visible from the OTHER placement too.
+    assert client.get(f"/dashboard/documents/{rows[1]['_id']}").status_code == 200
+
+
+def test_domain_is_a_list_picked_from_the_fixed_names(client, db, scratch):
+    """Several domains per document, each one of GET /dashboard/domains; the
+    filter takes whole names separated by "|", because names contain commas."""
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    doc, _rows = scratch
+    names = client.get("/dashboard/domains").json()
+    comma = "Capacity Building, Extension and Communication"
+    assert len(names) == 20 and comma in names
+    assert client.get(f"/dashboard/unique-documents/{doc['_id']}").json()["domain"] == []
+
+    url = f"/dashboard/unique-documents/{doc['_id']}"
+    out = client.patch(url, json={"domain": [comma, "Weed Management", comma]}).json()
+    assert out["domain"] == [comma, "Weed Management"]  # a repeat is stored once
+    assert client.patch(url, json={"domain": ["Agri"]}).status_code == 422
+    assert db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc["_id"]})["domain"] == [comma, "Weed Management"]
+
+    def found(value):
+        page = client.get("/dashboard/unique-documents",
+                          params={"filter[domain]": value, "filter[sha256]": doc["sha256"]}).json()
+        return [d["id"] for d in page["items"]] == [str(doc["_id"])]
+    assert found(comma)  # the comma does not split it
+    assert found("disease management|weed management")  # any of them, any case
+    assert not found("Disease Management")
+    assert not found("Weed")  # whole names, not substrings
+
+    # A string as stored before the change is served as a one-name list.
+    db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": doc["_id"]}, {"$set": {"domain": "Weed Management"}})
+    assert client.get(url).json()["domain"] == ["Weed Management"]
+    assert client.patch(url, json={"domain": None}).json()["domain"] == []
+
+
+def test_upload_form_takes_the_domains_as_json(client, db):
+    from dashboard.models import COLL_UPLOAD_QUEUE_ITEMS
+
+    placements = _placements(client, ("Karnataka", ["Paddy"]))
+    bad = client.post("/dashboard/uploads", files={"file": ("render_test.pdf", _unique_pdf(), "application/pdf")},
+                      data={"language": "eng", "placements_json": placements, "domain_json": '["Agri"]'})
+    assert bad.status_code == 400 and "unknown domain" in bad.text
+    item_id = _submit(client, placements_json=placements,
+                      domain_json='["Credit, Loan and Insurance", "Rural Infrastructure"]')
+    try:
+        item = db[COLL_UPLOAD_QUEUE_ITEMS].find_one({"_id": ObjectId(item_id)})
+        assert item["metadata"]["domain"] == ["Credit, Loan and Insurance", "Rural Infrastructure"]
+    finally:
+        _drop_upload(item_id)
+
+
+def test_patch_placement_stays_on_the_row(client, db, scratch):
+    doc, rows = scratch
+    # By ID. Nothing is created from a request and nothing is matched by name,
+    # so a move names the entry the person picked from the dropdown.
+    moved_to = SOME_ORG
+    resp = client.patch(f"/dashboard/documents/{rows[0]['_id']}",
+                        json={"organization_id": _vocab_id(client, "organizations", moved_to)})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["crop"] == moved_to
+    assert resp.json()["crop_kind"] == "organization"
+    # The other placement is untouched.
+    assert client.get(f"/dashboard/documents/{rows[1]['_id']}").json()["crop"] == "Scratch Beta"
+    # The copy entry reads its folder from the placement, so it shows the move
+    # without anything having written to the document.
+    out = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()
+    moved = [l for l in out["duplicate_links"] if l["row_id"] == rows[0]["row_id"]]
+    assert moved and moved[0]["crop"] == moved_to
+
+
+def test_patch_keeps_the_raw_name(db, client, scratch):
+    """A move writes `state_raw` / `crop_raw` from the entry it moved to, so a
+    placement stays traceable to a folder name.
+
+    PROVENANCE, not a reference. Nothing reads these: the OCR language keys off
+    the state's LGD code, and no lookup takes a name at all. They exist so a row
+    can still be reconciled with the WorkDrive tree it came from.
+    """
+    from dashboard.models import COLL_DOCUMENTS
+
+    _doc, rows = scratch
+    url = f"/dashboard/documents/{rows[0]['_id']}"
+
+    assert client.patch(url, json={"state_id": _vocab_id(client, "states", "Karnataka")}
+                        ).status_code == 200
+    stored = db[COLL_DOCUMENTS].find_one({"_id": rows[0]["_id"]})
+    assert stored["state_raw"] == "Karnataka"
+
+    client.patch(url, json={"state_id": _vocab_id(client, "states", "Keralam")})
+    stored = db[COLL_DOCUMENTS].find_one({"_id": rows[0]["_id"]})
+    assert stored["state_raw"] == "Keralam"      # the entry's own name, not a spelling
+
+    # A NAME is not a field here any anymore. Pydantic ignores it, so the row
+    # does not move -- which is why the frontend must send ids.
+    client.patch(url, json={"state": "Karnataka"})
+    stored = db[COLL_DOCUMENTS].find_one({"_id": rows[0]["_id"]})
+    assert stored["state_raw"] == "Keralam", "a name field must not move the row"
+
+
+def test_language_must_come_from_the_collection(client, scratch):
+    """The whole point of the lookup: the team picks, it cannot free-type."""
+    _doc, rows = scratch
+    assert client.patch(f"/dashboard/documents/{rows[0]['_id']}", json={"language": "Klingon"}).status_code == 400
+    assert client.patch(f"/dashboard/documents/{rows[0]['_id']}", json={"language": "kan"}).status_code == 200
+
+
+def test_setting_language_by_hand_marks_it_known(client, scratch):
+    """A person's choice is "manual" -- the value an upload writes for the same
+    choice. It used to come back "detected", as though OCR had read it, which
+    the testing team caught. Both are known, so both survive a re-run of
+    scripts/fill_language_from_state.py."""
+    doc, rows = scratch
+    client.patch(f"/dashboard/documents/{rows[0]['_id']}", json={"language": "tam"})
+    out = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()
+    assert out["language"] == "tam" and out["language_source"] == "manual"
+
+
+def test_language_source_is_a_closed_vocabulary(db):
+    """Three values, and no fourth. `state` is the one that means "a guess";
+    `detected` was read off the file and `manual` was chosen by a person on
+    upload -- both are known, they just came from different places."""
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    seen = set(db[COLL_UNIQUE_DOCUMENTS].distinct("language_source"))
+    assert seen <= {"detected", "state", "manual"}, seen
+    assert db[COLL_UNIQUE_DOCUMENTS].count_documents({"language_source": None}) == 0
+
+
+def test_the_fill_script_never_overwrites_a_known_language(db):
+    """Its overwrite set must exclude "detected", or a re-run replaces every
+    correction the agri team has made with a guess from the state."""
+    from scripts.fill_language_from_state import _OVERWRITABLE
+
+    assert "detected" not in _OVERWRITABLE
+    assert "manual" not in _OVERWRITABLE
+
+
+def test_every_document_has_a_language(client):
+    """The rule: a document the OCR pass read as English is English; everything
+    else takes its state's language. Nothing is left blank -- a plausible value
+    the agri team can correct beats a blank they cannot see."""
+    from dashboard.languages import LANGUAGES
+
+    for row in client.get("/dashboard/documents?page=1").json()["items"]:
+        assert row["language"] in LANGUAGES, row
+
+
+def test_no_document_is_left_without_a_language(db):
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    assert db[COLL_UNIQUE_DOCUMENTS].count_documents({"language": None}) == 0
+
+
+def test_state_language_inference_is_marked_as_such(client):
+    """Most of the corpus is inferred from the state, not measured. If that
+    distinction is ever lost, a guess becomes indistinguishable from a
+    detection -- which is how the wrong OCR model gets trusted."""
+    inferred = client.get("/dashboard/unique-documents?filter[language_source]=state").json()
+    detected = client.get("/dashboard/unique-documents?filter[language_source]=detected").json()
+    assert inferred["total"] > 0 and detected["total"] > 0
+    assert all(r["language_source"] == "state" for r in inferred["items"])
+
+
+def test_state_language_table_covers_every_state_and_only_tessdata(client):
+    from dashboard.languages import LANGUAGES, STATE_LANG, language_for_state
+
+    assert set(STATE_LANG.values()) <= set(LANGUAGES)
+    # Keyed on the LGD CODE, not on a name. That is the point of the table: a
+    # state can be renamed -- the sync already renamed Kerala to Keralam and
+    # Tamilnadu to Tamil Nadu -- and the OCR model it maps to must not move with
+    # the spelling. A lookup by name would answer None for 2,380 placements.
+    assert all(isinstance(k, int) for k in STATE_LANG)
+    # Every state the catalogue actually uses must map, or its documents fall
+    # back to no language at all. States with no documents yet (the union
+    # territories added for the dropdown) have nothing to map; dashboard uploads
+    # take their language from the form, not from this table.
+    for state in client.get("/dashboard/states").json():
+        if not state["document_count"] or state["code"] is None:
+            # No code means the entry is not from LGD at all -- a test fixture's
+            # throwaway state. A real one always has one; the sync matches on it.
+            continue
+        assert language_for_state(state["code"]), state["name"]
+
+
+def test_delete_document_takes_its_placements_with_it(client, db, scratch):
+    """The destructive one: document, placements and files all go.
+
+    The scratch document's copy links point at ids WorkDrive does not have, so
+    this also covers the guard -- a file that cannot be deleted is a 502 and
+    the database is left exactly as it was, retryable.
+    """
+    from dashboard.models import COLL_DOCUMENTS, COLL_UNIQUE_DOCUMENTS
+
+    doc, rows = scratch
+    resp = client.delete(f"/dashboard/unique-documents/{doc['_id']}")
+    if resp.status_code == 502:
+        assert "nothing was removed" in resp.json()["detail"]
+        assert db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc["_id"]}) is not None
+        assert db[COLL_DOCUMENTS].count_documents({"unique_document_id": doc["_id"]}) == len(rows)
+        # Take the files out of the way; the cascade itself is what is under test.
+        db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": doc["_id"]}, {"$set": {"duplicate_links": []}})
+        resp = client.delete(f"/dashboard/unique-documents/{doc['_id']}")
+
+    assert resp.status_code == 204, resp.text
+    assert db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc["_id"]}) is None
+    assert db[COLL_DOCUMENTS].count_documents({"unique_document_id": doc["_id"]}) == 0
+    assert client.delete(f"/dashboard/unique-documents/{doc['_id']}").status_code == 404
+
+
+def test_delete_document_is_refused_while_translating(client, db, scratch):
+    from dashboard.models import (
+        COLL_TRANSLATION_JOBS,
+        COLL_UNIQUE_DOCUMENTS,
+        TranslationJobKind,
+        new_translation_job,
+    )
+
+    doc, _rows = scratch
+    job = new_translation_job(document_id=doc["_id"], kind=TranslationJobKind.translate)
+    job["status"] = "running"
+    job_id = db[COLL_TRANSLATION_JOBS].insert_one(job).inserted_id
+    try:
+        resp = client.delete(f"/dashboard/unique-documents/{doc['_id']}")
+        assert resp.status_code == 409, resp.text
+        assert db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc["_id"]}) is not None
+    finally:
+        db[COLL_TRANSLATION_JOBS].delete_one({"_id": job_id})
+
+
+def test_delete_placement_keeps_the_document(client, db, scratch):
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    doc, rows = scratch
+    assert client.delete(f"/dashboard/documents/{rows[0]['_id']}").status_code == 204
+    after = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc["_id"]})
+    assert after is not None, "deleting a placement must not delete the document"
+    assert len(after["main_row_ids"]) == 1
+    assert len(after["duplicate_links"]) == 1
+
+
+# -- duplicate review ----------------------------------------------------------
+
+
+def test_find_duplicates_is_empty_but_says_why(client, scratch):
+    """The button exists so the frontend can be built. It must not imply that
+    no duplicates exist."""
+    _doc, rows = scratch
+    out = client.post(f"/dashboard/documents/{rows[0]['_id']}/find-duplicates").json()
+    assert out["candidates"] == []
+    assert out["note"] and "not connected yet" in out["note"]
+    assert out["document_id"].startswith("ANNAM_")
+
+
+def _merge_victim(db, *, name, sha, folders, file_prefix, **fields):
+    """A throwaway document filed under `folders` (Scratchland organisations),
+    one copy per placement, the way the corpus files them."""
+    from dashboard.display_id import free_display_ids, free_row_ids
+    from dashboard.models import (
+        COLL_DOCUMENTS, COLL_UNIQUE_DOCUMENTS, link_placement,
+        new_copy_link, new_unique_document,
+    )
+
+    doc = new_unique_document(display_id=free_display_ids(db, 1)[0], sha256=sha + "0" * (64 - len(sha)),
+                              shareable_name=name, representative_file_id=f"{file_prefix}0", **fields)
+    doc["_id"] = db[COLL_UNIQUE_DOCUMENTS].insert_one(doc).inserted_id
+    rows = []
+    for i, (row_id, folder) in enumerate(zip(free_row_ids(db, len(folders)), folders)):
+        row = _placement_row(db, row_id=row_id, unique_document_id=doc["_id"],
+                             state="Scratchland", crop=folder, source="upload")
+        row["_id"] = db[COLL_DOCUMENTS].insert_one(row).inserted_id
+        link_placement(db, doc["_id"], row_obj_id=row["_id"], row_id=row_id,
+                       copy_link=new_copy_link(zoho_file_id=f"{file_prefix}{i}",
+                                               shareable_link=f"http://example/{file_prefix}{i}",
+                                               shareable_name=name))
+        rows.append(row)
+    return doc, rows
+
+
+def _cleanup(db, docs_and_rows):
+    from dashboard.models import COLL_DOCUMENTS, COLL_UNIQUE_DOCUMENTS
+
+    for doc, rows in docs_and_rows:
+        db[COLL_DOCUMENTS].delete_many({"_id": {"$in": [r["_id"] for r in rows]}})
+        db[COLL_UNIQUE_DOCUMENTS].delete_one({"_id": doc["_id"]})
+
+
+def test_merge_moves_new_placements_and_drops_ones_already_filed(client, db, scratch):
+    """The team's rule (2026-10-17). A placement in a folder the survivor is
+    already filed in is deleted; every other one moves across keeping its POP
+    id. The merged document is deleted; every one of its FILES stays listed on
+    the survivor, tagged with where it came from."""
+    from dashboard.models import COLL_DOCUMENTS, COLL_UNIQUE_DOCUMENTS
+
+    survivor, survivor_rows = scratch  # filed under Scratch Alpha and Scratch Beta
+    other, other_rows = _merge_victim(db, name="merge-me.pdf", sha="mergeme",
+                                      folders=("Scratch Alpha", "Scratch Gamma"), file_prefix="fidM")
+    try:
+        resp = client.post(f"/dashboard/unique-documents/{survivor['_id']}/merge",
+                           json={"absorb": [str(other["_id"])], "merged_by": "Test Merger"})
+        assert resp.status_code == 200, resp.text
+        result = resp.json()
+        assert result["placements_moved"] == 1 and result["placements_dropped"] == 1
+        assert result["placement_count"] == 3 and result["links_added"] == 2
+        assert result["absorbed"] == ["merge-me.pdf"]
+
+        assert db[COLL_DOCUMENTS].find_one({"_id": other_rows[0]["_id"]}) is None  # Alpha: dropped
+        moved = db[COLL_DOCUMENTS].find_one({"_id": other_rows[1]["_id"]})       # Gamma: moved
+        assert moved["unique_document_id"] == survivor["_id"]
+        assert moved["row_id"] == other_rows[1]["row_id"]
+        assert db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": other["_id"]}) is None
+
+        out = client.get(f"/dashboard/unique-documents/{survivor['_id']}").json()
+        assert "merged_from" not in out
+        own = [l for l in out["duplicate_links"] if l["merged_document"] is None]
+        merged = [l for l in out["duplicate_links"] if l["merged_document"] is not None]
+        assert len(own) == 2 and all(l["merged_by"] == "system" and l["merged_at"] is None for l in own)
+        assert sorted(l["zoho_file_id"] for l in merged) == ["fidM0", "fidM1"]
+        assert all(l["merged_document"] == "merge-me.pdf" and l["merged_by"] == "Test Merger"
+                   and l["merged_at"] and l["row_id"] is None for l in merged)
+        assert out["representative_file_id"] == survivor.get("representative_file_id")
+
+        # The merged fingerprint: on every merged copy and in A's list, so the
+        # upload duplicate check finds A when B's file comes in again.
+        stored = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": survivor["_id"]})
+        assert stored["merged_sha256s"] == [other["sha256"]]
+        assert all(l.get("merged_sha256") == other["sha256"]
+                   for l in stored["duplicate_links"] if l.get("merged_document"))
+        from dashboard.queue_worker import find_candidates
+        assert [c["document_code"] for c in find_candidates(db, other["sha256"], [])] == [out["document_id"]]
+    finally:
+        _cleanup(db, [(other, other_rows)])
+
+
+def test_a_second_merged_document_with_the_same_name_gets_its_own_group(client, db, scratch):
+    survivor, _rows = scratch
+    one, one_rows = _merge_victim(db, name="same.pdf", sha="sameone", folders=("Scratch Gamma",), file_prefix="fidP")
+    two, two_rows = _merge_victim(db, name="same.pdf", sha="sametwo", folders=("Scratch Delta",), file_prefix="fidQ")
+    try:
+        assert client.post(f"/dashboard/unique-documents/{survivor['_id']}/merge",
+                           json={"absorb": [str(one["_id"]), str(two["_id"])]}).status_code == 200
+        groups = {l["zoho_file_id"]: l["merged_document"] for l in
+                  client.get(f"/dashboard/unique-documents/{survivor['_id']}").json()["duplicate_links"]}
+        assert (groups["fidP0"], groups["fidQ0"]) == ("same.pdf", "same.pdf (2)")
+    finally:
+        _cleanup(db, [(one, one_rows), (two, two_rows)])
+
+
+def test_merge_keeps_an_earlier_merges_tags(client, db, scratch):
+    """C merged into B, then B into A: C's files stay grouped under C."""
+    survivor, _rows = scratch
+    b, b_rows = _merge_victim(db, name="b.pdf", sha="chainb", folders=("Scratch Gamma",), file_prefix="fidB")
+    c, c_rows = _merge_victim(db, name="c.pdf", sha="chainc", folders=("Scratch Delta",), file_prefix="fidC")
+    try:
+        assert client.post(f"/dashboard/unique-documents/{b['_id']}/merge",
+                           json={"absorb": [str(c["_id"])], "merged_by": "First"}).status_code == 200
+        assert client.post(f"/dashboard/unique-documents/{survivor['_id']}/merge",
+                           json={"absorb": [str(b["_id"])], "merged_by": "Second"}).status_code == 200
+        links = {l["zoho_file_id"]: l for l in
+                 client.get(f"/dashboard/unique-documents/{survivor['_id']}").json()["duplicate_links"]}
+        assert (links["fidB0"]["merged_document"], links["fidB0"]["merged_by"]) == ("b.pdf", "Second")
+        assert (links["fidC0"]["merged_document"], links["fidC0"]["merged_by"]) == ("c.pdf", "First")
+    finally:
+        _cleanup(db, [(b, b_rows), (c, c_rows)])
+
+
+def test_merge_takes_translation_and_review_as_a_pair(client, db, scratch):
+    """A survivor with no translation takes the merged document's translation
+    AND its review -- a review belongs to one translation."""
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    survivor, _rows = scratch
+    other, other_rows = _merge_victim(
+        db, name="translated.pdf", sha="pairtr", folders=("Scratch Gamma",), file_prefix="fidT",
+        translation_zoho_file_id="trX", translation_shareable_link="http://example/trX",
+        translation_status="done", translated_by="Translator",
+        review_zoho_file_id="rvX", review_status="done", reviewed_by="Reviewer")
+    try:
+        result = client.post(f"/dashboard/unique-documents/{survivor['_id']}/merge",
+                             json={"absorb": [str(other["_id"])]}).json()
+        assert result["translation_taken_from"] == "translated.pdf"
+        assert result["not_trashed"] == []
+        after = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": survivor["_id"]})
+        assert (after["translation_zoho_file_id"], after["review_zoho_file_id"]) == ("trX", "rvX")
+        assert (after["translated_by"], after["reviewed_by"]) == ("Translator", "Reviewer")
+        assert after["translation_status"] == "done"
+    finally:
+        _cleanup(db, [(other, other_rows)])
+
+
+def test_merge_is_refused_while_a_document_is_being_translated(client, db, scratch):
+    from dashboard.models import COLL_DOCUMENTS, COLL_TRANSLATION_JOBS, COLL_UNIQUE_DOCUMENTS
+
+    survivor, _rows = scratch
+    other, other_rows = _merge_victim(db, name="busy.pdf", sha="busyx", folders=("Scratch Gamma",),
+                                      file_prefix="fidY")
+    job = db[COLL_TRANSLATION_JOBS].insert_one({"document_id": other["_id"], "status": "running"}).inserted_id
+    try:
+        resp = client.post(f"/dashboard/unique-documents/{survivor['_id']}/merge",
+                           json={"absorb": [str(other["_id"])]})
+        assert resp.status_code == 409 and "being translated" in resp.text
+        assert db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": other["_id"]}) is not None
+        assert db[COLL_DOCUMENTS].find_one({"_id": other_rows[0]["_id"]})["unique_document_id"] == other["_id"]
+    finally:
+        db[COLL_TRANSLATION_JOBS].delete_one({"_id": job})
+        _cleanup(db, [(other, other_rows)])
+
+
+def test_unlink_splits_a_merged_group_into_a_new_document(client, db, scratch):
+    """The group's links leave and become a new document's own copies; the
+    first is its anchor; metadata is copied; no placements, no translation."""
+    from dashboard.models import COLL_DOCUMENTS, COLL_UNIQUE_DOCUMENTS
+
+    survivor, _rows = scratch
+    db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": survivor["_id"]}, {"$set": {"season": "Kharif"}})
+    other, other_rows = _merge_victim(db, name="split-me.pdf", sha="splitme",
+                                      folders=("Scratch Gamma", "Scratch Delta"), file_prefix="fidS")
+    created = None
+    try:
+        assert client.post(f"/dashboard/unique-documents/{survivor['_id']}/merge",
+                           json={"absorb": [str(other["_id"])], "merged_by": "M"}).status_code == 200
+        resp = client.post(f"/dashboard/unique-documents/{survivor['_id']}/unlink",
+                           json={"merged_document": "split-me.pdf"})
+        assert resp.status_code == 201, resp.text
+        created = resp.json()
+        assert created["document_id"].startswith("ANNAM_")
+        assert created["representative_file_id"] == "fidS0"
+        assert created["shareable_name"] == "split-me.pdf"
+        assert [l["zoho_file_id"] for l in created["duplicate_links"]] == ["fidS0", "fidS1"]
+        assert all(l["merged_document"] is None and l["merged_by"] == "system"
+                   for l in created["duplicate_links"])
+        assert created["placement_count"] == 0 and created["season"] == "Kharif"
+        assert created["sha256"] == other["sha256"]  # its fingerprint comes back
+        assert db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": survivor["_id"]})["merged_sha256s"] == []
+        assert created["translation_file_id"] is None and created["translation_status"] == "not_started"
+
+        left = client.get(f"/dashboard/unique-documents/{survivor['_id']}").json()
+        assert not any(l["merged_document"] for l in left["duplicate_links"])
+        assert left["placement_count"] == 4  # the moved placements stay
+
+        again = client.post(f"/dashboard/unique-documents/{survivor['_id']}/unlink",
+                            json={"merged_document": "split-me.pdf"})
+        assert again.status_code == 404
+    finally:
+        db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": survivor["_id"]}, {"$unset": {"season": ""}})
+        if created:
+            from bson import ObjectId
+            db[COLL_UNIQUE_DOCUMENTS].delete_one({"_id": ObjectId(created["id"])})
+        _cleanup(db, [(other, other_rows)])
+
+
+def test_a_copy_delete_refuses_the_anchor_and_keeps_the_list_if_workdrive_refuses(client, db, scratch):
+    """The anchor is never deletable. And WorkDrive goes first: a file it will
+    not trash (here, an id that does not exist) leaves the list untouched."""
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    doc, _rows = scratch
+    before = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc["_id"]})
+    anchor = before["representative_file_id"] or before["duplicate_links"][0]["zoho_file_id"]
+    if not before["representative_file_id"]:
+        db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": doc["_id"]}, {"$set": {"representative_file_id": anchor}})
+    other = next(l["zoho_file_id"] for l in before["duplicate_links"] if l["zoho_file_id"] != anchor)
+    base = f"/dashboard/unique-documents/{doc['_id']}/duplicate-links"
+    assert client.delete(f"{base}/{anchor}").status_code == 400
+    assert client.delete(f"{base}/no-such-file").status_code == 404
+    assert client.delete(f"{base}/{other}").status_code == 502  # a fake id: WorkDrive refuses
+    after = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc["_id"]})
+    assert len(after["duplicate_links"]) == len(before["duplicate_links"])
+
+
+def test_merge_validates_before_it_writes(client, scratch):
+    """A typo in the fifth id must not leave the first four already merged."""
+    doc, _rows = scratch
+    assert client.post(f"/dashboard/unique-documents/{doc['_id']}/merge",
+                       json={"absorb": []}).status_code == 400
+    assert client.post(f"/dashboard/unique-documents/{doc['_id']}/merge",
+                       json={"absorb": [str(doc["_id"])]}).status_code == 400
+    assert client.post(f"/dashboard/unique-documents/{doc['_id']}/merge",
+                       json={"absorb": ["ANNAM_49999"]}).status_code == 404
+
+
+# -- lookups -------------------------------------------------------------------
+
+
+def test_a_vocabulary_entry_carries_an_id_a_label_and_nothing_to_match_on(client):
+    """What a dropdown needs: the id to send, the name to show, the count, and
+    for the synced kinds their LGD code.
+
+    NO `raw_names`. Every entry used to carry its older spellings, because a
+    form could type one and the backend would resolve it. Serving them now would
+    only invite a caller to match on one, which is the whole thing this removed.
+    """
+    states = client.get("/dashboard/states").json()
+    assert len(states) > 10
+    entry = next(s for s in states if s["name"] == "Karnataka")
+    assert set(entry) == {"id", "name", "document_count", "code"}
+    assert entry["document_count"] > 0 and entry["code"] == 29
+    for path in ("crops", "organizations", "districts", "kvks", "folders"):
+        for row in client.get(f"/dashboard/{path}").json()[:5]:
+            assert "raw_names" not in row, path
+    assert all(not c["name"].startswith("State ") for c in client.get("/dashboard/crops").json())
+
+
+def test_no_request_can_write_any_vocabulary(client, db):
+    """Every vocabulary is read-only over HTTP, and the routes are GONE rather
+    than left to answer 403.
+
+    Organisations were the last editable one. They are WorkDrive FOLDER names,
+    so a typed name that creates an entry turns every typo into a 192nd folder
+    nobody can tell from a real one -- and the dashboard had no way to tell them
+    apart afterwards. States, districts and KVKs come from the LGD sync and crops
+    from the crop master, where an edit here would be undone by the next run.
+
+    404 or 405, never 403: 405 where the path still serves a GET, 404 where the
+    whole path is gone. Nothing is created either way, which is what this
+    asserts -- a status code alone would not notice a write that happened.
+    """
+    from dashboard.models import COLL_ORG_MASTER, COLL_STATES
+
+    before = (db[COLL_ORG_MASTER].count_documents({}), db[COLL_STATES].count_documents({}))
+    for path in ("states", "organizations", "districts", "kvks", "crops"):
+        entries = client.get(f"/dashboard/{path}").json()
+        assert entries, f"no {path} in this database"
+        one, two = entries[0]["id"], entries[-1]["id"]
+        for method, url, body in (
+            ("post", f"/dashboard/{path}", {"name": "Nowhereshire"}),
+            ("patch", f"/dashboard/{path}/{one}", {"name": "Nowhereshire"}),
+            ("post", f"/dashboard/{path}/{one}/merge", {"absorb": [two]}),
+            ("delete", f"/dashboard/{path}/{one}", None),
+        ):
+            resp = getattr(client, method)(url, **({"json": body} if body is not None else {}))
+            assert resp.status_code in (404, 405), (method, url, resp.status_code)
+    assert (db[COLL_ORG_MASTER].count_documents({}),
+            db[COLL_STATES].count_documents({})) == before
+
+
+def test_the_crop_dropdown_never_offers_pesticides(client, db):
+    from dashboard.db import crops_collection
+
+    chemicals = {c["name"] for c in crops_collection(db).find({"type": "chemical"}, {"name": 1})}
+    offered = {c["name"] for c in client.get("/dashboard/crops").json()}
+    assert offered and not (offered & chemicals)
+
+
+def test_the_crop_dropdown_offers_only_crops(client, db):
+    """The master also lists diseases ("Leaf Rust in Wheat"), pests, weeds and
+    practices. Only type "crop" is offered -- plus untyped entries, because
+    Okra, Onion and Mango are untyped and carry placements."""
+    from dashboard.db import crops_collection
+
+    master = list(crops_collection(db).find({}, {"name": 1, "type": 1}))
+    offered = {c["id"] for c in client.get("/dashboard/crops").json()}
+    not_crops = {str(c["_id"]) for c in master if c.get("type") not in ("crop", None)}
+    untyped = {str(c["_id"]) for c in master if c.get("type") is None}
+    assert not_crops and not (offered & not_crops)
+    assert untyped <= offered
+    # the stats tile counts the same list the dropdown shows
+    assert client.get("/dashboard/stats").json()["crops"] == len(offered)
+
+
+def test_a_decision_re_reads_the_stored_ids_and_creates_nothing(client, db):
+    """create_placements() is what a decision calls. It reads the IDS the queue
+    stored and creates nothing.
+
+    The upload form used to be the one place a new organisation could appear out
+    of nothing: an unknown name was carried through the queue as `id: None` and
+    created at approval, which made a typo in the form indistinguishable from a
+    real folder. And when a stored id was missing, the queued NAME was used as a
+    fallback -- so an id that had gone silently re-resolved to whatever the label
+    now matched. Both are gone: an id that no longer resolves fails the decision.
+    """
+    from dashboard.db import get_database, organizations_collection
+    from dashboard.display_id import free_display_ids
+    from dashboard.models import (
+        COLL_DOCUMENTS,
+        COLL_UNIQUE_DOCUMENTS,
+        new_unique_document,
+    )
+    from dashboard.queue_worker import create_placements
+
+    live = get_database()
+    # Looked up BEFORE the insert: a name that is gone must fail the test, not
+    # strand a document that then fails every test counting documents.
+    state_id = _vocab_id(client, "states", "Karnataka")
+    org_id = _vocab_id(client, "organizations", SOME_ORG)
+    live[COLL_UNIQUE_DOCUMENTS].delete_many({"sha256": "vocab" + "0" * 59})
+    doc = new_unique_document(display_id=free_display_ids(live, 1)[0], sha256="vocab" + "0" * 59)
+    doc["_id"] = live[COLL_UNIQUE_DOCUMENTS].insert_one(doc).inserted_id
+    try:
+        copy = {"zoho_file_id": "fidV", "shareable_link": "http://example/v",
+                "shareable_name": "v.pdf"}
+        # Stored ids that still resolve file normally.
+        rows = create_placements(live, document=doc, copy=copy, placements=[
+            {"state": "Karnataka", "state_id": ObjectId(state_id),
+             "crop": SOME_ORG, "crop_kind": "organization",
+             "organization_id": ObjectId(org_id)}])
+        assert len(rows) == 1 and rows[0]["organization_id"] == ObjectId(org_id)
+
+        # An id that names nothing fails, and the LABEL beside it is not used to
+        # rescue it -- that fallback is what made a stale id dangerous.
+        for bad in ({"state": "Karnataka", "state_id": ObjectId("0" * 24),
+                     "crop": SOME_ORG, "crop_kind": "organization",
+                     "organization_id": ObjectId(org_id)},
+                    {"state": "Karnataka", "state_id": ObjectId(state_id),
+                     "crop": SOME_ORG, "crop_kind": "organization",
+                     "organization_id": ObjectId("0" * 24)}):
+            with pytest.raises(ValueError):
+                create_placements(live, document=doc, copy=copy, placements=[bad])
+        assert organizations_collection(live).find_one({"org_name": SOME_ORG}) is not None
+        assert organizations_collection(live).count_documents({"org_name": "Zz Brand New Thing"}) == 0
+    finally:
+        live[COLL_DOCUMENTS].delete_many({"unique_document_id": doc["_id"]})
+        live[COLL_UNIQUE_DOCUMENTS].delete_one({"_id": doc["_id"]})
+
+def test_document_carries_its_own_shareable_link(client, db):
+    """"Shareable Link" is one of the required metadata fields, so it has to be
+    ON the document -- not only inside duplicate_links. It is the anchor's."""
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    assert db[COLL_UNIQUE_DOCUMENTS].count_documents({"shareable_link": None}) == 0
+    mismatched = [
+        d["_id"] for d in db[COLL_UNIQUE_DOCUMENTS].find(
+            {}, {"shareable_link": 1, "representative_file_id": 1})
+        if d.get("representative_file_id")
+        and d["representative_file_id"] not in (d.get("shareable_link") or "")
+    ]
+    assert mismatched == []
+    row = client.get("/dashboard/documents?page=1").json()["items"][0]
+    assert row["shareable_link"].startswith("https://workdrive.zoho.in/file/")
+
+
+def test_crops_can_be_narrowed_by_state(client):
+    """`?state_id=` only -- `?state=<name>` is gone, like every other name."""
+    everything = client.get("/dashboard/crops").json()
+    state_id = _vocab_id(client, "states", "Karnataka")
+    narrowed = client.get(f"/dashboard/crops?state_id={state_id}").json()
+    assert 0 < len(narrowed) < len(everything)
+    # A name is not a narrowing any more: ignored, so the list is unnarrowed.
+    assert len(client.get("/dashboard/crops?state=Karnataka").json()) == len(everything)
+    # An id naming no state narrows to nothing, rather than to everything.
+    assert client.get("/dashboard/crops?state_id=000000000000000000000000").json() == []
+
+
+# -- states, crops and organisations are references ----------------------------
+
+
+def test_every_placement_references_a_real_state_and_one_folder(db):
+    """A placement points at a state and at EXACTLY ONE of a crop master entry or
+    an organisation. An id naming nothing would render as a blank column."""
+    from dashboard.db import crops_collection
+    from dashboard.db import organizations_collection
+    from dashboard.models import COLL_DOCUMENTS, COLL_STATES
+
+    states = {e["_id"] for e in db[COLL_STATES].find({}, {"_id": 1})}
+    crops = {e["_id"] for e in crops_collection(db).find({"type": {"$ne": "chemical"}}, {"_id": 1})}
+    orgs = {e["_id"] for e in organizations_collection(db).find({}, {"_id": 1})}
+    bad = []
+    for r in db[COLL_DOCUMENTS].find({}, {"row_id": 1, "state_id": 1, "crop_id": 1, "organization_id": 1}):
+        if r.get("state_id") not in states or ("crop_id" in r) == ("organization_id" in r) \
+                or ("crop_id" in r and r["crop_id"] not in crops) \
+                or ("organization_id" in r and r["organization_id"] not in orgs):
+            bad.append(r["row_id"])
+    assert bad == [], f"{len(bad)} placement(s) with a bad reference: {bad[:5]}"
+
+
+def test_new_placements_store_ids_not_names(client, db, scratch):
+    """No write path puts a name string back on a placement or a copy link --
+    that duplication is what made renaming a three-collection job."""
+    from dashboard.models import COLL_DOCUMENTS, COLL_UNIQUE_DOCUMENTS
+
+    doc, rows = scratch
+    client.patch(f"/dashboard/documents/{rows[0]['_id']}",
+                 json={"organization_id": str(rows[1]["organization_id"])})
+    for r in db[COLL_DOCUMENTS].find({"unique_document_id": doc["_id"]}):
+        assert "state" not in r and "crop" not in r, r
+        assert r["state_id"] and r["organization_id"] and "crop_id" not in r
+    for link in db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc["_id"]})["duplicate_links"]:
+        assert "state" not in link and "crop" not in link, link
+
+
+def test_rows_and_copies_show_the_placements_names(client, scratch):
+    doc, rows = scratch
+    row = client.get(f"/dashboard/documents/{rows[0]['_id']}").json()
+    assert (row["state"], row["crop"], row["crop_kind"]) == ("Scratchland", "Scratch Alpha", "organization")
+    assert row["state_id"] and row["organization_id"] and row["crop_id"] is None
+    links = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()["duplicate_links"]
+    assert sorted((l["state"], l["crop"]) for l in links) == [
+        ("Scratchland", "Scratch Alpha"), ("Scratchland", "Scratch Beta")]
+
+
+def test_a_patch_cannot_invent_a_state_or_a_folder(client, db, scratch):
+    """Moving a row names an entry that EXISTS, by id. Nothing is created and
+    nothing is guessed -- this is the path a typo in the edit form takes, and it
+    used to add a row to the vocabulary.
+
+    A NAME is not a field here at all now, so a body carrying one is ignored by
+    the model rather than resolved: it is neither an error nor a move. That is
+    the contract the frontend has to hold up, which is why the row is checked
+    afterwards and not just the status code.
+    """
+    from dashboard.models import COLL_ORG_MASTER, COLL_STATES
+
+    _doc, rows = scratch
+    url = f"/dashboard/documents/{rows[0]['_id']}"
+    counts = lambda: (db[COLL_STATES].count_documents({}),
+                      db[COLL_ORG_MASTER].count_documents({}))
+    before = counts()
+    nowhere = "000000000000000000000000"
+    for body, expect in (
+        ({"state_id": nowhere}, "does not name an existing state"),
+        ({"organization_id": nowhere}, "does not name an existing organization"),
+        ({"crop_id": nowhere}, "does not name an existing crop"),
+    ):
+        resp = client.patch(url, json=body)
+        assert resp.status_code == 400, (body, resp.text)
+        assert expect in resp.json()["detail"], (body, resp.json()["detail"])
+
+    # Name fields: accepted by HTTP, ignored by the model, so nothing moves.
+    # `district_id` is in the same boat now -- it is the DOCUMENT's field, so a
+    # placement PATCH carrying one changes nothing rather than refusing.
+    for body in ({"state": "Nowhereshire"}, {"organization": "Zz Not A Folder"},
+                 {"crop": "Zz Not A Crop"}, {"district": "Nowhereshire"},
+                 {"district_id": nowhere}, {"kvk_id": nowhere}):
+        assert client.patch(url, json=body).status_code == 200, body
+
+    assert counts() == before, "a PATCH created a vocabulary entry"
+    row = client.get(url).json()
+    assert (row["state"], row["crop"], row["district"]) == ("Scratchland", "Scratch Alpha", None)
+
+
+def test_moving_a_placement_between_a_crop_and_an_organization(client, db, scratch):
+    """Exactly one folder field is set at a time; moving to a crop clears the
+    organisation and back."""
+    from dashboard.models import COLL_DOCUMENTS
+
+    _doc, rows = scratch
+    url = f"/dashboard/documents/{rows[0]['_id']}"
+    paddy_id = _vocab_id(client, "crops", "Paddy")
+    paddy = client.patch(url, json={"crop_id": paddy_id}).json()
+    assert (paddy["crop"], paddy["crop_kind"]) == ("Paddy", "crop") and paddy["organization_id"] is None
+    stored = db[COLL_DOCUMENTS].find_one({"_id": rows[0]["_id"]})
+    # crop_raw follows the entry's own name: provenance, not something typed.
+    assert "organization_id" not in stored and stored["crop_raw"] == "Paddy"
+
+    back = client.patch(url, json={"organization_id": str(rows[1]["organization_id"])}).json()
+    assert (back["crop"], back["crop_kind"], back["crop_id"]) == ("Scratch Beta", "organization", None)
+
+    # An id that is not a crop is refused, not quietly made an organisation.
+    resp = client.patch(url, json={"crop_id": "0" * 24})
+    assert resp.status_code == 400 and "crop" in resp.json()["detail"]
+    # Both folder kinds at once is a caller error: a placement has exactly one.
+    assert client.patch(url, json={"crop_id": paddy_id,
+                                   "organization_id": str(rows[1]["organization_id"])}
+                        ).status_code == 400
+
+
+def test_crop_aliases_are_no_longer_consulted(client, db):
+    """`pop_crop_aliases` mapped our pre-master spellings onto master crops
+    ("Ground Nut" -> Groundnut) so a typed crop resolved.
+
+    Nothing types a crop. The collection is left alone -- it is a record of what
+    the corpus called things -- but no route reads it and no response carries it,
+    so an alias cannot quietly decide which crop an edit meant.
+    """
+    from dashboard.models import COLL_CROP_ALIASES
+
+    alias = db[COLL_CROP_ALIASES].find_one()
+    if alias is None:
+        pytest.skip("no crop aliases in this database -- the crops migration has not run")
+    listed = next(c for c in client.get("/dashboard/crops").json()
+                  if c["id"] == str(alias["crop_id"]))
+    assert "raw_names" not in listed
+    # The alias spelling is not a name of any crop the dropdown offers.
+    assert not any(c["name"].casefold() == alias["spelling"].casefold()
+                   for c in client.get("/dashboard/crops").json())
+
+
+def test_the_folder_filter_is_one_column_over_two_vocabularies(client, scratch):
+    """"Crop" is a single column backed by two vocabularies, so `crop_id` and
+    `organization_id` sent together mean EITHER -- a placement can never have
+    both, and AND-ing them would match nothing."""
+    _doc, rows = scratch
+    row = client.get(f"/dashboard/documents/{rows[0]['_id']}").json()
+    org_id = row["organization_id"]
+    assert client.get(f"/dashboard/documents?filter[organization_id]={org_id}").json()["total"] == 1
+    assert client.get(
+        "/dashboard/documents?filter[organization_id]=000000000000000000000000").json()["total"] == 0
+
+    crops = client.get("/dashboard/documents?filter[crop_kind]=crop").json()["total"]
+    orgs = client.get("/dashboard/documents?filter[crop_kind]=organization").json()["total"]
+    assert crops > 0 and orgs > 0
+    assert crops + orgs == client.get("/dashboard/documents").json()["total"]
+    assert client.get("/dashboard/documents?filter[crop_kind]=fruit").json()["total"] == 0
+
+    paddy_id = _vocab_id(client, "crops", "Paddy")
+    paddy = client.get(f"/dashboard/documents?filter[crop_id]={paddy_id}").json()["total"]
+    both = client.get(f"/dashboard/documents?filter[crop_id]={paddy_id}"
+                      f"&filter[organization_id]={org_id}").json()["total"]
+    assert paddy > 0 and both == paddy + 1
+
+
+def test_an_upload_names_every_folder_by_id(client):
+    """`placements_json` carries ids, and each must name an existing entry.
+
+    Rejected at SUBMIT, not at approval. The queue used to carry an unknown
+    organisation through as `id: None` and create it when the upload was filed,
+    so a typo failed -- or worse, succeeded -- long after the person who typed
+    it had moved on. With ids there is nothing to type: the kind is in the field
+    name, so `crop_ids` and `organization_ids` can never be confused the way one
+    `"crops"` list that accepted either could.
+    """
+    item_id = _submit(client, placements_json=_placements(
+        client, ("Karnataka", ["Paddy", SOME_ORG])))
+    try:
+        got = sorted((p["crop"], p["crop_kind"], bool(p.get("crop_id") or p.get("organization_id")))
+                     for p in client.get(f"/dashboard/uploads/{item_id}").json()["placements"])
+        assert got == sorted([(SOME_ORG, "organization", True), ("Paddy", "crop", True)])
+    finally:
+        client.post(f"/dashboard/uploads/{item_id}/cancel")
+
+    state_id = _vocab_id(client, "states", "Karnataka")
+    crop_id = _vocab_id(client, "crops", "Paddy")
+    nowhere = "000000000000000000000000"
+    for group, expected in (
+        ({"state_id": state_id, "crop_ids": [nowhere]}, "does not name an existing crop"),
+        ({"state_id": state_id, "organization_ids": [nowhere]},
+         "does not name an existing organization"),
+        ({"state_id": nowhere, "crop_ids": [crop_id]}, "does not name an existing state"),
+        ({"state_id": state_id}, "has no folders"),
+        ({"crop_ids": [crop_id]}, "needs"),
+        # A NAME is not a field here any more, so a group carrying only names
+        # has no state_id and is refused rather than guessed at.
+        ({"state": "Karnataka", "crops": ["Paddy"]}, "needs"),
+        # district_id is a field of the UPLOAD now, not of a group. A group
+        # still carrying one is refused rather than quietly ignored.
+        ({"state_id": state_id, "crop_ids": [crop_id],
+          "district_id": nowhere}, "not a placement field any more"),
+    ):
+        resp = client.post("/dashboard/uploads",
+                           files={"file": ("x.pdf", _MINIMAL_PDF, "application/pdf")},
+                           data={"language": "eng", "placements_json": json.dumps([group])})
+        assert resp.status_code == 400, (group, resp.text)
+        assert expected in resp.json()["detail"], (group, resp.json()["detail"])
+
+    # placements_json itself is required: the states_json + crops_json cross
+    # product took two NAME lists and is gone with them.
+    resp = client.post("/dashboard/uploads",
+                       files={"file": ("x.pdf", _MINIMAL_PDF, "application/pdf")},
+                       data={"language": "eng", "states_json": '["Karnataka"]',
+                             "crops_json": '["Paddy"]'})
+    assert resp.status_code == 422, resp.text
+
+
+def test_organization_names_are_unique_regardless_of_case(client, db):
+    """"ICAR - X" next to "Icar - X" is the duplication this schema removes.
+
+    Enforced by the index, not by a route: nothing creates an organisation from
+    a request any more, so the guard that matters is the one the corpus loader
+    hits.
+    """
+    from pymongo.errors import DuplicateKeyError
+
+    from dashboard.models import COLL_ORGANIZATIONS, utcnow
+
+    # pop_organizations is the corpus loader's folder list, no longer what the
+    # dropdown serves (that is the agriai master), so the test brings its own
+    # entry rather than borrowing one from /dashboard/organizations.
+    probe = "Zz Index Probe Organisation"
+    db[COLL_ORGANIZATIONS].delete_many({"name": {"$in": [probe, probe.upper()]}})
+    db[COLL_ORGANIZATIONS].insert_one({"name": probe, "raw_names": [],
+                                       "created_at": utcnow(), "updated_at": utcnow()})
+    try:
+        with pytest.raises(DuplicateKeyError):
+            db[COLL_ORGANIZATIONS].insert_one({"name": probe.upper(), "raw_names": [],
+                                               "created_at": utcnow(), "updated_at": utcnow()})
+    finally:
+        db[COLL_ORGANIZATIONS].delete_one({"name": probe})
+
+
+def test_the_vocabulary_module_has_no_name_lookup_left(client, db):
+    """`dashboard.vocabulary` resolves ids and nothing else.
+
+    find(), resolve(), folder(), ids_matching() and crop_spellings() are gone.
+    Between them they gave one question four answers -- the name, an older
+    spelling in `raw_names`, a normaliser that stripped "State " off the front,
+    and a crop-alias table -- and the backend had to pick. Keralam is the case
+    that made it concrete: the LGD sync renamed Kerala, so "Kerala" and
+    "Keralam" became different questions with the same intent.
+
+    `raw_names` is still STORED. It is provenance for the folder spellings the
+    crawl found, and the corpus loader does its own matching against it
+    (migrate_from_corpus._by_name), where no request can reach.
+    """
+    from dashboard import vocabulary
+
+    for gone in ("find", "resolve", "folder", "ids_matching", "crop_spellings",
+                 "rename", "merge", "delete"):
+        assert not hasattr(vocabulary, gone), f"vocabulary.{gone}() is back"
+
+    state = db["pop_states"].find_one({"name": "Keralam"})
+    assert "State Kerala" in (state.get("raw_names") or []), "fixture assumption"
+    # The id is the only way in, and it is what every list serves.
+    assert vocabulary.get(db, "state", str(state["_id"]))["_id"] == state["_id"]
+    assert vocabulary.get(db, "state", "Keralam") is None      # a name is not an id
+    assert _vocab_id(client, "states", "Keralam") == str(state["_id"])
+
+
+def test_lookup_lists_carry_ids_and_live_counts(client, scratch):
+    _doc, rows = scratch
+    org_id = client.get(f"/dashboard/documents/{rows[0]['_id']}").json()["organization_id"]
+    entry = next(o for o in client.get("/dashboard/organizations").json() if o["id"] == org_id)
+    assert entry["document_count"] == 1
+    client.delete(f"/dashboard/documents/{rows[0]['_id']}")
+    entry = next(o for o in client.get("/dashboard/organizations").json() if o["id"] == org_id)
+    assert entry["document_count"] == 0  # computed on read, so a delete cannot leave it stale
+    state_id = client.get(f"/dashboard/documents/{rows[1]['_id']}").json()["state_id"]
+    assert [o["name"] for o in client.get(f"/dashboard/organizations?state_id={state_id}").json()] == ["Scratch Beta"]
+    assert client.get(f"/dashboard/crops?state_id={state_id}").json() == []
+    assert client.get("/dashboard/crops?state=Karnataka").json()
+
+
+def test_folder_options_follow_the_advisory_type(client):
+    """Comprehensive / Crop Advisory offer crops, Non-Crop Advisory offers
+    organisations, General (and blank) offers both -- for the Add Document form
+    and the table's Folder filter alike."""
+    def kinds(advisory):
+        q = f"?advisory_type={advisory}" if advisory is not None else ""
+        return {f["kind"] for f in client.get(f"/dashboard/folders{q}").json()}
+
+    assert kinds("Comprehensive") == {"crop"}
+    assert kinds("Crop Advisory") == kinds("crop-advisory") == {"crop"}
+    assert kinds("Non-Crop Advisory") == {"organization"}
+    assert kinds("General") == kinds(None) == {"crop", "organization"}
+    everything = client.get("/dashboard/folders?advisory_type=General").json()
+    assert len(everything) == len(client.get("/dashboard/crops").json()) + len(client.get("/dashboard/organizations").json())
+    state_id = _vocab_id(client, "states", "Karnataka")
+    narrowed = client.get(
+        f"/dashboard/folders?advisory_type=General&state_id={state_id}").json()
+    assert 0 < len(narrowed) < len(everything)
+
+
+def test_languages_include_the_verdicts_and_the_tessdata_pack(client):
+    langs = client.get("/dashboard/languages").json()
+    codes = {x["code"] for x in langs}
+    assert {"eng", "kan", "hin", "ori", "tam"} <= codes
+    # "Non-English" is not a language, but it IS what the OCR pass concluded for
+    # hundreds of documents, so the team needs it to refine them from.
+    assert "non_english" in codes
+
+
+# -- uploads -------------------------------------------------------------------
+# Everything up to the decision. The `new` path is exercised only where it is
+# refused: taking it for real pushes a file into Zoho WorkDrive, which a test run
+# should not do.
+
+
+@pytest.mark.parametrize("payload,language", [
+    ("placements", "xyz"),                                      # not a language code
+    ('[{"state_id":"%(state)s"}]', "eng"),                      # no folders
+    ("notjson", "eng"),
+    ('[{"crop_ids":["%(crop)s"]}]', "eng"),                     # no state
+    ("[]", "eng"),                                              # empty array
+    ('{"state_id":"%(state)s"}', "eng"),                        # object, not array
+])
+def test_upload_validation(client, payload, language):
+    ids = {"state": _vocab_id(client, "states", "Karnataka"),
+           "crop": _vocab_id(client, "crops", "Paddy")}
+    placements_json = (_placements(client, ("Karnataka", ["Paddy"]))
+                       if payload == "placements" else payload % ids)
+    resp = client.post("/dashboard/uploads",
+                       files={"file": ("t.pdf", b"%PDF-1.4 fake", "application/pdf")},
+                       data={"placements_json": placements_json, "language": language})
+    assert resp.status_code == 400, resp.text
+
+
+_MINIMAL_PDF = (
+    b"%PDF-1.4\n"
+    b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+    b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+    b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]>>endobj\n"
+    b"trailer<</Root 1 0 R>>\n"
+)
+
+
+def _unique_pdf() -> bytes:
+    """_MINIMAL_PDF with a unique trailing comment, so its sha256 is its own.
+
+    The same file cannot be queued twice (routes_uploads._refuse_if_queued), so
+    two tests -- or one test's two uploads -- sending identical bytes would
+    refuse each other."""
+    return _MINIMAL_PDF + b"%" + ObjectId().binary.hex().encode() + b"\n"
+
+
+def _submit(client, headers=None, **data):
+    """Submit an upload. `placements_json` is required and carries IDS -- see
+    _placements() for building one from names a test can read. `headers` says
+    who is uploading; the default is the suite's admin."""
+    resp = client.post("/dashboard/uploads", headers=headers,
+                       files={"file": ("render_test.pdf", data.pop("pdf", None) or _unique_pdf(),
+                                       "application/pdf")},
+                       data={"language": "eng", **data})
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"]
+
+
+def _placements(client, *groups) -> str:
+    """`placements_json` built from names, for readability.
+
+    Each group is (state, [folder names]) plus optional district/kvk names. A
+    folder is looked up in the crop master first and then in organisations,
+    which is what the old name-taking form did on the server -- except it is a
+    TEST doing it now, against the lists the API serves, which is exactly what
+    the frontend's dropdowns do.
+    """
+    out = []
+    for group in groups:
+        state, folders = group[0], group[1]
+        extra = group[2] if len(group) > 2 else {}
+        crop_ids, organization_ids = [], []
+        for name in folders:
+            try:
+                crop_ids.append(_vocab_id(client, "crops", name))
+            except AssertionError:
+                organization_ids.append(_vocab_id(client, "organizations", name))
+        entry = {"state_id": _vocab_id(client, "states", state)}
+        if crop_ids:
+            entry["crop_ids"] = crop_ids
+        if organization_ids:
+            entry["organization_ids"] = organization_ids
+        for key, name in extra.items():
+            entry[f"{key}_id"] = _vocab_id(client, f"{key}s", name)
+        out.append(entry)
+    return json.dumps(out)
+
+
+def _await_review(client, item_id, timeout=30.0, headers=None):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        item = client.get(f"/dashboard/uploads/{item_id}", headers=headers).json()
+        if item["status"] in ("awaiting_review", "failed"):
+            return item
+        time.sleep(0.3)
+    pytest.fail(f"upload {item_id} never left {item['status']}")
+
+
+def test_upload_takes_per_state_folder_groups(client):
+    """A state with its folders, then another state with different folders --
+    not a cross product of one folder list over every state.
+
+    The cross-product form (`states_json` + `crops_json`) crossed two NAME lists
+    and went with them; a caller that wants a cross product sends the pairs.
+    """
+    item_id = _submit(client, placements_json=_placements(
+        client, ("Karnataka", ["Paddy", "Finger Millet"]), ("Keralam", ["Coconut"])))
+    try:
+        item = client.get(f"/dashboard/uploads/{item_id}").json()
+        assert [(p["state"], p["crop"]) for p in item["placements"]] == [
+            ("Karnataka", "Paddy"), ("Karnataka", "Finger Millet"), ("Keralam", "Coconut")]
+        # Every one carries the id it was filed by -- the name beside it is the
+        # queue's label, read from the entry.
+        assert all(p["crop_id"] and p["state_id"] for p in item["placements"])
+    finally:
+        client.post(f"/dashboard/uploads/{item_id}/cancel")
+
+
+def test_duplicate_placements_are_collapsed(client):
+    """The same folder listed twice under one state is normal input; it must not
+    become two rows for one folder. Deduped on the IDS, which is the only thing
+    the form sends -- two spellings of one crop cannot even arise now."""
+    state_id = _vocab_id(client, "states", "Karnataka")
+    crop_id = _vocab_id(client, "crops", "Paddy")
+    item_id = _submit(client, placements_json=json.dumps([
+        {"state_id": state_id, "crop_ids": [crop_id, crop_id]},
+        {"state_id": state_id, "crop_ids": [crop_id]},
+    ]))
+    try:
+        assert len(client.get(f"/dashboard/uploads/{item_id}").json()["placements"]) == 1
+    finally:
+        client.post(f"/dashboard/uploads/{item_id}/cancel")
+
+
+def test_upload_pauses_for_review_and_cancels_cleanly(client):
+    """No document and no placement exists until a person decides."""
+    before = client.get("/dashboard/stats").json()
+    item_id = _submit(client, placements_json=_placements(client, ("Karnataka", ["Paddy"])))
+    try:
+        item = _await_review(client, item_id)
+        assert item["status"] == "awaiting_review", item
+        assert item["sha256"] and len(item["sha256"]) == 64
+        assert item["note"]
+        assert client.get("/dashboard/stats").json() == before
+    finally:
+        assert client.post(f"/dashboard/uploads/{item_id}/cancel").status_code in (204, 404)
+    assert client.get(f"/dashboard/uploads/{item_id}").status_code == 404
+    assert client.get("/dashboard/stats").json() == before
+
+
+def test_candidates_report_what_is_new_and_what_is_not(client, db):
+    """The three-way decision is driven by the placements, not by yes/no: `add`
+    is offered only when this upload names a place the document is not in."""
+    from dashboard.db import get_database
+    from dashboard.models import COLL_DOCUMENTS, COLL_UNIQUE_DOCUMENTS
+    from dashboard.queue_worker import find_candidates, new_placements_for
+
+    live = get_database()
+    known = live[COLL_UNIQUE_DOCUMENTS].find_one({"sha256": {"$ne": None},
+                                                  "main_row_ids.1": {"$exists": True}})
+    from dashboard import vocabulary
+
+    placed = live[COLL_DOCUMENTS].find_one({"unique_document_id": known["_id"]})
+    folder_kind = "crop" if placed.get("crop_id") else "organization"
+    folder_field = vocabulary.field(folder_kind)
+    # Compared by ID, which is all a queued placement carries: the `state` and
+    # `crop` strings beside them are the queue's labels.
+    have = {"state": vocabulary.get(live, "state", placed["state_id"])["name"],
+            "state_id": placed["state_id"],
+            "crop": vocabulary.get(live, folder_kind, placed[folder_field])["name"],
+            "crop_kind": folder_kind, folder_field: placed[folder_field]}
+    elsewhere = {"state": "Elsewhere", "state_id": ObjectId("0" * 24),
+                 "crop": "Something Else", "crop_kind": folder_kind,
+                 folder_field: ObjectId("1" * 24)}
+    asked = [have, elsewhere]
+
+    candidates = find_candidates(live, known["sha256"], asked)
+    assert len(candidates) == 1
+    c = candidates[0]
+    assert c["match_type"] == "sha" and c["score"] == 1.0
+    assert c["document_code"].startswith("ANNAM_")
+    # The pair it already has is filtered out; the unknown one survives.
+    assert [(p["state"], p["crop"]) for p in c["new_placements"]] == [
+        ("Elsewhere", "Something Else")]
+    assert c["can_add"] is True
+    # Byte-identical content cannot become a second document: sha256 is unique.
+    assert c["can_create_new"] is False
+
+    # Asking only for places it already has leaves nothing to add.
+    assert new_placements_for(live, known, [have]) == []
+    assert find_candidates(live, "0" * 64, asked) == []
+
+
+def test_new_is_refused_for_an_exact_duplicate(client, db):
+    """Not a policy -- sha256 is unique on unique_documents, so a second
+    document for the same bytes cannot be stored at all."""
+    from dashboard.models import COLL_UPLOAD_QUEUE_ITEMS, COLL_UNIQUE_DOCUMENTS
+
+    known = db[COLL_UNIQUE_DOCUMENTS].find_one({"sha256": {"$ne": None}})
+    item_id = _submit(client, placements_json=_placements(client, ("Karnataka", ["Paddy"])))
+    try:
+        _await_review(client, item_id)
+        # Stand the item's candidates up against a real document without
+        # uploading its bytes: the endpoints read the stored candidates.
+        db[COLL_UPLOAD_QUEUE_ITEMS].update_one({"_id": __import__("bson").ObjectId(item_id)}, {"$set": {
+            "candidates": [{"document_id": str(known["_id"]),
+                            "document_code": f"ANNAM_{known['display_id']:05d}",
+                            "match_type": "sha", "score": 1.0, "can_add": False,
+                            "can_create_new": False, "new_placements": []}]}})
+        assert client.post(f"/dashboard/uploads/{item_id}/new").status_code == 409
+        # ...and `add` is refused too when there is nothing new to file.
+        assert client.post(f"/dashboard/uploads/{item_id}/add",
+                           json={"document_id": f"ANNAM_{known['display_id']:05d}"}).status_code == 409
+        # An id that is not one of the candidates cannot be attached to.
+        assert client.post(f"/dashboard/uploads/{item_id}/add",
+                           json={"document_id": "ANNAM_49999"}).status_code == 400
+    finally:
+        client.post(f"/dashboard/uploads/{item_id}/cancel")
+
+
+def test_add_is_refused_when_nothing_matched(client):
+    item_id = _submit(client, placements_json=_placements(client, ("Karnataka", ["Paddy"])))
+    try:
+        item = _await_review(client, item_id)
+        if item["candidates"]:
+            pytest.skip("this fixture PDF is already in the catalogue")
+        assert client.post(f"/dashboard/uploads/{item_id}/add").status_code == 409
+    finally:
+        client.post(f"/dashboard/uploads/{item_id}/cancel")
+
+
+def test_upload_queue_lists(client):
+    items = client.get("/dashboard/uploads").json()
+    assert isinstance(items, list)
+    # The queue is work in flight or waiting on someone. A finished upload
+    # deletes itself, so a `done` row here means _finish stopped cleaning up.
+    assert [i for i in items if i["status"] == "done"] == []
+
+
+def test_a_completed_upload_leaves_the_queue(client, db, scratch):
+    """The decision is the end of the item's life.
+
+    Filing the upload onto an existing document creates the placement and then
+    removes the queue entry -- the result is the row, not a `done` line someone
+    has to clear by hand.
+    """
+    from bson import ObjectId
+
+    from dashboard.models import COLL_DOCUMENTS, COLL_UPLOAD_QUEUE_ITEMS
+
+    doc, rows = scratch
+    before = db[COLL_DOCUMENTS].count_documents({"unique_document_id": doc["_id"]})
+
+    # A place the scratch document is not in, using vocabulary that already
+    # exists so the run does not leave a new state or crop behind.
+    item_id = _submit(client, placements_json=_placements(client, ("Karnataka", ["Paddy"])))
+    _await_review(client, item_id)
+    db[COLL_UPLOAD_QUEUE_ITEMS].update_one({"_id": ObjectId(item_id)}, {"$set": {
+        "candidates": [{"document_id": str(doc["_id"]),
+                        "document_code": f"ANNAM_{doc['display_id']:05d}",
+                        "match_type": "sha", "score": 1.0, "can_add": True,
+                        "can_create_new": False,
+                        "new_placements": [{"state": "Karnataka", "crop": "Paddy"}]}]}})
+
+    assert client.post(f"/dashboard/uploads/{item_id}/add").status_code == 200
+
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if client.get(f"/dashboard/uploads/{item_id}").status_code == 404:
+            break
+        time.sleep(0.3)
+    else:
+        pytest.fail(f"upload {item_id} is still in the queue after finishing")
+
+    assert db[COLL_DOCUMENTS].count_documents({"unique_document_id": doc["_id"]}) == before + 1
+    assert [i for i in client.get("/dashboard/uploads").json() if i["id"] == item_id] == []
+
+
+def test_a_manual_translation_upload_is_refused_while_a_job_runs(client, db, scratch):
+    """A person can attach a translation they made elsewhere -- but not while
+    the pipeline is about to write one, or the job would overwrite it."""
+    from dashboard.models import COLL_TRANSLATION_JOBS, TranslationJobKind, new_translation_job
+
+    doc, _rows = scratch
+    job = new_translation_job(document_id=doc["_id"], kind=TranslationJobKind.translate)
+    job_id = db[COLL_TRANSLATION_JOBS].insert_one(job).inserted_id
+    try:
+        resp = client.post(f"/dashboard/unique-documents/{doc['_id']}/translation",
+                           files={"file": ("t.docx", b"not really a docx", "application/octet-stream")})
+        assert resp.status_code == 409, resp.text
+        assert "cancel" in resp.json()["detail"]
+    finally:
+        db[COLL_TRANSLATION_JOBS].delete_one({"_id": job_id})
+
+    # Nothing was uploaded, so the document is untouched.
+    out = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()
+    assert out["translation_status"] == "not_started"
+    assert out["translation_file_id"] is None
+
+    missing = "0" * 24
+    assert client.post(f"/dashboard/unique-documents/{missing}/translation",
+                       files={"file": ("t.docx", b"x")}).status_code == 404
+
+
+def test_a_finished_translation_job_can_be_cleared(client, db):
+    """The queue shows what is translating now; the result lives on the
+    document. So a stopped job can be removed, and a live one cannot."""
+    from dashboard.models import COLL_TRANSLATION_JOBS, TranslationJobKind, new_translation_job
+
+    made = []
+    try:
+        for status in ("done", "failed", "cancelled"):
+            job = new_translation_job(document_id="0" * 24, kind=TranslationJobKind.translate)
+            job["status"] = status
+            made.append(db[COLL_TRANSLATION_JOBS].insert_one(job).inserted_id)
+            assert client.delete(f"/dashboard/translation-jobs/{made[-1]}").status_code == 204
+            assert db[COLL_TRANSLATION_JOBS].find_one({"_id": made[-1]}) is None
+
+        # Still live: it has to be cancelled first, or the worker would keep
+        # writing progress to a row that no longer exists.
+        job = new_translation_job(document_id="0" * 24, kind=TranslationJobKind.translate)
+        made.append(db[COLL_TRANSLATION_JOBS].insert_one(job).inserted_id)
+        assert client.delete(f"/dashboard/translation-jobs/{made[-1]}").status_code == 409
+    finally:
+        db[COLL_TRANSLATION_JOBS].delete_many({"_id": {"$in": made}})
+
+    assert client.delete(f"/dashboard/translation-jobs/{'0' * 24}").status_code == 404
+    assert client.delete("/dashboard/translation-jobs/not-an-id").status_code == 422
+
+
+def test_decisions_reject_unknown_items(client):
+    missing = "0" * 24
+    for path in ("add", "new", "cancel"):
+        assert client.post(f"/dashboard/uploads/{missing}/{path}").status_code == 404, path
+    assert client.post("/dashboard/uploads/not-an-id/new").status_code == 422
+
+
+# -- misc ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("path,expected", [
+    ("/dashboard/documents/not-an-object-id", 422),
+    ("/dashboard/documents/000000000000000000000000", 404),
+    ("/dashboard/unique-documents/not-an-object-id", 422),
+    ("/dashboard/unique-documents/000000000000000000000000", 404),
+])
+def test_bad_ids(client, path, expected):
+    assert client.get(path).status_code == expected
+
+
+def test_config_reports_translation_availability(client):
+    assert isinstance(client.get("/dashboard/config").json()["translation_available"], bool)
+
+
+def test_old_flat_endpoints_are_gone(client):
+    """The dedup-review flow of the previous schema, and its embedding routes."""
+    for path in ("/dashboard/dedup/groups", "/dashboard/dedup/stats"):
+        assert client.get(path).status_code == 404, path
+
+
+def test_nothing_reads_the_previous_schema(db):
+    """This schema is self-contained. `legacy_document_code` used to carry the
+    old database's ANNAM code and the loader used to open that database to read
+    it -- both are gone, so nothing here depends on `pop_dashboard` existing."""
+    from dashboard import migrate_from_corpus
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    assert db[COLL_UNIQUE_DOCUMENTS].count_documents(
+        {"legacy_document_code": {"$exists": True}}) == 0
+    assert not hasattr(migrate_from_corpus, "legacy_codes_by_sha")
+
+
+def test_documents_carry_only_the_agreed_fields(db):
+    """The metadata set was specified explicitly. Anything else on a document is
+    a field nobody asked for, and drifts into the dashboard's forms and exports
+    unnoticed."""
+    from dashboard.models import COLL_DOCUMENTS, COLL_UNIQUE_DOCUMENTS
+
+    allowed_doc = {
+        "_id", "display_id", "sha256", "num_pages",
+        "format_original", "shareable_name", "shareable_link",
+        "language", "language_source",
+        "advisory_type", "advisory_scope", "season", "edition_revision_volume",
+        "date_of_release", "month_of_release", "year_of_release",
+        "date_of_collection", "month_of_collection", "year_of_collection",
+        "advisory_name", "advisory_released_org", "advisory_org_address",
+        "live_source_link", "domain", "verification_status", "uploaded_by",
+        "document_status",
+        "translation_status", "translation_zoho_file_id", "translation_shareable_link",
+        "review_status", "review_zoho_file_id", "review_shareable_link",
+        "translated_by", "translated_at", "reviewed_by", "reviewed_at",
+        "approved_by_approver", "approved_by_admin",
+        "uploaded_by_id", "approved_by_approver_id", "approved_by_admin_id",
+        "chunk_embeddings", "main_row_ids", "duplicate_links",
+        "representative_file_id", "district_id", "kvk_id",
+        "created_at", "updated_at",
+        # DEAD DATA, tolerated until someone clears it: the anchor PLACEMENT
+        # pointer. Nothing reads or writes it any more -- the anchor row is
+        # derived from the copy entry carrying representative_file_id -- but it
+        # is still stored on every migrated document, and clearing it is a
+        # one-off $unset nobody has run.
+        "representative_row_id",
+        # Likewise: ANNAM ids of merged documents, never filled and no longer
+        # written or served -- duplicate_links tags merged files now.
+        "merged_from",
+    }
+    # `state`/`crop` name strings are tolerated only until
+    # dashboard/migrate_vocabulary_refs.py phase 2 removes them; nothing writes
+    # them any more (see test_new_placements_store_ids_not_names).
+    allowed_row = {
+        "_id", "row_id", "unique_document_id", "state_id", "state_raw",
+        "crop_id", "organization_id", "crop_raw", "subpath", "source_key", "created_at", "updated_at",
+        "state", "crop",
+    }
+    allowed_copy = {"zoho_file_id", "shareable_link", "shareable_name", "row_id",
+                    "state", "crop"}
+
+    for d in db[COLL_UNIQUE_DOCUMENTS].find().limit(200):
+        assert set(d) <= allowed_doc, set(d) - allowed_doc
+        for link in d.get("duplicate_links") or []:
+            assert set(link) <= allowed_copy, set(link) - allowed_copy
+    for r in db[COLL_DOCUMENTS].find().limit(200):
+        assert set(r) <= allowed_row, set(r) - allowed_row
+
+
+# -- audit trail, sort, search, downloads, live events -------------------------
+
+
+def test_search_keeps_the_spaces_inside_a_phrase(client, scratch):
+    """Only the ends are trimmed: the words in between are matched as typed."""
+    doc, rows = scratch
+    client.patch(f"/dashboard/documents/{rows[0]['_id']}",
+                 json={"advisory_name": "Scratch crop dan something something"})
+
+    def hits(term):
+        page = client.get("/dashboard/unique-documents",
+                          params={"filter[advisory_name]": term}).json()
+        return {d["id"] for d in page["items"]}
+
+    assert str(doc["_id"]) in hits("  crop dan something ")
+    assert str(doc["_id"]) not in hits("crop something")
+    assert str(doc["_id"]) not in hits("cropdan")
+
+
+def test_a_row_carries_the_documents_manual_fields(client, scratch):
+    """The main table shows them and seeds its inline edit boxes from them, so
+    a row has to carry what its document holds."""
+    doc, rows = scratch
+    fields = {"advisory_name": "Scratch advisory name", "advisory_type": "Scratch type",
+              "advisory_scope": "Scratch scope"}
+    client.patch(f"/dashboard/documents/{rows[0]['_id']}", json=fields)
+    page = client.get("/dashboard/documents",
+                      params={"filter[advisory_name]": fields["advisory_name"]}).json()
+    assert page["items"]
+    for row in page["items"]:
+        assert {f: row[f] for f in fields} == fields
+    one = client.get(f"/dashboard/documents/{page['items'][0]['id']}").json()
+    assert {f: one[f] for f in fields} == fields
+
+
+def test_search_boxes_take_commas_as_part_of_the_phrase(client, scratch):
+    """A typed search is one phrase: "Paddy, Kharif" is not "Paddy" OR "Kharif".
+    Dropdown filters still read a comma as a list."""
+    doc, rows = scratch
+    client.patch(f"/dashboard/unique-documents/{doc['_id']}",
+                 json={"shareable_name": "scratch-test Paddy, Kharif 2021.pdf"})
+
+    def hits(term, key="shareable_name"):
+        page = client.get("/dashboard/unique-documents", params={f"filter[{key}]": term}).json()
+        return {d["id"] for d in page["items"]}
+
+    assert str(doc["_id"]) in hits(" paddy, kharif ")
+    assert str(doc["_id"]) not in hits("paddy, rabi")
+    main = client.get("/dashboard/documents",
+                      params={"filter[shareable_name]": "Paddy, Kharif 2021"}).json()
+    assert {r["id"] for r in main["items"]} >= {str(r["_id"]) for r in rows}
+    # Ids stay a list.
+    annam = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()["document_id"]
+    ids = hits(f"{annam}, ANNAM_99999", key="document_id")
+    assert str(doc["_id"]) in ids
+
+
+def test_times_are_sent_as_utc_and_day_filters_mean_the_ist_day(client, db, scratch):
+    """A bare "10:00:00" reads as local time in the browser -- 5h30 off in IST."""
+    from datetime import datetime
+
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    doc, rows = scratch
+    # 20:00 UTC on 4 Jan is 01:30 IST on 5 Jan.
+    db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": doc["_id"]}, {"$set": {
+        "translated_by": "Scratch Translator", "translated_at": datetime(2020, 1, 4, 20, 0)}})
+
+    one = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()
+    assert one["translated_at"] == "2020-01-04T20:00:00Z"
+    assert one["created_at"].endswith("Z")
+    row = client.get(f"/dashboard/documents/{rows[0]['_id']}").json()
+    assert row["translated_at"] == "2020-01-04T20:00:00Z" and row["created_at"].endswith("Z")
+
+    def found(**params):
+        page = client.get("/dashboard/unique-documents",
+                          params={"filter[shareable_name]": "scratch-test", **params}).json()
+        return str(doc["_id"]) in {d["id"] for d in page["items"]}
+
+    assert found(**{"filter[translated_at]": "2020-01-05"})
+    assert not found(**{"filter[translated_at]": "2020-01-04"})
+    assert found(**{"filter[translated_at_from]": "2020-01-05", "filter[translated_at_to]": "2020-01-05"})
+    assert not found(**{"filter[translated_at_to]": "2020-01-04"})
+
+
+def test_uploaded_by_comes_with_the_upload_and_cannot_be_edited(client, db, scratch):
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    item_id = _submit(client, placements_json=_placements(client, ("Karnataka", ["Paddy"])),
+                      uploaded_by="Scratch Uploader")
+    try:
+        item = client.get(f"/dashboard/uploads/{item_id}").json()
+        assert item["metadata"]["uploaded_by"] == "Scratch Uploader"
+        assert "verified_by" not in item["metadata"]
+    finally:
+        client.post(f"/dashboard/uploads/{item_id}/cancel")
+
+    doc, rows = scratch
+    db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": doc["_id"]}, {"$set": {"uploaded_by": "Scratch Uploader"}})
+    client.patch(f"/dashboard/unique-documents/{doc['_id']}", json={"uploaded_by": "Someone Else"})
+    client.patch(f"/dashboard/documents/{rows[0]['_id']}", json={"uploaded_by": "Someone Else"})
+    out = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()
+    assert out["uploaded_by"] == "Scratch Uploader"
+    assert "verified_by" not in out
+    page = client.get("/dashboard/unique-documents", params={"filter[uploaded_by]": "scratch uploader"}).json()
+    assert str(doc["_id"]) in {d["id"] for d in page["items"]}
+
+
+def test_name_lists_for_the_audit_filters(client, db, scratch):
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    doc, _ = scratch
+    db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": doc["_id"]}, {"$set": {
+        "uploaded_by": "Scratch Uploader", "translated_by": "scratch translator",
+        "reviewed_by": " Scratch Reviewer "}})
+    for path, name in (("uploaded-by", "Scratch Uploader"), ("translated-by", "scratch translator"),
+                       ("reviewed-by", "Scratch Reviewer")):
+        names = client.get(f"/dashboard/{path}").json()
+        assert name in names, path
+        assert "" not in names and None not in names
+        assert names == sorted(names, key=str.casefold)
+        assert len(names) == len(set(names))
+
+
+def test_states_list_every_state_and_union_territory(client):
+    """Every state and UT is present, by its LGD CODE.
+
+    Matched on the code and not on the name, which is the lesson of this whole
+    change: LGD capitalises "And", prefixes an article and says Keralam, so a
+    name check asserts a spelling rather than which places are covered. The
+    codes are stable, and they are what the OCR language table keys on.
+    """
+    entries = client.get("/dashboard/states").json()
+    by_code = {s["code"]: s["name"] for s in entries}
+    # Chandigarh, Chhattisgarh, Tamil Nadu, Andaman & Nicobar, Delhi, J&K,
+    # Puducherry, Keralam, Ladakh, Lakshadweep, Dadra & Nagar Haveli, Central.
+    for code in (4, 22, 33, 35, 7, 1, 34, 32, 37, 31, 38, 39):
+        assert code in by_code, code
+    assert len([s for s in entries if s["code"] is not None]) == 37
+    # No entry is still called by a spelling the sync replaced.
+    current = {s["name"] for s in entries}
+    assert not {"Chattisgarh", "Tamilnadu", "Andaman and Nicobar", "Kerala"} & current
+
+
+def test_audit_fields_are_served_filtered_and_sorted(client, db, scratch):
+    from datetime import datetime, timedelta, timezone
+
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    doc, rows = scratch
+    at = datetime(2020, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": doc["_id"]}, {"$set": {
+        "translated_by": "Scratch Translator", "translated_at": at,
+        "reviewed_by": "Scratch Reviewer", "reviewed_at": at + timedelta(days=1)}})
+
+    one = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()
+    assert one["translated_by"] == "Scratch Translator"
+    assert one["reviewed_by"] == "Scratch Reviewer"
+    assert one["translated_at"].startswith("2020-01-02T03:04:05")
+    row = client.get(f"/dashboard/documents/{rows[0]['_id']}").json()
+    assert row["translated_by"] == "Scratch Translator" and row["reviewed_at"].startswith("2020-01-03")
+
+    for path in ("/dashboard/unique-documents", "/dashboard/documents"):
+        by = client.get(path, params={"filter[translated_by]": "scratch translator"}).json()
+        assert by["total"] >= 1
+        day = client.get(path, params={"filter[reviewed_at_from]": "2020-01-03",
+                                       "filter[reviewed_at_to]": "2020-01-03"}).json()
+        assert day["items"] and all(i["reviewed_at"].startswith("2020-01-03") for i in day["items"])
+
+        # Blanks sort last in BOTH directions.
+        for order in ("translated_at", "-translated_at"):
+            first = client.get(path, params={"sort": order, "page_size": 5}).json()["items"]
+            assert first[0]["translated_at"] is not None
+        oldest = client.get(path, params={"sort": "translated_at",
+                                          "filter[shareable_name]": "scratch-test"}).json()["items"]
+        assert oldest and oldest[0]["translated_by"] == "Scratch Translator"
+
+    # Sorting is no longer limited to the audit timestamps -- any filterable
+    # column goes (see test_every_filterable_column_can_be_sorted). Only a
+    # column that does not exist is refused.
+    assert client.get("/dashboard/unique-documents", params={"sort": "shareable_name"}).status_code == 200
+    assert client.get("/dashboard/documents", params={"sort": "-nope"}).status_code == 400
+
+
+def test_deleting_a_review_clears_who_and_when(client, db, scratch):
+    from datetime import datetime, timezone
+
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    doc, _ = scratch
+    db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": doc["_id"]}, {"$set": {
+        "review_status": "done", "reviewed_by": "Scratch Reviewer",
+        "reviewed_at": datetime.now(timezone.utc),
+        "translation_status": "done", "translated_by": "Scratch Translator",
+        "translated_at": datetime.now(timezone.utc)}})
+    assert client.delete(f"/dashboard/unique-documents/{doc['_id']}/review").status_code == 204
+    assert client.delete(f"/dashboard/unique-documents/{doc['_id']}/translation").status_code == 204
+    out = client.get(f"/dashboard/unique-documents/{doc['_id']}").json()
+    assert (out["reviewed_by"], out["reviewed_at"], out["translated_by"], out["translated_at"]) == (None,) * 4
+
+
+def test_download_names_follow_the_shareable_name(client, scratch):
+    from dashboard.routes_files import download_name
+
+    assert download_name("Paddy_KA_2021.pdf", "x_translated.docx", "_translation") == "Paddy_KA_2021_translation.docx"
+    assert download_name("Rice v1.2 guide.pdf", "r.pdf", "_reviewed") == "Rice v1.2 guide_reviewed.pdf"
+    assert download_name("Paddy_KA_2021.pdf", "scan.pdf", "") == "Paddy_KA_2021.pdf"
+    doc, _ = scratch
+    # The scratch document has no file of any of the three kinds, so each says
+    # so rather than 404ing because the kind itself is unknown.
+    for kind in ("translation", "review", "original"):
+        resp = client.get(f"/dashboard/unique-documents/{doc['_id']}/{kind}/download")
+        assert resp.status_code == 404 and kind in resp.json()["detail"], (kind, resp.text)
+    assert client.get(f"/dashboard/unique-documents/{doc['_id']}/nonsense/download").status_code == 404
+
+
+def test_the_original_downloads_under_the_documents_own_name(client):
+    """The original was the odd one out: it could only be fetched through the
+    by-file-id proxy, which names the download after the WorkDrive file. Now it
+    has the same named endpoint the translation and review have."""
+    doc = next(d for d in client.get("/dashboard/unique-documents").json()["items"]
+               if d["representative_file_id"] and d["shareable_name"])
+    # Range request: the headers are the point, the bytes are not.
+    resp = client.get(f"/dashboard/unique-documents/{doc['id']}/original/download",
+                      headers={"Range": "bytes=0-99"})
+    assert resp.status_code == 206, resp.text
+    stem = doc["shareable_name"].rsplit(".", 1)[0][:20]
+    assert stem in resp.headers["content-disposition"]
+    assert resp.headers["content-disposition"].startswith("attachment;")
+    assert resp.headers["accept-ranges"] == "bytes"
+    # ?inline=1 is the eye icon: same file, shown instead of saved.
+    inline = client.get(f"/dashboard/unique-documents/{doc['id']}/original/download?inline=1",
+                        headers={"Range": "bytes=0-99"})
+    assert inline.headers["content-disposition"].startswith("inline;")
+
+
+def test_translation_jobs_carry_the_unique_document_id(client, db, scratch):
+    from dashboard.models import COLL_TRANSLATION_JOBS, TranslationJobKind, new_translation_job
+
+    doc, _ = scratch
+    job = new_translation_job(document_id=doc["_id"], kind=TranslationJobKind.translate)
+    job["status"] = "done"
+    job_id = db[COLL_TRANSLATION_JOBS].insert_one(job).inserted_id
+    try:
+        jobs = client.get("/dashboard/translation-jobs", params={"status": "done"}).json()
+        mine = next(j for j in jobs if j["id"] == str(job_id))
+        assert mine["unique_document_id"] == str(doc["_id"]) == mine["document_id"]
+    finally:
+        db[COLL_TRANSLATION_JOBS].delete_one({"_id": job_id})
+
+
+@pytest.mark.parametrize("stage,pipeline,action", [
+    (2, 0, "skip"), (2, 1, "skip"),
+    (1, 0, "single_call"), (1, 1, "translate_transcript"),
+    (0, 0, "single_call"), (0, 1, "ocr_then_translate"),
+])
+def test_what_a_run_does_with_a_page_follows_its_stage_and_the_pipeline(stage, pipeline, action):
+    from dashboard.routes_translation import _page_action
+
+    assert _page_action(stage, pipeline) == action
+
+
+def test_a_calls_cost_is_its_tokens_at_the_models_price():
+    from dashboard.routes_translation import _cost_usd
+
+    usage = {"input_tokens": 1_000_000, "output_tokens": 1_000_000}
+    assert _cost_usd("gemini-3.1-pro-preview", usage) == pytest.approx(14.0)
+    assert _cost_usd("gemini-3.1-flash-lite", usage) == pytest.approx(1.75)
+    assert _cost_usd("gemini-3.5-flash-lite", usage) == pytest.approx(2.80)
+    assert _cost_usd("gemini-3.1-pro-preview", usage, 0.5) == pytest.approx(7.0)  # flex and batch
+    assert _cost_usd("MiniMax-M3", usage) is None and _cost_usd("gemini-3.8-flash", None) is None
+
+
+def test_page_stages_come_from_the_links_when_none_are_stored():
+    from dashboard.routes_translation import _page_stages
+
+    # A job from before page_stage: a link means translated.
+    assert _page_stages(None, ["l", "", "l"], ["a", "", "c"]) == [2, 0, 2]
+    assert _page_stages([], ["l", ""], ["a", ""]) == [2, 0]
+    # Stored: a link beats the digit, a transcript is kept, one with no file is nothing.
+    assert _page_stages([1, 1, 1, 0], ["l", "", "", ""], ["a", "t", "", ""]) == [2, 1, 0, 0]
+
+
+def test_a_job_is_served_with_its_pipeline_and_page_stages(client, db, scratch):
+    from dashboard.models import COLL_TRANSLATION_JOBS, TranslationJobKind, new_translation_job
+
+    doc, _ = scratch
+    ids = []
+    try:
+        new = new_translation_job(document_id=doc["_id"], kind=TranslationJobKind.translate, pipeline=1)
+        new.update(status="failed", page_links=["l", "", ""], page_file_ids=["a", "t", ""], page_stage=[2, 1, 0])
+        # The shape of a job written before either field existed.
+        old = new_translation_job(document_id=doc["_id"], kind=TranslationJobKind.translate)
+        old.update(status="failed", page_links=["l", ""], page_file_ids=["a", ""])
+        del old["pipeline"], old["page_stage"]
+        for job in (new, old):
+            ids.append(db[COLL_TRANSLATION_JOBS].insert_one(job).inserted_id)
+        jobs = {j["id"]: j for j in client.get("/dashboard/translation-jobs", params={"status": "failed"}).json()}
+        assert (jobs[str(ids[0])]["pipeline"], jobs[str(ids[0])]["page_stage"]) == (1, [2, 1, 0])
+        assert (jobs[str(ids[1])]["pipeline"], jobs[str(ids[1])]["page_stage"]) == (0, [2, 0])
+    finally:
+        db[COLL_TRANSLATION_JOBS].delete_many({"_id": {"$in": ids}})
+
+
+@pytest.mark.parametrize("body,status", [
+    ({"pipeline": 2}, 422), ({"pipeline": "1"}, 422), ({"pipeline": True}, 422), ({"model": "gpt-4"}, 422),
+])
+def test_pipeline_is_zero_or_one(client, body, status):
+    """Refused before any document or job is looked at, so nothing is queued."""
+    resp = client.post(f"/dashboard/unique-documents/{'0' * 24}/translate", json=body)
+    if resp.status_code == 503:
+        pytest.skip("translation is switched off on this server (TRANS=off)")
+    assert resp.status_code == status, resp.text
+
+
+def test_pipeline_one_is_allowed_in_every_mode_where_the_server_can_run_it(monkeypatch):
+    from fastapi import HTTPException
+
+    from dashboard import routes_translation as rt
+
+    monkeypatch.setattr(rt, "OCR_URL", "http://ocr/parse")
+    monkeypatch.setattr(rt, "flash_api_key", lambda: "key")
+    assert rt._pipeline_of(None) == 1 and rt._pipeline_of({"mode": "batch"}) == 1
+    assert rt._pipeline_of({"pipeline": 1, "mode": "flex"}) == 1 and rt._pipeline_of({"pipeline": 0}) == 0
+    monkeypatch.setattr(rt, "OCR_URL", "")  # no OCR service: the default falls back, an explicit 1 is refused
+    assert rt._pipeline_of(None) == 0
+    with pytest.raises(HTTPException) as err:
+        rt._pipeline_of({"pipeline": 1, "mode": "batch"})
+    assert err.value.status_code == 400
+
+
+def test_a_batch_line_for_a_transcript_is_the_prompt_and_the_text_only():
+    from scripts.run_pop_to_docx_updated_pagewise_docx import gemini_batch_html, gemini_batch_text_request
+
+    line = gemini_batch_text_request("Translate.\n", "page text")
+    assert line == {"contents": [{"role": "user", "parts": [{"text": "Translate.\n\npage text"}]}]}
+    reply = {"candidates": [{"content": {"parts": [{"text": "hidden", "thought": True}, {"text": "<p>Hi</p>"}]}}]}
+    assert gemini_batch_html(reply).strip() == "<p>Hi</p>"
+
+
+def test_events_stream_pushes_queue_changes(client, db, scratch):
+    """Open the stream, delete a finished job, and see the event arrive."""
+    import threading
+
+    from dashboard.models import COLL_TRANSLATION_JOBS, TranslationJobKind, new_translation_job
+
+    doc, _ = scratch
+    job = new_translation_job(document_id=doc["_id"], kind=TranslationJobKind.translate)
+    job["status"] = "done"
+    job_id = db[COLL_TRANSLATION_JOBS].insert_one(job).inserted_id
+    seen = []
+    try:
+        with httpx.Client(base_url=BASE_URL, timeout=20.0) as stream_client:
+            with stream_client.stream("GET", "/dashboard/events") as resp:
+                assert resp.status_code == 200
+                assert resp.headers["content-type"].startswith("text/event-stream")
+                lines = resp.iter_lines()
+                assert any(": connected" in line for line in (next(lines), next(lines)))
+                threading.Timer(0.3, lambda: client.delete(f"/dashboard/translation-jobs/{job_id}")).start()
+                event = None
+                for line in lines:
+                    if line.startswith("event: "):
+                        event = line[7:]
+                    elif line.startswith("data: ") and event == "translation":
+                        data = json.loads(line[6:])
+                        if data.get("id") == str(job_id):
+                            seen.append(data)
+                            break
+    finally:
+        db[COLL_TRANSLATION_JOBS].delete_one({"_id": job_id})
+    assert seen == [{"id": str(job_id), "deleted": True}]
+
+
+def test_row_routes_pass_the_audit_fields_through(client, db, scratch):
+    """The /documents/{row_id}/... wrappers delegate to the document routes;
+    the extra by-name parameters must not shift their arguments."""
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    doc, rows = scratch
+    db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": doc["_id"]}, {"$set": {"translation_status": "in_progress"}})
+    resp = client.post(f"/dashboard/documents/{rows[0]['_id']}/translate", json={"translated_by": "Scratch"})
+    assert resp.status_code in (400, 409, 503), resp.text  # refused, never a 500
+    db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": doc["_id"]}, {"$set": {
+        "translation_status": "done", "translated_by": "Scratch Translator"}})
+    assert client.delete(f"/dashboard/documents/{rows[0]['_id']}/translation").status_code == 204
+    assert client.get(f"/dashboard/unique-documents/{doc['_id']}").json()["translated_by"] is None
+
+
+# -- sorting, and the two placement columns that are not folders ---------------
+
+
+def test_every_filterable_column_can_be_sorted(client):
+    """The sort whitelist is derived from the filter tables, so the promise is
+    exactly "a column you can filter, you can sort" -- checked here against the
+    real tables rather than a copy of the list."""
+    from dashboard.routes_documents import _JOINED_FILTERS
+
+    for key in _JOINED_FILTERS:
+        resp = client.get(f"/dashboard/unique-documents?sort={key}")
+        assert resp.status_code == 200, (key, resp.text)
+        assert resp.json()["total"] > 0, key
+    # A placement column belongs to the main table only: the documents listing
+    # has no row_id to sort by, and says so rather than ignoring the parameter.
+    assert client.get("/dashboard/documents?sort=row_id").status_code == 200
+    bad = client.get("/dashboard/unique-documents?sort=row_id")
+    assert bad.status_code == 400 and "sort must be one of" in bad.json()["detail"]
+    assert client.get("/dashboard/unique-documents?sort=nonsense").status_code == 400
+
+
+def test_sorting_puts_blanks_last_but_keeps_zero(client, db, scratch):
+    """`0` is a value, not a blank. POP_00000 and a 0-page document must sort at
+    the TOP ascending -- the obvious `$ifNull` test reads both as missing and
+    buries them with the genuinely empty rows."""
+    from datetime import datetime, timezone
+
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    first = client.get("/dashboard/documents?sort=row_id").json()["items"][0]
+    assert first["row_id"] == "POP_00000"
+    assert client.get("/dashboard/documents?sort=-row_id").json()["items"][0]["row_id"] != "POP_00000"
+
+    # A 0-page document sorts at the very top, ahead of every 1-page one.
+    doc, _rows = scratch
+    db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": doc["_id"]}, {"$set": {"num_pages": 0}})
+    pages = [d["num_pages"] for d in client.get("/dashboard/unique-documents?sort=num_pages").json()["items"]]
+    assert pages[0] == 0
+
+    # Blanks last in BOTH directions. No document in the corpus has ever been
+    # translated, so the scratch document is the only one with a timestamp --
+    # which is exactly what makes this worth asserting.
+    db[COLL_UNIQUE_DOCUMENTS].update_one({"_id": doc["_id"]}, {"$set": {"translated_at": datetime.now(timezone.utc)}})
+    for direction in ("translated_at", "-translated_at"):
+        items = client.get(f"/dashboard/unique-documents?sort={direction}").json()["items"]
+        assert items[0]["translated_at"] is not None, direction
+
+
+def test_state_and_folder_sort_by_the_name_the_table_shows(client):
+    """Both are stored as ids, and the crop master is in another DATABASE in
+    production, so this cannot be a $lookup. Whatever it is, the order has to be
+    the displayed names' order."""
+    for column in ("state", "crop"):
+        names = [row[column] for row in client.get(f"/dashboard/documents?sort={column}").json()["items"]]
+        assert names == sorted(names, key=str.lower), column
+        reverse = [row[column] for row in client.get(f"/dashboard/documents?sort=-{column}").json()["items"]]
+        assert reverse == sorted(reverse, key=str.lower, reverse=True), column
+    # The documents listing has no state of its own, so it sorts by the
+    # placement holding the copy the document IS -- found by matching the
+    # representative FILE against the copy entries, not by a stored anchor row.
+    rows = client.get("/dashboard/unique-documents?sort=state").json()["items"]
+    anchors = [next((c["state"] for c in r["duplicate_links"]
+                     if c["zoho_file_id"] == r["representative_file_id"]), None)
+               for r in rows]
+    assert [a for a in anchors if a] == sorted((a for a in anchors if a), key=str.lower)
+
+
+def _a_district(client, *, with_kvk: bool = False):
+    """A real synced district, and optionally one of its KVKs.
+
+    Tests cannot invent one: districts and KVKs come from the LGD sync and the
+    API answers 403 to a create. So they use what is actually there, which also
+    means these tests fail loudly if the sync has never been run.
+    """
+    districts = client.get("/dashboard/districts").json()
+    assert districts, "no districts -- run scripts/sync_lgd.py against this database"
+    for d in districts:
+        if d["code"] is None:       # skip our own "All" entries
+            continue
+        if not with_kvk:
+            return d, None
+        kvks = [k for k in client.get(f"/dashboard/kvks?district_id={d['id']}").json() if k["code"]]
+        if kvks:
+            return d, kvks[0]
+    raise AssertionError("no synced district with a KVK")
+
+
+def test_district_and_kvk_live_on_the_document(client, db, scratch):
+    """Set once, shown on EVERY placement of that document.
+
+    They were placement fields, and that was wrong: a Package of Practices is
+    written for a place, and filing it in a second folder does not put it in a
+    second district. Storing them per placement gave one document as many
+    districts as it had folders, and a document-level edit then had to pick one
+    placement to write to -- which is the only reason an anchor placement
+    existed, and it refused outright once that placement was deleted.
+    """
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    doc, rows = scratch
+    first, second = rows[0]["_id"], rows[1]["_id"]
+    district, kvk = _a_district(client, with_kvk=True)
+    url = f"/dashboard/unique-documents/{doc['_id']}"
+    assert client.get(f"/dashboard/documents/{first}").json()["district"] is None
+
+    out = client.patch(url, json={"district_id": district["id"], "kvk_id": kvk["id"]}).json()
+    assert (out["district"], out["kvk"]) == (district["name"], kvk["name"])
+    assert (out["district_id"], out["kvk_id"]) == (district["id"], kvk["id"])
+    # BOTH placements report it -- that is the whole point of the move.
+    for row in (first, second):
+        shown = client.get(f"/dashboard/documents/{row}").json()
+        assert (shown["district"], shown["kvk"]) == (district["name"], kvk["name"])
+    # Stored on the document, and on neither row.
+    from dashboard.models import COLL_DOCUMENTS
+    assert db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc["_id"]})["district_id"] is not None
+    assert all("district_id" not in db[COLL_DOCUMENTS].find_one({"_id": r})
+               for r in (first, second))
+
+    # A NAME is not a field here. Pydantic drops it, so nothing moves.
+    assert client.patch(url, json={"district": "Nowhereshire"}).json()["district"] == district["name"]
+    # An id names an existing entry; anything else is refused, not invented.
+    bad = client.patch(url, json={"district_id": "0" * 24})
+    assert bad.status_code == 400 and "district" in bad.json()["detail"]
+
+    # "" clears it. A cleared reference and one never set look alike -- the
+    # field is gone, not stored as null.
+    assert client.patch(url, json={"district_id": ""}).json()["district"] is None
+    assert "district_id" not in db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc["_id"]})
+    assert client.get(f"/dashboard/documents/{first}").json()["kvk"] == kvk["name"]
+    client.patch(url, json={"kvk_id": ""})
+
+
+def test_a_document_keeps_its_district_when_its_last_placement_goes(client, db, scratch):
+    """The edit that used to refuse. With district on the placement, a document
+    whose anchor placement had been deleted answered 409 -- "no anchor
+    placement, so it has nowhere to keep a district" -- for a field that is
+    simply its own."""
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    doc, rows = scratch
+    district, _kvk = _a_district(client)
+    url = f"/dashboard/unique-documents/{doc['_id']}"
+    for row in rows:
+        assert client.delete(f"/dashboard/documents/{row['_id']}").status_code == 204
+
+    out = client.patch(url, json={"district_id": district["id"]})
+    assert out.status_code == 200, out.text
+    assert out.json()["district"] == district["name"]
+    assert db[COLL_UNIQUE_DOCUMENTS].find_one(
+        {"_id": doc["_id"]})["district_id"] is not None
+
+
+def test_district_and_kvk_filter_and_sort_like_the_other_columns(client, scratch):
+    """Same contract as every other column, from both listings -- and the two
+    listings agree, because they now filter the same stored field."""
+    doc, _rows = scratch
+    url = f"/dashboard/unique-documents/{doc['_id']}"
+    district, kvk = _a_district(client, with_kvk=True)
+    before = client.get(f"/dashboard/documents?filter[district_id]={district['id']}").json()["total"]
+    client.patch(url, json={"district_id": district["id"], "kvk_id": kvk["id"]})
+    try:
+        # By id, and combinable with the other filters -- the same contract as
+        # filter[state_id]. filter[district] took a substring and is gone.
+        assert client.get(f"/dashboard/documents?filter[district_id]={district['id']}"
+                          ).json()["total"] == before + 2
+        assert client.get("/dashboard/documents",
+                          params={"filter[kvk_id]": kvk["id"]}).json()["total"] >= 1
+        both = client.get("/dashboard/documents", params={"filter[district_id]": district["id"],
+                                                          "filter[kvk_id]": kvk["id"]})
+        assert both.json()["total"] >= 1
+        assert client.get("/dashboard/documents",
+                          params={"filter[district_id]": "0" * 24}).json()["total"] == 0
+        # The documents listing filters the same field, so it sees the document
+        # once however many placements carry it.
+        assert client.get("/dashboard/unique-documents",
+                          params={"filter[district_id]": district["id"]}).json()["total"] >= 1
+
+        entry = next(d for d in client.get("/dashboard/districts").json() if d["id"] == district["id"])
+        # No write route exists for a district at all, in use or not.
+        assert client.delete(f"/dashboard/districts/{district['id']}").status_code in (404, 405)
+
+        names = [r["district"] for r in client.get("/dashboard/documents?sort=district").json()["items"]]
+        assert names[0] is not None  # rows with no district sort last, as everywhere else
+        docs = client.get("/dashboard/unique-documents?sort=district").json()["items"]
+        assert docs[0]["district"] is not None
+    finally:
+        client.patch(url, json={"district_id": "", "kvk_id": ""})
+
+
+def test_one_shared_all_entry_serves_every_parent(client, db):
+    """"Not specific to a district" is ONE fact, so it is ONE row.
+
+    It was first built the other way -- an "All" under each of the 37 states and
+    each of the 823 districts -- which gave the same meaning 860 different ids
+    and no way to keep them in step with the "no id at all" that the form sends.
+    The row carries no parent and no LGD code, so no query by parent can reach
+    it and every list has to add it back.
+    """
+    from dashboard.models import COLL_DISTRICTS, COLL_KVKS
+
+    for coll in (COLL_DISTRICTS, COLL_KVKS):
+        rows = list(db[coll].find({"is_all": True}))
+        assert len(rows) == 1, f"{coll} should hold exactly one shared All row"
+        assert rows[0]["name"] == "All"
+        # Parentless, so it belongs to no state and to no district.
+        assert rows[0].get("state_id") is None and rows[0].get("district_id") is None
+        assert rows[0].get("district_code") is None and rows[0].get("kvk_code") is None
+
+    states = client.get("/dashboard/states").json()
+    seen = set()
+    for state in states[:6]:
+        listed = client.get(f"/dashboard/districts?state_id={state['id']}").json()
+        alls = [d for d in listed if d["name"] == "All"]
+        assert len(alls) == 1, f"{state['name']} should offer All exactly once"
+        assert listed[0]["name"] == "All", "All comes first -- the order a dropdown wants"
+        seen.add(alls[0]["id"])
+    assert len(seen) == 1, "every state must be offered the SAME All id"
+
+    # Unnarrowed -- what the column filter dropdown reads -- lists it once too.
+    assert sum(1 for d in client.get("/dashboard/districts").json() if d["name"] == "All") == 1
+    assert sum(1 for k in client.get("/dashboard/kvks").json() if k["name"] == "All") == 1
+
+
+def test_a_parent_with_no_children_of_its_own_still_offers_all(client, db):
+    """The reason the shared row is unioned in rather than queried for: Central
+    has no districts at all, and 152 real districts have no KVK. Before this
+    their dropdowns came back empty, which reads as broken rather than as
+    "nothing specific to pick"."""
+    from dashboard.models import COLL_DISTRICTS, COLL_KVKS
+
+    central = next((s for s in client.get("/dashboard/states").json()
+                    if s["name"] == "Central"), None)
+    if central is not None:
+        offered = client.get(f"/dashboard/districts?state_id={central['id']}").json()
+        assert [d["name"] for d in offered] == ["All"]
+
+    with_kvk = {k["district_id"] for k in db[COLL_KVKS].find(
+        {"kvk_code": {"$exists": True}}, {"district_id": 1})}
+    bare = db[COLL_DISTRICTS].find_one(
+        {"district_code": {"$exists": True}, "_id": {"$nin": list(with_kvk)}})
+    if bare is not None:
+        offered = client.get(f"/dashboard/kvks?district_id={bare['_id']}").json()
+        assert [k["name"] for k in offered] == ["All"], bare["name"]
+
+    # And the nested tree says the same thing, since the frontend reads it once
+    # at load instead of narrowing per dropdown.
+    for state in client.get("/dashboard/locations").json():
+        assert any(d["name"] == "All" for d in state["districts"]), state["name"]
+        for d in state["districts"]:
+            assert any(k["name"] == "All" for k in d["kvks"]), (state["name"], d["name"])
+
+
+def test_an_empty_district_id_clears_it(client, scratch):
+    """The edit form sends only the fields it changed, so it needs a way to say
+    "the user picked nothing". A null cannot say it -- null means "not sent", as
+    for every other field -- so an EMPTY string clears. It used to answer 400,
+    having tried to read "" as an ObjectId.
+
+    `district_id` is the only field that carries this now; `{"district": ...}`
+    by name is gone with every other name field, so there is one way to say it
+    rather than two that had to agree.
+
+    On the DOCUMENT: district is its field, so this is the document's PATCH. The
+    placement's PATCH no longer has a district to clear.
+    """
+    doc, _rows = scratch
+    district, _kvk = _a_district(client)
+    row_url = f"/dashboard/unique-documents/{doc['_id']}"
+
+    assert client.patch(row_url, json={"district_id": district["id"]}).status_code == 200
+    assert client.get(row_url).json()["district"] == district["name"]
+    assert client.patch(row_url, json={"district_id": ""}).status_code == 200
+    cleared = client.get(row_url).json()
+    assert cleared["district"] is None and cleared["district_id"] is None
+
+    # A name field is not a field here: ignored, so it neither sets nor clears.
+    assert client.patch(row_url, json={"district": district["name"]}).status_code == 200
+    assert client.get(row_url).json()["district"] is None
+
+    # A null is still "unchanged", not "clear".
+    assert client.patch(row_url, json={"district_id": district["id"]}).status_code == 200
+    assert client.patch(row_url, json={"district_id": None}).status_code == 200
+    assert client.get(row_url).json()["district"] == district["name"]
+
+    # The shared All row is a real, selectable value -- not a synonym for empty.
+    all_district = next(d for d in client.get("/dashboard/districts").json()
+                        if d["name"] == "All")
+    assert client.patch(row_url, json={"district_id": all_district["id"]}).status_code == 200
+    assert client.get(row_url).json()["district"] == "All"
+    assert client.patch(row_url, json={"district_id": ""}).status_code == 200
+    assert client.get(row_url).json()["district"] is None
+
+
+def test_an_existing_document_can_be_filed_under_another_state_and_folder(client, db, scratch):
+    """POST /unique-documents/{id}/placements -- the counterpart to PATCH
+    /documents/{row_id}, which MOVES a placement rather than adding one.
+
+    Before this, filing a document the database already had somewhere else meant
+    uploading the file again and taking the /uploads/{id}/add branch, which needs
+    the bytes in hand for content that is already stored.
+
+    No second FILE is created, which is what makes that sound: a dashboard
+    upload writes one file into one flat folder and files it in several places,
+    so placements already share a zoho_file_id. The new row reuses the anchor
+    copy, so duplicate_links does not grow and the anchor does not move.
+    """
+    from dashboard.models import COLL_DOCUMENTS, COLL_UNIQUE_DOCUMENTS
+
+    doc, rows = scratch
+    before = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc["_id"]})
+    state = next(s for s in client.get("/dashboard/states").json() if s["name"] == "Karnataka")
+    crop = client.get("/dashboard/crops").json()[0]
+
+    resp = client.post(f"/dashboard/unique-documents/{doc['_id']}/placements",
+                       json={"state_id": state["id"], "crop_id": crop["id"]})
+    assert resp.status_code == 201, resp.text
+    out = resp.json()
+    assert (out["state"], out["crop"], out["crop_kind"]) == ("Karnataka", crop["name"], "crop")
+    assert out["document_id"] == client.get(f"/dashboard/documents/{rows[0]['_id']}").json()["document_id"]
+    # It is a placement of the SAME document, so the content fields are the
+    # document's and the file served is the document's anchor.
+    assert out["sha256"] == before["sha256"]
+    assert out["representative_file_id"] == before.get("representative_file_id")
+    # District and kvk are one-per-document and live on the anchor, so a second
+    # placement does not get its own.
+    assert out["district"] is None and out["kvk"] is None
+
+    after = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc["_id"]})
+    assert len(after.get("duplicate_links") or []) == len(before.get("duplicate_links") or [])
+    assert db[COLL_DOCUMENTS].count_documents({"unique_document_id": doc["_id"]}) == len(rows) + 1
+    # And it shows up as a placement of the document, which is what the modal lists.
+    listed = client.get(f"/dashboard/unique-documents/{doc['_id']}/placements").json()
+    assert out["row_id"] in [r["row_id"] for r in listed]
+
+
+def test_filing_a_document_where_it_already_is_is_refused(client, scratch):
+    """409 naming the row that is already there, so the frontend can point at
+    it. The corpus does contain a document twice in one folder -- two physical
+    WorkDrive copies -- but a person clicking "add" twice means the second one
+    by mistake."""
+    doc, rows = scratch
+    row = client.get(f"/dashboard/documents/{rows[0]['_id']}").json()
+    resp = client.post(f"/dashboard/unique-documents/{doc['_id']}/placements",
+                       json={"state_id": row["state_id"], "organization_id": row["organization_id"]})
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert row["document_id"] in detail and row["row_id"] in detail and row["state"] in detail
+
+
+def test_a_new_placement_takes_whichever_id_the_caller_holds(client, scratch):
+    """The table row and the document modal hold different ids for the same
+    thing, and either is a reasonable thing to send: a document by ObjectId or
+    ANNAM id, or the PLACEMENT the person actually clicked, by ObjectId or POP
+    id. All four reach the same document -- asserted by the 409, which names it.
+    """
+    doc, rows = scratch
+    row = client.get(f"/dashboard/documents/{rows[0]['_id']}").json()
+    body = {"state_id": row["state_id"], "organization_id": row["organization_id"]}
+    for held in (str(doc["_id"]), row["document_id"], str(rows[0]["_id"]), row["row_id"]):
+        resp = client.post(f"/dashboard/unique-documents/{held}/placements", json=body)
+        assert resp.status_code == 409, (held, resp.status_code, resp.text)
+        assert row["row_id"] in resp.json()["detail"], held
+    # An id that names nothing is a 404 and writes nothing. The 24-zero
+    # ObjectId is in here deliberately: parse_display_id() reads a bare number
+    # too, so it once parsed as display id 0 and filed this scratch placement
+    # onto ANNAM_00000, a real corpus document (see _document_for_placement).
+    for missing in ("ANNAM_49999", "POP_49999", "000000000000000000000000",
+                    "0", "ANNAM_00000_", "nonsense"):
+        resp = client.post(f"/dashboard/unique-documents/{missing}/placements", json=body)
+        assert resp.status_code == 404, (missing, resp.status_code, resp.text)
+
+
+def test_a_new_placement_names_one_state_and_exactly_one_folder(client, db, scratch):
+    """Ids only, one folder, and every vocabulary read-only -- so a bad body
+    writes nothing at all."""
+    from dashboard.models import COLL_DOCUMENTS
+
+    doc, _rows = scratch
+    url = f"/dashboard/unique-documents/{doc['_id']}/placements"
+    state = next(s for s in client.get("/dashboard/states").json() if s["name"] == "Karnataka")
+    crop = client.get("/dashboard/crops").json()[0]
+    org = client.get("/dashboard/organizations").json()[0]
+    before = db[COLL_DOCUMENTS].count_documents({"unique_document_id": doc["_id"]})
+    for body, status in (
+        ({"state_id": state["id"]}, 400),                                       # no folder
+        ({"state_id": state["id"], "crop_id": crop["id"],
+          "organization_id": org["id"]}, 400),                                  # both
+        ({"state_id": "000000000000000000000000", "crop_id": crop["id"]}, 400),  # no such state
+        ({"state_id": state["id"], "crop_id": "000000000000000000000000"}, 400),
+        ({"crop_id": crop["id"]}, 422),                                         # state_id required
+    ):
+        resp = client.post(url, json=body)
+        assert resp.status_code == status, (body, resp.status_code, resp.text)
+    assert db[COLL_DOCUMENTS].count_documents({"unique_document_id": doc["_id"]}) == before
+
+
+def test_removing_the_last_placement_keeps_the_file(client, db, scratch):
+    """Deleting a document's LAST placement must not empty its duplicate_links.
+
+    The association goes; the bytes do not. The file is still in WorkDrive and
+    the document still names it in representative_file_id, so dropping the entry
+    left the document unable to be downloaded, translated or filed again -- while
+    its file sat there the whole time. Reachable by the plainest route there is:
+    upload a document, then delete its placement.
+
+    There is no anchor ROW to go stale any more -- it was derivable from the
+    copy entry carrying the anchor file, so it is read when wanted rather than
+    stored. The anchor FILE stays: that is still the document.
+    """
+    from dashboard.models import COLL_DOCUMENTS, COLL_UNIQUE_DOCUMENTS
+
+    doc, rows = scratch
+    before = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc["_id"]})
+
+    # First of two: its own file goes with it, which is the corpus case.
+    assert client.delete(f"/dashboard/documents/{rows[0]['_id']}").status_code == 204
+    mid = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc["_id"]})
+    assert len(mid["duplicate_links"]) == len(before["duplicate_links"]) - 1
+
+    # Last one: the link stays.
+    assert client.delete(f"/dashboard/documents/{rows[1]['_id']}").status_code == 204
+    after = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc["_id"]})
+    assert after is not None, "the document must survive its last placement"
+    assert after.get("main_row_ids") == []
+    assert len(after.get("duplicate_links") or []) == 1
+    assert after.get("representative_file_id") == before.get("representative_file_id")
+    assert db[COLL_DOCUMENTS].count_documents({"unique_document_id": doc["_id"]}) == 0
+
+
+def test_a_document_with_no_placements_left_can_be_filed_again(client, db, scratch):
+    """A placement is an ASSOCIATION -- (document, state, folder) -- so it needs
+    no file of its own to exist, and this used to refuse one that had none.
+
+    The "Original" download reads representative_file_id off the DOCUMENT, not
+    off the row and not off duplicate_links, so a placement carrying no copy
+    link still downloads. Filing a document back after its last placement was
+    removed is the case that proved it: the refusal was a 409 about copy links
+    for a document whose file was reachable in WorkDrive all along.
+    """
+    from dashboard.models import COLL_DOCUMENTS, COLL_UNIQUE_DOCUMENTS
+
+    doc, rows = scratch
+    for row in rows:
+        assert client.delete(f"/dashboard/documents/{row['_id']}").status_code == 204
+
+    state = _vocab_id(client, "states", "Karnataka")
+    crop = client.get("/dashboard/crops").json()[0]
+    resp = client.post(f"/dashboard/unique-documents/{doc['_id']}/placements",
+                       json={"state_id": state, "crop_id": crop["id"]})
+    assert resp.status_code == 201, resp.text
+    out = resp.json()
+    assert (out["state"], out["crop"]) == ("Karnataka", crop["name"])
+    # The file comes back with it: the document is downloadable and translatable
+    # again, from the anchor it never stopped naming.
+    assert out["representative_file_id"] == doc.get("representative_file_id")
+    after = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc["_id"]})
+    assert len(after["main_row_ids"]) == 1
+    assert db[COLL_DOCUMENTS].count_documents({"unique_document_id": doc["_id"]}) == 1
+
+
+def test_filing_a_stranded_document_restores_its_anchor_link(client, db, scratch):
+    """The repair path for a document the OLD unlink already stranded: copy
+    links empty, representative_file_id still naming a real file in WorkDrive.
+
+    Filing it rebuilds the entry from that file id, so the download and the
+    translation source come back without anyone editing the database by hand.
+    This is the state a document reaches by being uploaded and then having its
+    only placement deleted, which is exactly how it was found.
+    """
+    from dashboard.models import COLL_UNIQUE_DOCUMENTS
+
+    doc, _rows = scratch
+    stranded = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc["_id"]})
+    file_id = stranded["duplicate_links"][0]["zoho_file_id"]
+    db[COLL_UNIQUE_DOCUMENTS].update_one(
+        {"_id": doc["_id"]},
+        {"$set": {"duplicate_links": [], "representative_file_id": file_id}})
+
+    state = _vocab_id(client, "states", "Karnataka")
+    crop = client.get("/dashboard/crops").json()[0]
+    resp = client.post(f"/dashboard/unique-documents/{doc['_id']}/placements",
+                       json={"state_id": state, "crop_id": crop["id"]})
+    assert resp.status_code == 201, resp.text
+
+    after = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc["_id"]})
+    links = after.get("duplicate_links") or []
+    assert [l["zoho_file_id"] for l in links] == [file_id]
+    # The entry names the placement that brought it back, not the deleted one,
+    # so the anchor ROW reads back correctly without ever being stored.
+    new_row = int(resp.json()["row_id"].removeprefix("POP_"))
+    assert links[0]["row_id"] == new_row
+
+
+def test_a_placement_needs_no_file_of_its_own(client, db, scratch):
+    """The same point without the delete: a document stripped of its copy links
+    is still filed, and the new row carries no invented link.
+
+    """
+    from dashboard.models import COLL_DOCUMENTS, COLL_UNIQUE_DOCUMENTS
+
+    doc, _rows = scratch
+    db[COLL_UNIQUE_DOCUMENTS].update_one(
+        {"_id": doc["_id"]},
+        {"$set": {"duplicate_links": [], "representative_file_id": None}})
+
+    state = _vocab_id(client, "states", "Karnataka")
+    crop = client.get("/dashboard/crops").json()[0]
+    resp = client.post(f"/dashboard/unique-documents/{doc['_id']}/placements",
+                       json={"state_id": state, "crop_id": crop["id"]})
+    assert resp.status_code == 201, resp.text
+
+    after = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc["_id"]})
+    assert after.get("duplicate_links") == []
+    row_id = resp.json()["row_id"]
+    assert row_id in [r["row_id"] for r in
+                      client.get(f"/dashboard/unique-documents/{doc['_id']}/placements").json()]
+    assert db[COLL_DOCUMENTS].count_documents({"unique_document_id": doc["_id"]}) == 3
+
+
+def test_kvk_is_its_own_vocabulary_not_an_organisation(client):
+    """`pop_organizations` holds FOLDER names, one of which was called "KVK
+    Files" until it moved to crop "All". Which KVK a document came from is a
+    different question, so the two vocabularies must not leak into each other's
+    dropdowns."""
+    kvks = {k["name"] for k in client.get("/dashboard/kvks").json()}
+    folders = {f["name"] for f in client.get("/dashboard/folders").json()}
+    organizations = {o["name"] for o in client.get("/dashboard/organizations").json()}
+    assert kvks, "no KVKs -- run scripts/sync_lgd.py against this database"
+    # The folder entry and the KVK vocabulary are separate things.
+    assert "KVK Files" not in kvks
+    # No synced KVK is offered as a folder.
+    assert not (kvks - {"All"}) & folders
+
+
+def test_the_synced_vocabularies_are_readable_and_carry_their_codes(client):
+    """The writes are gone (test_no_request_can_write_any_vocabulary); what the
+    frontend depends on is that every READ still works and carries the LGD code
+    -- which is now what the OCR language table is keyed by, so a missing code
+    is a document with no language rather than a cosmetic gap."""
+    for path in ("states", "districts", "kvks"):
+        entries = client.get(f"/dashboard/{path}").json()
+        assert entries, f"no {path} -- run scripts/sync_lgd.py against this database"
+        # "All" is parentless and codeless by design; a test fixture's throwaway
+        # state has no code either, and is the only other thing without one.
+        coded = [e["code"] for e in entries if e["code"] is not None]
+        assert len(coded) > 30 if path == "states" else len(coded) > 100, path
+        assert len(set(coded)) == len(coded), f"{path} codes are not unique"
+        assert next(e for e in entries if e["name"] == "All")["code"] is None \
+            if path != "states" else True
+
+
+def test_copy_entries_carry_the_whole_placement(client, db, scratch):
+    """The documents listing has no state or folder of its own -- a document can
+    be filed in several places. It reports each COPY's, read from that copy's
+    placement, so a reader can show the anchor's without a second request per
+    row.
+
+    State and folder only. District and KVK used to be here too, and they were
+    the same fact repeated per copy: they are the DOCUMENT's fields, so the
+    document carries them once and no copy can disagree.
+    """
+    doc, rows = scratch
+    district, kvk = _a_district(client, with_kvk=True)
+    url = f"/dashboard/unique-documents/{doc['_id']}"
+    client.patch(url, json={"district_id": district["id"], "kvk_id": kvk["id"]})
+    try:
+        out = client.get(url).json()
+        by_row = {c["row_id"]: c for c in out["duplicate_links"]}
+        assert by_row[rows[0]["row_id"]]["state"] == "Scratchland"
+        # The sibling copy is a different placement and says so.
+        assert by_row[rows[1]["row_id"]]["crop"] != by_row[rows[0]["row_id"]]["crop"]
+        # Neither copy carries a district; the document does, once.
+        assert all("district" not in c and "kvk" not in c for c in out["duplicate_links"])
+        assert (out["district"], out["kvk"]) == (district["name"], kvk["name"])
+    finally:
+        client.patch(url, json={"district_id": "", "kvk_id": ""})
+
+
+def test_the_documents_listing_filters_on_placements_too(client, scratch):
+    """state/crop/district/kvk live on the placement, so they used to be
+    main-table-only. The documents listing now lifts them: "documents filed in
+    Keralam" is every document with a Keralam placement."""
+    doc, rows = scratch
+    scratchland = _vocab_id(client, "states", "Scratchland")
+    docs = client.get("/dashboard/unique-documents",
+                      params={"filter[state_id]": scratchland}).json()
+    assert docs["total"] == 1 and docs["items"][0]["id"] == str(doc["_id"])
+
+    # One document, two placements -- counted once here and twice on the main
+    # table. That is the whole distinction between the two listings.
+    placements = client.get("/dashboard/documents",
+                            params={"filter[state_id]": scratchland}).json()
+    assert placements["total"] == 2
+
+    # Combines with the document-level filters rather than replacing them.
+    both = client.get("/dashboard/unique-documents",
+                      params={"filter[state_id]": scratchland,
+                              "filter[shareable_name]": "scratch-test"})
+    assert both.json()["total"] == 1
+    assert client.get("/dashboard/unique-documents",
+                      params={"filter[state_id]": scratchland,
+                              "filter[shareable_name]": "no-such-document"}).json()["total"] == 0
+    assert client.get("/dashboard/unique-documents",
+                      params={"filter[state_id]": "0" * 24}).json()["total"] == 0
+
+    # Every filtered document is a real subset, and never more than the
+    # placements that matched.
+    for name in ("Keralam", "Punjab"):
+        state_id = _vocab_id(client, "states", name)
+        d = client.get("/dashboard/unique-documents",
+                       params={"filter[state_id]": state_id}).json()["total"]
+        p = client.get("/dashboard/documents",
+                       params={"filter[state_id]": state_id}).json()["total"]
+        assert 0 < d <= p, name
+
+
+def test_the_document_patch_reaches_every_placement(client, db, scratch):
+    """One edit, one document, every placement -- including district and kvk.
+
+    This test used to assert the opposite: that the modal wrote district/kvk to
+    the document's ANCHOR placement and left its siblings alone, so one copy
+    showed Wayanad and the others showed nothing. There was no good answer there
+    for a document filed in three folders, which is why the fields moved.
+    """
+    doc, rows = scratch
+    district, kvk = _a_district(client, with_kvk=True)
+    url = f"/dashboard/unique-documents/{doc['_id']}"
+    try:
+        out = client.patch(url, json={"district_id": district["id"], "kvk_id": kvk["id"],
+                                      "num_pages": 11}).json()
+        assert (out["district"], out["kvk"]) == (district["name"], kvk["name"])
+        # A document-level field in the same request lands too -- one $set.
+        assert out["num_pages"] == 11
+        # EVERY placement reports it, not just one.
+        for row in rows:
+            shown = client.get(f"/dashboard/documents/{row['_id']}").json()
+            assert (shown["district"], shown["kvk"]) == (district["name"], kvk["name"])
+        # The copies carry neither: it is not theirs to differ on.
+        assert all("district" not in c for c in out["duplicate_links"])
+
+        # "" clears, and clears only what was named.
+        cleared = client.patch(url, json={"district_id": ""}).json()
+        assert cleared["district"] is None and cleared["kvk"] == kvk["name"]
+        assert client.patch(url, json={"district_id": "0" * 24}).status_code == 400
+    finally:
+        client.patch(url, json={"district_id": "", "kvk_id": ""})
+
+
+def test_the_event_stream_keepalive_is_visible_to_a_browser(client):
+    """The keepalive is a NAMED event, not an SSE comment, because a comment is
+    invisible to EventSource.
+
+    This is the frontend's only way to tell a live-but-quiet stream from a dead
+    one. EventSource's own retry fires when the connection ERRORS or CLOSES; the
+    failure it cannot see is a socket a proxy or NAT has silently stopped
+    forwarding, which stays "open" and delivers nothing forever. With a comment
+    keepalive there was nothing a watchdog could reset on, so a stale queue was
+    only ever corrected by the fallback poll.
+    """
+    from dashboard.events import KEEPALIVE_SECONDS
+
+    deadline = time.monotonic() + KEEPALIVE_SECONDS + 15
+    seen: list[str] = []
+    with client.stream("GET", "/dashboard/events",
+                       timeout=KEEPALIVE_SECONDS + 15) as stream:
+        assert stream.status_code == 200
+        assert stream.headers["content-type"].startswith("text/event-stream")
+        # Proxies buffer a stream into silence without this, which looks exactly
+        # like a dead connection.
+        assert stream.headers.get("x-accel-buffering") == "no"
+        for line in stream.iter_lines():
+            seen.append(line)
+            if line == "event: ping":
+                break
+            if time.monotonic() > deadline:
+                raise AssertionError(f"no ping within the deadline: {seen[:12]}")
+
+    # `retry` tells EventSource how soon to come back after a drop; without it
+    # the browser picks its own interval.
+    assert any(l.startswith("retry:") for l in seen), seen[:12]
+    assert "event: ping" in seen, seen[:12]
+
+
+def test_an_upload_with_a_district_comes_back_as_json(client, db):
+    """A real POST, because the 500 this guards was invisible to every
+    unit-level test of the parsing.
+
+    district_id/kvk_id are stored as ObjectIds -- they are references, and the
+    worker re-reads them as such -- and they now live in the item's `metadata`,
+    which is served as a plain dict. An ObjectId in there reaches the JSON
+    serializer raw and fails the WHOLE response with a 500, after the item has
+    already been queued: the upload happened, and the caller was told it
+    errored. `_stringify_ids` covered the placements, which is where these two
+    used to live, so nothing covered them once they moved.
+    """
+    district, kvk = _a_district(client, with_kvk=True)
+    resp = client.post(
+        "/dashboard/uploads",
+        files={"file": ("district-json.pdf", _unique_pdf(), "application/pdf")},
+        data={"language": "eng",
+              "district_id": district["id"], "kvk_id": kvk["id"],
+              "placements_json": _placements(client, ("Keralam", ["Paddy"]))})
+    assert resp.status_code == 201, resp.text
+    item = resp.json()
+    try:
+        # Serialized as strings, and still the ids that were sent.
+        assert item["metadata"]["district_id"] == district["id"]
+        assert item["metadata"]["kvk_id"] == kvk["id"]
+        # And not on the placement, which has no district to carry.
+        assert all("district_id" not in p for p in item["placements"])
+        # Listing the queue serializes them the same way -- a different code
+        # path to the same helper, and the one the Add Document box polls.
+        listed = next(i for i in client.get("/dashboard/uploads").json()
+                      if i["id"] == item["id"])
+        assert listed["metadata"]["district_id"] == district["id"]
+    finally:
+        client.delete(f"/dashboard/uploads/{item['id']}")
+
+
+def test_an_upload_names_one_district_for_the_document_not_one_per_group(client, db):
+    """The Add Document form sends district_id / kvk_id as fields of the UPLOAD,
+    by id, and they land on the document -- so they are the same whichever
+    folders it is filed in. Optional: a form that sends neither behaves exactly
+    as before, which is every upload so far.
+
+    They used to arrive inside each placement group and be written to the
+    placement rows. That gave one document as many districts as it had folders,
+    with nothing to reconcile them.
+    """
+    from bson import ObjectId
+
+    from dashboard.queue_worker import _optional_ref
+    from dashboard.routes_uploads import _checked_ref, _parse_placements
+
+    district, kvk = _a_district(client, with_kvk=True)
+    state_id = _vocab_id(client, "states", "Keralam")
+    crop_id = _vocab_id(client, "crops", "Paddy")
+
+    # The placement groups carry state and folder, and nothing else.
+    pairs = _parse_placements(db, json.dumps([{"state_id": state_id, "crop_ids": [crop_id]}]))
+    assert len(pairs) == 1
+    assert "district_id" not in pairs[0] and "kvk_id" not in pairs[0]
+
+    # A group still sending one is refused, so a caller on the old shape is told
+    # rather than having it silently dropped.
+    with pytest.raises(Exception) as caught:
+        _parse_placements(db, json.dumps([
+            {"state_id": state_id, "crop_ids": [crop_id], "district_id": district["id"]}]))
+    assert "not a placement field any more" in str(getattr(caught.value, "detail", caught.value))
+
+    # The upload's own fields, verified at submit and read back by the worker
+    # from the item's metadata.
+    form = {"district_id": district["id"], "kvk_id": kvk["id"]}
+    checked = {k: _checked_ref(db, form, k) for k in ("district_id", "kvk_id")}
+    assert checked["district_id"] == ObjectId(district["id"])
+    assert checked["kvk_id"] == ObjectId(kvk["id"])
+    assert _optional_ref(db, checked, "district") == ObjectId(district["id"])
+    assert _optional_ref(db, checked, "kvk") == ObjectId(kvk["id"])
+
+    # An id the sync does not have fails at SUBMIT, not at approval.
+    with pytest.raises(Exception) as caught:
+        _checked_ref(db, {"district_id": "0" * 24}, "district_id")
+    assert "district" in str(getattr(caught.value, "detail", caught.value))
+
+    # Neither sent -> nothing stored.
+    assert _checked_ref(db, {}, "district_id") is None
+    assert _optional_ref(db, {}, "district") is None
+
+
+# -- who may do what (dashboard/access.py) ----------------------------------------
+# Admin is a ROLE, sent by the frontend. Edit approver and upload approver are
+# LISTS kept here, which an admin fills from the user dropdown. Everyone else is
+# an expert: browse, download, upload.
+
+
+@pytest.fixture
+def members(client):
+    """Put made-up users into the approval lists for one test, and take them
+    out again. Returns add(list_name) -> user_id."""
+    added = []
+
+    def add(list_name: str) -> str:
+        user_id = str(ObjectId())
+        resp = client.post(f"/dashboard/user-management/{list_name}",
+                           json={"user_id": user_id, "name": "Render Test", "email": "rt@example.org"})
+        assert resp.status_code == 201, resp.text
+        added.append((list_name, user_id))
+        return user_id
+
+    yield add
+    for list_name, user_id in added:
+        client.delete(f"/dashboard/user-management/{list_name}/{user_id}")
+
+
+def test_a_write_without_a_caller_is_refused_but_reads_stay_open(client):
+    """No X-User-Id is a 401, not an anonymous expert -- an anonymous queue
+    would come back empty and look like a working answer."""
+    with httpx.Client(base_url=BASE_URL, timeout=30.0) as anonymous:
+        assert anonymous.get("/dashboard/stats").status_code == 200
+        assert anonymous.get("/dashboard/documents", params={"page_size": 1}).status_code == 200
+        assert anonymous.get("/dashboard/me").status_code == 401
+        assert anonymous.get("/dashboard/uploads").status_code == 401
+        assert anonymous.patch(f"/dashboard/unique-documents/{'0' * 24}",
+                               json={"advisory_name": "x"}).status_code == 401
+
+
+def test_me_says_what_the_caller_may_do(client, members):
+    admin = client.get("/dashboard/me").json()
+    assert admin == {"user_id": ADMIN_ID, "role": "admin", "is_admin": True, "can_edit": True,
+                     "can_approve_uploads": False, "can_translate": True}
+
+    expert = str(ObjectId())
+    mine = client.get("/dashboard/me", headers=_as(expert, "moderator")).json()
+    # A moderator is an expert here: only "admin" is a role that grants anything.
+    assert (mine["is_admin"], mine["can_edit"], mine["can_approve_uploads"], mine["can_translate"]) \
+        == (False, False, False, False)
+
+    editor, approver = members("edit"), members("upload")
+    assert client.get("/dashboard/me", headers=_as(editor)).json()["can_edit"] is True
+    flags = client.get("/dashboard/me", headers=_as(approver)).json()
+    assert (flags["can_approve_uploads"], flags["can_edit"], flags["can_translate"]) == (True, False, False)
+
+
+def test_the_approval_lists_are_admin_only(client, members):
+    expert = _as(str(ObjectId()))
+    assert client.get("/dashboard/user-management/edit", headers=expert).status_code == 403
+    assert client.post("/dashboard/user-management/edit", headers=expert,
+                       json={"user_id": str(ObjectId())}).status_code == 403
+
+    user_id = members("edit")
+    listed = client.get("/dashboard/user-management/edit").json()
+    entry = next(e for e in listed if e["user_id"] == user_id)
+    assert (entry["name"], entry["email"], entry["added_by"]) == ("Render Test", "rt@example.org", ADMIN_ID)
+    # In one list is not in the other.
+    assert user_id not in [e["user_id"] for e in client.get("/dashboard/user-management/upload").json()]
+
+    assert client.post("/dashboard/user-management/edit", json={"user_id": user_id}).status_code == 409
+    assert client.post("/dashboard/user-management/edit", json={"user_id": "Ramesh"}).status_code == 400
+    assert client.get("/dashboard/user-management/translate").status_code == 404
+
+    assert client.delete(f"/dashboard/user-management/edit/{user_id}").status_code == 204
+    assert client.delete(f"/dashboard/user-management/edit/{user_id}").status_code == 404
+
+
+def test_only_an_editor_changes_documents(client, scratch, members):
+    doc, rows = scratch
+    doc_id = str(doc["_id"])
+    expert = _as(str(ObjectId()))
+    assert client.patch(f"/dashboard/unique-documents/{doc_id}", headers=expert,
+                        json={"advisory_name": "by an expert"}).status_code == 403
+    assert client.delete(f"/dashboard/documents/{rows[0]['_id']}", headers=expert).status_code == 403
+    assert client.post(f"/dashboard/unique-documents/{doc_id}/merge", headers=expert,
+                       json={"absorb": []}).status_code == 403
+    # ...and an expert can still READ it.
+    assert client.get(f"/dashboard/unique-documents/{doc_id}", headers=expert).status_code == 200
+
+    editor = _as(members("edit"))
+    resp = client.patch(f"/dashboard/unique-documents/{doc_id}", headers=editor,
+                        json={"advisory_name": "by an edit approver"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["advisory_name"] == "by an edit approver"
+
+
+def test_only_an_admin_translates(client, scratch, members):
+    """Every translation action, the translation queue included -- even for an
+    edit approver, who may otherwise do everything an admin does to a document."""
+    doc_id = str(scratch[0]["_id"])
+    for who in (_as(str(ObjectId())), _as(members("edit")), _as(members("upload"))):
+        assert client.get("/dashboard/translation-jobs", headers=who).status_code == 403
+        assert client.post(f"/dashboard/unique-documents/{doc_id}/translate", headers=who).status_code == 403
+        assert client.post(f"/dashboard/unique-documents/{doc_id}/review", headers=who,
+                           files={"file": ("r.docx", b"x", "application/octet-stream")}).status_code == 403
+        assert client.delete(f"/dashboard/unique-documents/{doc_id}/translation", headers=who).status_code == 403
+    assert client.get("/dashboard/translation-jobs").status_code == 200
+
+
+def _drop_upload(item_id: str) -> None:
+    """Remove a test's upload whatever stage it was left at -- the API only lets
+    the person holding it do that, and a failed assertion can leave it anywhere.
+    The server runs on this machine, so its staged file is ours to remove too."""
+    from dashboard import queue_worker
+    from dashboard.db import get_database
+    from dashboard.models import COLL_UPLOAD_QUEUE_ITEMS
+
+    get_database()[COLL_UPLOAD_QUEUE_ITEMS].delete_one({"_id": ObjectId(item_id)})
+    queue_worker.unstage(ObjectId(item_id))
+
+
+def _queue_ids(client, headers) -> list[str]:
+    return [i["id"] for i in client.get("/dashboard/uploads", headers=headers).json()]
+
+
+def test_an_expert_upload_goes_through_the_approvers_to_the_admins(client, db, members):
+    """The whole chain, both declines included:
+
+        expert -(approve)-> approver -(approve)-> admin -(decline)-> approver -(decline)-> expert
+    """
+    expert, other = _as(str(ObjectId())), _as(str(ObjectId()))
+    approver = _as(members("upload"))
+    item_id = _submit(client, headers=expert, uploaded_by="Render Test Expert",
+                      placements_json=_placements(client, ("Karnataka", ["Paddy"])))
+    try:
+        item = _await_review(client, item_id, headers=expert)
+        # It starts with its uploader, who may edit, approve or remove it --
+        # and nobody else sees it yet.
+        assert (item["stage"], item["level"], item["upload_level"]) == ("expert", 0, 0)
+        assert item["actions"] == {"can_edit": True, "can_approve": True, "can_decline": False,
+                                   "can_decide": False, "can_discard": False, "can_resubmit": False,
+                                   "can_remove": True}
+        assert item_id not in _queue_ids(client, approver)
+        assert client.post(f"/dashboard/uploads/{item_id}/approve", headers=other).status_code == 404
+        item = client.post(f"/dashboard/uploads/{item_id}/approve", headers=expert).json()
+        assert (item["stage"], item["level"], item["upload_level"]) == ("approver", 1, 0)
+        # The uploader sees it but can no longer withdraw or decide it.
+        assert not any(item["actions"].values()), item["actions"]
+        assert client.post(f"/dashboard/uploads/{item_id}/cancel", headers=expert).status_code == 403
+        # Another expert does not see it at all; the admins not yet.
+        assert item_id not in _queue_ids(client, other)
+        assert client.get(f"/dashboard/uploads/{item_id}", headers=other).status_code == 404
+        assert item_id not in _queue_ids(client, None)
+        # An admin's /add on it is a 409 that says where it is, not a 404: an
+        # admin meets an item at the approvers only after another admin
+        # declined it back, i.e. after losing a race (UM-009).
+        early = client.post(f"/dashboard/uploads/{item_id}/add")
+        assert early.status_code == 409 and "upload approvers" in early.json()["detail"]
+
+        # The approver: preview, edit, approve.
+        seen = next(i for i in client.get("/dashboard/uploads", headers=approver).json() if i["id"] == item_id)
+        # The uploader by name, not only by account id (UM-002).
+        assert seen["uploaded_by"] == "Render Test Expert"
+        assert seen["actions"] == {"can_edit": True, "can_approve": True, "can_decline": True,
+                                   "can_decide": False, "can_discard": False, "can_resubmit": False,
+                                   "can_remove": False}
+        preview = client.get(f"/dashboard/uploads/{item_id}/file", headers=approver)
+        assert preview.status_code == 200 and preview.content.startswith(_MINIMAL_PDF)
+        assert client.post(f"/dashboard/uploads/{item_id}/add", headers=approver).status_code == 403
+        edited = client.patch(f"/dashboard/uploads/{item_id}", headers=approver,
+                              json={"advisory_name": "fixed by approver",
+                                    "placements": json.loads(_placements(client, ("Keralam", ["Coconut"])))})
+        assert edited.status_code == 200, edited.text
+        assert edited.json()["metadata"]["advisory_name"] == "fixed by approver"
+        assert [(p["state"], p["crop"]) for p in edited.json()["placements"]] == [("Keralam", "Coconut")]
+        assert client.patch(f"/dashboard/uploads/{item_id}", headers=approver,
+                            json={"uploaded_by": "someone else"}).status_code == 422
+        assert client.post(f"/dashboard/uploads/{item_id}/approve", headers=approver).json()["stage"] == "admin"
+        assert item_id not in _queue_ids(client, approver)
+        # A second approver clicking Approve a moment later is told it was
+        # already approved, and by whom -- not "upload not found" (UM-009).
+        late = client.post(f"/dashboard/uploads/{item_id}/approve", headers=approver)
+        assert late.status_code == 409 and late.json()["detail"].startswith("already approved by Render Test")
+
+        # The admin declines it back to the approvers, with a note.
+        assert client.post(f"/dashboard/uploads/{item_id}/decline", json={"note": "  "}).status_code == 400
+        back = client.post(f"/dashboard/uploads/{item_id}/decline", json={"note": "wrong season"}).json()
+        assert (back["stage"], back["admin_note"]) == ("approver", "wrong season")
+        assert item_id not in _queue_ids(client, None)
+
+        # The approver declines it on to the uploader.
+        back = client.post(f"/dashboard/uploads/{item_id}/decline", headers=approver,
+                           json={"note": "please re-scan"}).json()
+        assert (back["stage"], back["level"], back["upload_level"]) == ("expert", 0, 0)
+        assert item_id not in _queue_ids(client, approver)
+
+        mine = next(i for i in client.get("/dashboard/uploads", headers=expert).json() if i["id"] == item_id)
+        assert (mine["approver_note"], mine["admin_note"]) == ("please re-scan", "wrong season")
+        assert mine["actions"]["can_remove"] is True
+        assert (mine["actions"]["can_edit"], mine["actions"]["can_resubmit"],
+                mine["actions"]["can_decline"]) == (True, True, False)
+
+        # The uploader corrects it and sends it back to the approvers -- nobody
+        # else may (to them it is not even visible while it is with its
+        # uploader), and the approvers' note is cleared once it is answered
+        # (UM-005).
+        fix = {"season": "Kharif", "placements": json.loads(_placements(client, ("Keralam", ["Paddy"])))}
+        assert client.patch(f"/dashboard/uploads/{item_id}", headers=other, json=fix).status_code == 404
+        # An approver is told it went back to the uploader (409), a stranger
+        # learns nothing (404).
+        assert client.patch(f"/dashboard/uploads/{item_id}", headers=approver, json=fix).status_code == 409
+        fixed = client.patch(f"/dashboard/uploads/{item_id}", headers=expert, json=fix)
+
+        assert fixed.status_code == 200, fixed.text
+        assert fixed.json()["metadata"]["season"] == "Kharif"
+        assert client.post(f"/dashboard/uploads/{item_id}/resubmit", headers=approver).status_code == 404
+        again = client.post(f"/dashboard/uploads/{item_id}/resubmit", headers=expert)
+        assert again.status_code == 200, again.text
+        assert (again.json()["stage"], again.json()["approver_note"]) == ("approver", None)
+        assert client.post(f"/dashboard/uploads/{item_id}/resubmit", headers=expert).status_code == 403
+        assert item_id in _queue_ids(client, approver)
+        # Once it is with the approvers again, the uploader can no longer edit it.
+        assert client.patch(f"/dashboard/uploads/{item_id}", headers=expert, json=fix).status_code == 403
+
+        # Taken off the approval list while the item still waits there: told
+        # so, rather than "upload not found" (UM-009).
+        gone = _as(str(ObjectId()))
+        refused = client.post(f"/dashboard/uploads/{item_id}/approve", headers=gone)
+        assert (refused.status_code, refused.json()["detail"]) == (403, "you are no longer an upload approver")
+
+        # Declined once more, and this time the uploader removes it instead.
+        client.post(f"/dashboard/uploads/{item_id}/decline", headers=approver, json={"note": "still wrong"})
+        assert client.delete(f"/dashboard/uploads/{item_id}", headers=other).status_code == 404
+        assert client.delete(f"/dashboard/uploads/{item_id}", headers=expert).status_code == 204
+        assert client.get(f"/dashboard/uploads/{item_id}", headers=expert).status_code == 404
+    finally:
+        client.delete(f"/dashboard/uploads/{item_id}", headers=expert)
+        _drop_upload(item_id)
+
+
+def test_an_approver_or_admin_upload_starts_at_their_own_level(client, members):
+    """An approver's own upload waits on them until they approve it on to the
+    admins; an admin's starts with the admins. Neither is ever declined below
+    the level it came from: an admin's has nobody to go back to, an
+    approver's goes back to the approvers once and stops there."""
+    approver = _as(members("upload"))
+    for headers, upload_level in ((approver, 1), (None, 2)):
+        item_id = _submit(client, headers=headers,
+                          placements_json=_placements(client, ("Karnataka", ["Paddy"])))
+        try:
+            item = _await_review(client, item_id, headers=headers)
+            if upload_level == 1:
+                assert (item["stage"], item["level"]) == ("approver", 1)
+                assert (item["actions"]["can_approve"], item["actions"]["can_remove"],
+                        item["actions"]["can_decline"], item["actions"]["can_decide"]) == (True, True, False, False)
+                item = client.post(f"/dashboard/uploads/{item_id}/approve", headers=approver).json()
+            assert (item["stage"], item["level"], item["upload_level"]) == ("admin", 2, upload_level)
+            assert item_id in _queue_ids(client, None)
+            mine = client.get(f"/dashboard/uploads/{item_id}").json()
+            assert mine["actions"]["can_decline"] is (upload_level < 2)
+            declined = client.post(f"/dashboard/uploads/{item_id}/decline", json={"note": "fix it"})
+            if upload_level == 2:
+                assert declined.status_code == 409, declined.text
+                continue
+            assert (declined.json()["stage"], declined.json()["level"]) == ("approver", 1)
+            # Back at the approver's own level: they may edit, approve or
+            # remove it, but there is no expert to decline it to.
+            back = client.get(f"/dashboard/uploads/{item_id}", headers=approver).json()
+            assert (back["actions"]["can_decline"], back["actions"]["can_approve"],
+                    back["actions"]["can_remove"]) == (False, True, True)
+            assert client.post(f"/dashboard/uploads/{item_id}/decline", headers=approver,
+                               json={"note": "no"}).status_code == 409
+            assert client.delete(f"/dashboard/uploads/{item_id}", headers=approver).status_code == 204
+        finally:
+            client.post(f"/dashboard/uploads/{item_id}/cancel")
+            _drop_upload(item_id)
+
+
+def test_a_concurrent_decision_on_one_upload_lands_once(client, db, members):
+    """Two approvers approving the same item: the second finds it gone from
+    their stage, rather than both moving it."""
+    first, second = _as(members("upload")), _as(members("upload"))
+    expert = _as(str(ObjectId()))
+    item_id = _submit(client, headers=expert, placements_json=_placements(client, ("Karnataka", ["Paddy"])))
+    try:
+        _await_review(client, item_id, headers=expert)
+        client.post(f"/dashboard/uploads/{item_id}/approve", headers=expert)
+        assert client.post(f"/dashboard/uploads/{item_id}/approve", headers=first).status_code == 200
+        late = client.post(f"/dashboard/uploads/{item_id}/approve", headers=second)
+        assert late.status_code == 409 and late.json()["detail"].startswith("already approved"), late.text
+    finally:
+        client.post(f"/dashboard/uploads/{item_id}/cancel")
+        _drop_upload(item_id)
+
+
+def test_the_same_file_cannot_be_queued_twice(client, members):
+    """An upload is not in the catalogue until an admin files it, so the
+    catalogue check cannot see a copy still in review. The queue is checked at
+    submit: the second copy is refused, whoever sends it and whatever stage the
+    first one is at, and goes through once the first is removed."""
+    expert, approver = _as(str(ObjectId())), _as(members("upload"))
+    pdf = _unique_pdf()
+    placements = _placements(client, ("Keralam", ["Paddy"]))
+    first = _submit(client, expert, pdf=pdf, placements_json=placements)
+    try:
+        for who in (expert, approver, None):
+            resp = client.post("/dashboard/uploads", headers=who,
+                               files={"file": ("again.pdf", pdf, "application/pdf")},
+                               data={"language": "eng", "placements_json": placements})
+            assert resp.status_code == 409, resp.text
+            assert "already in the upload queue" in resp.json()["detail"]
+            assert "render_test.pdf" in resp.json()["detail"]
+        # A different file is not held up by it.
+        _drop_upload(_submit(client, expert, placements_json=placements))
+    finally:
+        _drop_upload(first)
+    _drop_upload(_submit(client, expert, pdf=pdf, placements_json=placements))
+
+
+def test_organizations_say_their_type_and_state(client):
+    """The organisation master has entries sharing one name (17 names twice or
+    more), so each option carries the master's own `type` and `state`."""
+    orgs = client.get("/dashboard/organizations").json()
+    assert orgs and all(o["type"] in ("central", "state", "district") and o["state"] for o in orgs)
+    folders = client.get("/dashboard/folders").json()
+    assert all(f["type"] and f["state"] for f in folders if f["kind"] == "organization")
+    assert all(f["type"] is None and f["state"] is None for f in folders if f["kind"] == "crop")
+
+
+def test_a_placement_that_loses_its_pop_number_takes_the_next_one(db):
+    """Two writers can draw the same free POP number. The one that loses the
+    race moves to the next free number instead of failing the upload."""
+    from dashboard.display_id import free_row_ids
+    from dashboard.models import COLL_DOCUMENTS
+    from dashboard.queue_worker import _insert_row
+
+    taken = free_row_ids(db, 1)[0]
+    ids = []
+    try:
+        ids.append(db[COLL_DOCUMENTS].insert_one({"row_id": taken, "render_test": True}).inserted_id)
+        row = {"row_id": taken, "render_test": True}
+        ids.append(_insert_row(db, row))
+        assert row["row_id"] != taken
+        assert db[COLL_DOCUMENTS].count_documents({"row_id": row["row_id"]}) == 1
+    finally:
+        db[COLL_DOCUMENTS].delete_many({"_id": {"$in": ids}})
+
+
+def test_two_admins_deciding_one_upload_at_once_lands_once(client, db, scratch):
+    """Requests run in parallel. Two adds and a discard fired together on one
+    item: exactly one wins, the others get 409, and the document gains the
+    new folder once."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from dashboard.models import COLL_DOCUMENTS, COLL_UPLOAD_QUEUE_ITEMS
+
+    doc, _rows = scratch
+    before = db[COLL_DOCUMENTS].count_documents({"unique_document_id": doc["_id"]})
+    item_id = _submit(client, placements_json=_placements(client, ("Karnataka", ["Paddy"])))
+    try:
+        _await_review(client, item_id)
+        db[COLL_UPLOAD_QUEUE_ITEMS].update_one({"_id": ObjectId(item_id)}, {"$set": {
+            "candidates": [{"document_id": str(doc["_id"]),
+                            "document_code": f"ANNAM_{doc['display_id']:05d}",
+                            "match_type": "sha", "score": 1.0, "can_add": True,
+                            "can_create_new": False,
+                            "new_placements": [{"state": "Karnataka", "crop": "Paddy"}]}]}})
+
+        def fire(action):
+            with httpx.Client(base_url=BASE_URL, timeout=30.0, headers=_as(ADMIN_ID, "admin")) as c:
+                if action == "add":
+                    return c.post(f"/dashboard/uploads/{item_id}/add").status_code
+                return c.post(f"/dashboard/uploads/{item_id}/cancel").status_code
+
+        with ThreadPoolExecutor(3) as pool:
+            codes = list(pool.map(fire, ["add", "add", "cancel"]))
+        winners = [c for c in codes if c in (200, 204)]
+        # A loser is told someone acted first: 409 while the item is still
+        # there, 404 "no longer in the queue" once the winner discarded it.
+        assert len(winners) == 1 and all(c in (404, 409) for c in codes if c not in (200, 204)), codes
+
+        deadline = time.time() + 30
+        while time.time() < deadline and client.get(f"/dashboard/uploads/{item_id}").status_code != 404:
+            time.sleep(0.3)
+        after = db[COLL_DOCUMENTS].count_documents({"unique_document_id": doc["_id"]})
+        assert after == before + (1 if winners[0] == 200 else 0), (codes, before, after)
+    finally:
+        _drop_upload(item_id)
+
+
+def test_who_approved_an_upload_is_recorded_on_its_new_document(client, db, members, monkeypatch):
+    """The approver's and the admin's names travel with the item and land on
+    the document /new creates. The filing step runs IN THIS PROCESS, with the
+    WorkDrive upload stubbed, so the test writes nothing to Zoho."""
+    import sys
+    import types
+
+    from dashboard import queue_worker, zoho_layout
+    from dashboard.models import COLL_DOCUMENTS, COLL_UNIQUE_DOCUMENTS, COLL_UPLOAD_QUEUE_ITEMS
+
+    expert_id, approver_id, admin_id = str(ObjectId()), members("upload"), str(ObjectId())
+    expert = _as(expert_id)
+    approver = _as(approver_id)  # listed as "Render Test"
+    item_id = _submit(client, headers=expert, placements_json=_placements(client, ("Karnataka", ["Paddy"])))
+    doc_id = None
+    try:
+        _await_review(client, item_id, headers=expert)
+        client.post(f"/dashboard/uploads/{item_id}/approve", headers=expert)
+        # No name sent: the approval list's stored name is used.
+        out = client.post(f"/dashboard/uploads/{item_id}/approve", headers=approver).json()
+        assert out["approved_by_approver"] == "Render Test"
+        # Declined back by the admin, approved again by name.
+        client.post(f"/dashboard/uploads/{item_id}/decline", json={"note": "check"})
+        out = client.post(f"/dashboard/uploads/{item_id}/approve", headers=approver,
+                          json={"approved_by": "Approver Person"}).json()
+        assert out["approved_by_approver"] == "Approver Person"
+        assert out["approved_by_approver_id"] == approver_id
+
+        # The admin's claim, as POST /new makes it -- then the worker's filing,
+        # run here so the Zoho upload can be stubbed.
+        oid = ObjectId(item_id)
+        db[COLL_UPLOAD_QUEUE_ITEMS].update_one({"_id": oid}, {"$set": {
+            "status": "uploading", "approved_by_admin": "Admin Person", "approved_by_admin_id": admin_id}})
+        monkeypatch.setitem(sys.modules, "pop_server", types.SimpleNamespace(_get_zoho=lambda: None))
+        monkeypatch.setattr(zoho_layout, "upload_original", lambda *_a, **_k: "render-test-file")
+        queue_worker._finish(oid, None)
+
+        assert db[COLL_UPLOAD_QUEUE_ITEMS].find_one({"_id": oid}) is None, "the filing failed"
+        doc = db[COLL_UNIQUE_DOCUMENTS].find_one({"representative_file_id": "render-test-file"})
+        doc_id = doc["_id"]
+        assert (doc["approved_by_approver"], doc["approved_by_admin"]) == ("Approver Person", "Admin Person")
+        assert (doc["uploaded_by_id"], doc["approved_by_approver_id"], doc["approved_by_admin_id"]) == \
+            (expert_id, approver_id, admin_id)
+        served = client.get(f"/dashboard/unique-documents/{doc_id}").json()
+        assert (served["approved_by_approver"], served["approved_by_admin"]) == ("Approver Person", "Admin Person")
+        page = client.get("/dashboard/unique-documents",
+                          params={"filter[approved_by_admin]": "admin person"}).json()
+        assert [d["id"] for d in page["items"]] == [str(doc_id)]
+        assert "Admin Person" in client.get("/dashboard/approved-by-admin").json()
+        assert "Approver Person" in client.get("/dashboard/approved-by-approver").json()
+        # Document-only: the main table neither shows nor filters on them.
+        rows = client.get("/dashboard/documents",
+                          params={"filter[sha256]": doc["sha256"]}).json()["items"]
+        assert rows and all("approved_by_admin" not in r and "approved_by_approver" not in r for r in rows)
+        assert client.get("/dashboard/documents",
+                          params={"filter[approved_by_admin]": "admin person"}).status_code == 400
+        # Read-only, like uploaded_by.
+        client.patch(f"/dashboard/unique-documents/{doc_id}", json={"approved_by_admin": "Someone"})
+        assert db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": doc_id})["approved_by_admin"] == "Admin Person"
+    finally:
+        _drop_upload(item_id)
+        if doc_id is not None:
+            db[COLL_DOCUMENTS].delete_many({"unique_document_id": doc_id})
+            db[COLL_UNIQUE_DOCUMENTS].delete_one({"_id": doc_id})

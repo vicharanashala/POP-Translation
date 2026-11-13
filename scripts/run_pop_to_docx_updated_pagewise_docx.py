@@ -1,5 +1,6 @@
 import argparse
 import base64
+import html
 import json
 import os
 import re
@@ -8,11 +9,12 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import anthropic
 import fitz  # PyMuPDF
+import requests
 from bs4 import BeautifulSoup, NavigableString
 from google import genai
 from google.genai import types
@@ -282,7 +284,94 @@ def split_pdf_to_page_folders(
 # - googleSearch enabled
 # ---------------------------------------------------------------------
 
-def make_generate_content_config(enable_google_search: bool = True, thinking_level: str = "HIGH"):
+# ---------------------------------------------------------------------
+# Time limit and cancellation for one Gemini attempt.
+# A Gemini call has no time limit of its own: one that never answers blocks
+# its page forever, and a job cancel (checked only between steps) waits on it
+# forever too. So each attempt runs in a helper thread and the page thread
+# waits on it a second at a time -- checking for a cancel each second and
+# giving up once the attempt has run GEMINI_ATTEMPT_TIMEOUT_SECONDS.
+# ---------------------------------------------------------------------
+
+GEMINI_ATTEMPT_TIMEOUT_SECONDS = int(os.environ.get("GEMINI_ATTEMPT_TIMEOUT_SECONDS") or 120)
+# Flex (service_tier="flex": half price, best-effort capacity) answers in 1-15
+# minutes, so a Flex attempt gets Google's recommended 15 instead of two.
+GEMINI_FLEX_TIMEOUT_SECONDS = int(os.environ.get("GEMINI_FLEX_TIMEOUT_SECONDS") or 900)
+
+try:  # present when run inside pop_server; absent when the script runs alone
+    import _job_ctl as _ctl
+except ImportError:
+    _ctl = None
+
+
+def _check_cancel():
+    if _ctl is not None:
+        _ctl.check_cancel()
+
+
+def _sleep_cancellable(seconds: float):
+    end = time.monotonic() + seconds
+    while (left := end - time.monotonic()) > 0:
+        _check_cancel()
+        time.sleep(min(1.0, left))
+
+
+class ApiLimitReached(BaseException):
+    """Gemini refused because the credits are used up (402) or the daily
+    request limit is reached (429 ...PerDay). Retrying, or moving on to the
+    next page, only burns more refused calls, so this stops the whole job.
+    A BaseException, like a cancel, so the per-page `except Exception`
+    handlers let it through."""
+
+
+def _api_limit_message(e: BaseException) -> str | None:
+    text, code = str(e), getattr(e, "code", None)
+    if code == 402:
+        return "Gemini credits are used up -- add credit in AI Studio, then translate again"
+    if code == 429 and "spending cap" in text:
+        return "Gemini monthly spending cap reached -- raise it in AI Studio, then translate again"
+    if code == 429 and ("PerDay" in text or "per_day" in text):
+        # Google says how long until the cap resets ('retryDelay': '52715s');
+        # turned into a wall-clock time in IST, where the team works.
+        m = re.search(r"retryDelay'?\"?:\s*'?\"?(\d+)s", text)
+        if m:
+            ist = datetime.now(timezone(timedelta(hours=5, minutes=30))) + timedelta(seconds=int(m.group(1)) + 59)
+            when = ist.strftime("%-I:%M %p IST on %d %b")
+        else:
+            when = "about 5:30 AM IST"
+        return f"Gemini daily request limit reached -- it resets at {when}; translate again after that"
+    return None
+
+
+def _run_with_deadline(fn, timeout_seconds: float):
+    """Run fn() in a helper thread; return its result, re-raise its error, or
+    raise TimeoutError after timeout_seconds. A cancel raises at once. A
+    thread given up on is left to die on the client's own HTTP timeout; its
+    result is thrown away."""
+    box = {}
+    finished = threading.Event()
+
+    def run():
+        try:
+            box["value"] = fn()
+        except BaseException as e:  # noqa: BLE001 -- handed back to the waiting thread
+            box["error"] = e
+        finally:
+            finished.set()
+
+    threading.Thread(target=run, daemon=True, name="gemini-attempt").start()
+    deadline = time.monotonic() + timeout_seconds
+    while not finished.wait(1.0):
+        _check_cancel()
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"no complete reply from Gemini within {timeout_seconds}s")
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
+def make_generate_content_config(enable_google_search: bool = True, thinking_level: str = "HIGH",
+                                 service_tier: str | None = None):
     tools = []
 
     if enable_google_search:
@@ -297,7 +386,45 @@ def make_generate_content_config(enable_google_search: bool = True, thinking_lev
             thinking_level=thinking_level.upper(),
         ),
         tools=tools,
+        service_tier=service_tier,
     )
+
+
+# -- Gemini Batch API ----------------------------------------------------------
+# The same request translate_page_pdf_to_html_gemini sends, written out as one
+# line of a Batch API input file instead of sent at once. Google runs the lines
+# later (hours, not seconds) at half price and outside the daily request limit;
+# the caller (dashboard/routes_translation.py) submits, polls and collects.
+
+def gemini_batch_request(pdf_path: Path, prompt: str, enable_google_search: bool,
+                         thinking_level: str = "HIGH") -> dict:
+    png_bytes = render_pdf_page_to_png_bytes(pdf_path)
+    request = {
+        "contents": [{"role": "user", "parts": [
+            {"text": prompt},
+            {"inline_data": {"mime_type": "image/png", "data": base64.b64encode(png_bytes).decode("ascii")}},
+        ]}],
+        "generation_config": {"thinking_config": {"thinking_level": thinking_level.upper()}},
+    }
+    if enable_google_search:
+        request["tools"] = [{"google_search": {}}]
+    return request
+
+
+def gemini_batch_text_request(prompt: str, transcript: str) -> dict:
+    """One line of a batch input file for the transcript path: the same text
+    translate_transcript_to_html_gemini sends, with no thinking level and no
+    tools, as there."""
+    return {"contents": [{"role": "user", "parts": [{"text": prompt.rstrip() + "\n\n" + transcript}]}]}
+
+
+def gemini_batch_html(response: dict) -> str:
+    """The page's HTML out of one batch result's `response`; raises if empty."""
+    parts = (((response.get("candidates") or [{}])[0].get("content") or {}).get("parts")) or []
+    text = "".join(p.get("text") or "" for p in parts if not p.get("thought")).strip()
+    if not text:
+        raise RuntimeError("Empty response received from Gemini batch.")
+    return clean_html(text)
 
 
 def translate_page_pdf_to_html_gemini(
@@ -309,6 +436,7 @@ def translate_page_pdf_to_html_gemini(
     retry_wait_seconds: int,
     enable_google_search: bool,
     thinking_level: str = "HIGH",
+    service_tier: str | None = None,
 ) -> tuple[str, dict | None]:
     """
     Sends the same 300 DPI rendered page PNG the MiniMax/OpenAI paths get,
@@ -322,65 +450,77 @@ def translate_page_pdf_to_html_gemini(
     """
     png_bytes = render_pdf_page_to_png_bytes(pdf_path)
     last_error = None
+    time_limit = GEMINI_FLEX_TIMEOUT_SECONDS if service_tier == "flex" else GEMINI_ATTEMPT_TIMEOUT_SECONDS
 
-    client = genai.Client(api_key=api_key)
+    # The HTTP timeout only frees a helper thread _run_with_deadline gave up on.
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=time_limit * 1000),
+    )
     generate_content_config = make_generate_content_config(
         enable_google_search=enable_google_search,
         thinking_level=thinking_level,
+        service_tier=service_tier,
     )
 
     pname = pdf_path.parent.name
     image_size_kb = len(png_bytes) / 1024
 
     for attempt in range(1, max_retries + 1):
+        _check_cancel()
         attempt_start = time.perf_counter()
 
         try:
-            collected = []
-            usage_metadata = None
-
             log(
                 f"{pname} | attempt {attempt}/{max_retries} | "
-                f"request sent to Gemini | image_size={image_size_kb:.1f} KB | thinking_level={thinking_level}"
+                f"request sent to Gemini | image_size={image_size_kb:.1f} KB | thinking_level={thinking_level} | "
+                f"tier={service_tier or 'standard'} | time_limit={time_limit}s"
             )
 
-            chunk_count = 0
-            text_chunk_count = 0
-            last_stream_log = time.perf_counter()
+            def stream(attempt=attempt, attempt_start=attempt_start):
+                collected = []
+                usage_metadata = None
+                chunk_count = 0
+                text_chunk_count = 0
+                last_stream_log = time.perf_counter()
 
-            for chunk in client.models.generate_content_stream(
-                model=model,
-                contents=[
-                    types.Content(
-                        role="user",
-                        parts=[
-                            types.Part.from_text(text=prompt),
-                            types.Part.from_bytes(
-                                data=png_bytes,
-                                mime_type="image/png",
-                            ),
-                        ],
-                    ),
-                ],
-                config=generate_content_config,
-            ):
-                chunk_count += 1
+                for chunk in client.models.generate_content_stream(
+                    model=model,
+                    contents=[
+                        types.Content(
+                            role="user",
+                            parts=[
+                                types.Part.from_text(text=prompt),
+                                types.Part.from_bytes(
+                                    data=png_bytes,
+                                    mime_type="image/png",
+                                ),
+                            ],
+                        ),
+                    ],
+                    config=generate_content_config,
+                ):
+                    chunk_count += 1
 
-                if getattr(chunk, "usage_metadata", None):
-                    usage_metadata = chunk.usage_metadata
+                    if getattr(chunk, "usage_metadata", None):
+                        usage_metadata = chunk.usage_metadata
 
-                if text := chunk.text:
-                    collected.append(text)
-                    text_chunk_count += 1
+                    if text := chunk.text:
+                        collected.append(text)
+                        text_chunk_count += 1
 
-                now = time.perf_counter()
-                if now - last_stream_log >= 30:
-                    log(
-                        f"{pname} | attempt {attempt} | still streaming... "
-                        f"elapsed={format_duration(now - attempt_start)} | "
-                        f"chunks={chunk_count} | text_chunks={text_chunk_count}"
-                    )
-                    last_stream_log = now
+                    now = time.perf_counter()
+                    if now - last_stream_log >= 30:
+                        log(
+                            f"{pname} | attempt {attempt} | still streaming... "
+                            f"elapsed={format_duration(now - attempt_start)} | "
+                            f"chunks={chunk_count} | text_chunks={text_chunk_count}"
+                        )
+                        last_stream_log = now
+                return collected, usage_metadata, chunk_count, text_chunk_count
+
+            collected, usage_metadata, chunk_count, text_chunk_count = _run_with_deadline(
+                stream, time_limit)
 
             full_text = "".join(collected).strip()
             attempt_elapsed = time.perf_counter() - attempt_start
@@ -424,11 +564,19 @@ def translate_page_pdf_to_html_gemini(
                 f"{pname} | attempt {attempt}/{max_retries} failed | "
                 f"duration={format_duration(attempt_elapsed)} | error={e}"
             )
+            if (why := _api_limit_message(e)) is not None:
+                raise ApiLimitReached(why) from e
 
             if attempt < max_retries:
-                log(f"{pname} | waiting {retry_wait_seconds}s before retry")
-                time.sleep(retry_wait_seconds)
+                # Flex runs on spare capacity and answers 503 when there is none;
+                # Google's advice is to back off, so each wait doubles there.
+                wait = retry_wait_seconds * (2 ** (attempt - 1) if service_tier == "flex" else 1)
+                log(f"{pname} | waiting {wait}s before retry")
+                _sleep_cancellable(wait)
 
+    if service_tier == "flex" and getattr(last_error, "code", None) == 503:
+        raise RuntimeError(f"Flex had no spare capacity at Google (503 on all {max_retries} tries) "
+                           f"-- try again later, or use normal or batch") from last_error
     raise RuntimeError(f"Failed after {max_retries} attempts for {pdf_path}") from last_error
 
 
@@ -549,7 +697,7 @@ def translate_page_pdf_to_html_minimax(
 
             if attempt < max_retries:
                 log(f"{pname} | waiting {retry_wait_seconds}s before retry")
-                time.sleep(retry_wait_seconds)
+                _sleep_cancellable(retry_wait_seconds)
 
     raise RuntimeError(f"Failed after {max_retries} attempts for {pdf_path}") from last_error
 
@@ -700,7 +848,7 @@ def translate_page_pdf_to_html_openai(
 
             if attempt < max_retries:
                 log(f"{pname} | waiting {retry_wait_seconds}s before retry")
-                time.sleep(retry_wait_seconds)
+                _sleep_cancellable(retry_wait_seconds)
 
     raise RuntimeError(f"Failed after {max_retries} attempts for {pdf_path}") from last_error
 
@@ -804,9 +952,130 @@ def translate_page_pdf_to_html_claude(
 
             if attempt < max_retries:
                 log(f"{pname} | waiting {retry_wait_seconds}s before retry")
-                time.sleep(retry_wait_seconds)
+                _sleep_cancellable(retry_wait_seconds)
 
     raise RuntimeError(f"Failed after {max_retries} attempts for {pdf_path}") from last_error
+
+
+# ---------------------------------------------------------------------
+# Two-step translation: self-hosted OCR, then a text-only Gemini call
+# ---------------------------------------------------------------------
+# translate_page_pdf_to_html below sends the page IMAGE to one model that reads
+# and translates in a single call. This path splits the work: a self-hosted OCR
+# service reads the page (one POST per page) and Gemini Flash only translates
+# the text. The caller (dashboard/routes_translation.py) keeps the transcript in
+# between, so a failed translation never costs the OCR again. What comes out is
+# the same translated.html the one-call path writes, so the images, .docx and
+# merge stages cannot tell which path made a page.
+
+# The service takes one page at a time, so a request can wait behind others.
+OCR_TIMEOUT_SECONDS = 900
+OCR_DPI = 300
+# The service returns the tokenizer's word marker where a space belongs.
+OCR_SPACE_MARKER = "\u2581"
+
+def ocr_page_to_transcript(pdf_path: Path, ocr_url: str) -> str:
+    """One page through the OCR service, as text. Any failure raises; the HTTP
+    status is what says it failed, because the body of a 500 is plain text."""
+    png_bytes = render_pdf_page_to_png_bytes(pdf_path, dpi=OCR_DPI)
+    try:
+        resp = requests.post(
+            ocr_url,
+            files={"image": ("page.png", png_bytes, "image/png")},
+            timeout=(10, OCR_TIMEOUT_SECONDS),
+        )
+    except requests.RequestException as e:
+        raise RuntimeError(f"OCR service unreachable: {type(e).__name__}: {e}") from e
+    if resp.status_code != 200:
+        raise RuntimeError(f"OCR service returned HTTP {resp.status_code}: {resp.text[:200]}")
+    try:
+        markdown = resp.json()["markdown"]
+    except (ValueError, KeyError, TypeError) as e:
+        raise RuntimeError(f"OCR service returned an unreadable reply: {e}") from e
+    return markdown.replace(OCR_SPACE_MARKER, " ").strip()
+
+
+def transcript_to_html(text: str) -> str:
+    """Translated page text -> the HTML fragment the later stages read. The
+    OCR writes tables as HTML, so those pass through; everything else becomes
+    paragraphs split on blank lines, a single newline inside one a <br/>."""
+    parts = []
+    for chunk in re.split(r"(<table>.*?</table>)", text, flags=re.S):
+        if chunk.startswith("<table>"):
+            parts.append(chunk.replace("<table>", '<table border="1">', 1))
+            continue
+        for para in re.split(r"\n\s*\n", chunk.strip()):
+            if para.strip():
+                lines = "<br/>".join(html.escape(line) for line in para.strip().split("\n"))
+                parts.append(f"<p>{lines}</p>")
+    return "\n".join(parts) + "\n"
+
+
+def translate_transcript_to_html_gemini(
+    transcript: str,
+    prompt: str,
+    model: str,
+    api_key: str,
+    max_retries: int,
+    retry_wait_seconds: int,
+    pname: str,
+    service_tier: str | None = None,
+) -> tuple[str, dict | None]:
+    """The transcript of one page -> its English HTML. Same attempt limit,
+    cancel check and credit/daily-limit handling as the one-call Gemini path;
+    no thinking level and no Google Search, which is how it was measured.
+    service_tier="flex" is the half-price best-effort tier, with the longer
+    time limit and doubling back-off the one-call path gives it."""
+    if not transcript.strip():
+        return "<p></p>\n", None  # a blank page: nothing to translate
+    time_limit = GEMINI_FLEX_TIMEOUT_SECONDS if service_tier == "flex" else GEMINI_ATTEMPT_TIMEOUT_SECONDS
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=time_limit * 1000),
+    )
+    config = types.GenerateContentConfig(service_tier=service_tier) if service_tier else None
+    contents = prompt.rstrip() + "\n\n" + transcript
+    last_error = None
+
+    for attempt in range(1, max_retries + 1):
+        _check_cancel()
+        attempt_start = time.perf_counter()
+        try:
+            log(f"{pname} | attempt {attempt}/{max_retries} | transcript sent to {model} | chars={len(transcript)}")
+            response = _run_with_deadline(
+                lambda: client.models.generate_content(model=model, contents=contents, config=config),
+                time_limit,
+            )
+            full_text = (response.text or "").strip()
+            if not full_text:
+                raise RuntimeError("Empty response received from Gemini.")
+
+            usage = None
+            if meta := getattr(response, "usage_metadata", None):
+                in_tok = getattr(meta, "prompt_token_count", None) or 0
+                out_tok = (getattr(meta, "candidates_token_count", None) or 0) + (
+                    getattr(meta, "thoughts_token_count", None) or 0)
+                usage = {"input_tokens": in_tok, "output_tokens": out_tok,
+                         "total_tokens": getattr(meta, "total_token_count", None) or (in_tok + out_tok)}
+            log(f"{pname} | attempt {attempt} | translation completed | "
+                f"duration={format_duration(time.perf_counter() - attempt_start)} | chars={len(full_text)}")
+            return transcript_to_html(clean_html(full_text)), usage
+
+        except Exception as e:
+            last_error = e
+            log(f"{pname} | attempt {attempt}/{max_retries} failed | "
+                f"duration={format_duration(time.perf_counter() - attempt_start)} | error={e}")
+            if (why := _api_limit_message(e)) is not None:
+                raise ApiLimitReached(why) from e
+            if attempt < max_retries:
+                wait = retry_wait_seconds * (2 ** (attempt - 1) if service_tier == "flex" else 1)
+                log(f"{pname} | waiting {wait}s before retry")
+                _sleep_cancellable(wait)
+
+    if service_tier == "flex" and getattr(last_error, "code", None) == 503:
+        raise RuntimeError(f"Flex had no spare capacity at Google (503 on all {max_retries} tries) "
+                           f"-- try again later, or use normal or batch") from last_error
+    raise RuntimeError(f"Failed after {max_retries} attempts translating {pname}") from last_error
 
 
 def translate_page_pdf_to_html(
@@ -820,6 +1089,7 @@ def translate_page_pdf_to_html(
     provider: str = "gemini",
     openai_reasoning_effort: str | None = None,
     gemini_thinking_level: str = "HIGH",
+    gemini_service_tier: str | None = None,
 ) -> tuple[str, dict | None]:
     if provider == "claude":
         return translate_page_pdf_to_html_claude(
@@ -861,6 +1131,7 @@ def translate_page_pdf_to_html(
         retry_wait_seconds=retry_wait_seconds,
         enable_google_search=enable_google_search,
         thinking_level=gemini_thinking_level,
+        service_tier=gemini_service_tier,
     )
 
 
@@ -876,6 +1147,7 @@ def process_translation_for_page(
     provider: str = "gemini",
     openai_reasoning_effort: str | None = None,
     gemini_thinking_level: str = "HIGH",
+    gemini_service_tier: str | None = None,
 ):
     page_start = time.perf_counter()
 
@@ -910,6 +1182,7 @@ def process_translation_for_page(
             provider=provider,
             openai_reasoning_effort=openai_reasoning_effort,
             gemini_thinking_level=gemini_thinking_level,
+            gemini_service_tier=gemini_service_tier,
         )
 
         html_path.write_text(translated_html, encoding="utf-8")

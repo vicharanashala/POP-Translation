@@ -1,0 +1,18 @@
+#!/command/with-contenv sh
+set -x
+
+echo "=== WAITING FOR TAILSCALE ==="
+WAIT_COUNT=0
+until tailscale status --self 2>/dev/null | grep -q "Online"; do
+    echo "Waiting for Tailscale to come online... ($WAIT_COUNTs)"
+    WAIT_COUNT=$((WAIT_COUNT + 1))
+    if [ $WAIT_COUNT -gt 30 ]; then
+        echo "WARNING: Tailscale not online after 30 seconds, proceeding anyway..."
+        break
+    fi
+    sleep 2
+done
+echo "=== TAILSCALE IS ONLINE, STARTING PYTHON ==="
+
+cd /app
+exec uvicorn pop_server:app --host 0.0.0.0 --port 8032

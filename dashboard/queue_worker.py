@@ -1,293 +1,524 @@
-"""Background worker for the upload/dedup queue (upload_queue_items).
+"""Background worker for the upload queue (upload_queue_items).
 
-Same ThreadPoolExecutor-driven async-job shape pop_server.py already uses
-for the translation pipeline (_jobs dict + ThreadPoolExecutor), but
-DB-backed so queue state survives a server restart instead of living only
-in an in-memory dict.
+Same ThreadPoolExecutor-driven async-job shape pop_server.py already uses for
+the translation pipeline, but DB-backed so queue state survives a server restart
+instead of living only in an in-memory dict.
 
-Deliberately its own small pool (2 workers), separate from both the
-translation pipeline's pool and the currently-running
-scripts/hash_and_embed_report_true.py batch job -- this is per-upload,
-single-middle-page OCR + one embedding call, not the batch job's
-download/OCR-pool-decoupled design, so it doesn't need or want that much
-concurrency, and keeping it small avoids competing for CPU with whichever
-of those two is running.
+TWO PHASES, with a human decision between them:
+
+    POST /uploads          queued -> hashing -> checking_duplicate -> awaiting_review
+    POST /uploads/{id}/add    file the upload's NEW placements onto an existing
+                              document -- no second copy of the metadata, and no
+                              second upload to Zoho
+    POST /uploads/{id}/new    create a separate document
+    POST /uploads/{id}/cancel discard; nothing was uploaded
+
+The pause is BEFORE the Zoho upload on purpose: a cancelled upload must not leave
+an orphan file in WorkDrive, so the bytes wait on local disk (see STAGING_DIR)
+and only reach Zoho once a person says go -- and only on the `new` path, since
+`add` reuses the document's existing file.
+
+THE DUPLICATE CHECK IS A PLACEHOLDER. `find_candidates()` below does one cheap,
+honest thing -- looks for an existing document with the same sha256 -- and
+returns nothing otherwise. It does NOT do similarity, so a re-encoded or
+re-scanned copy of an existing document is reported as new. It already returns a
+RANKED LIST of up to three, because that is the shape the chunk-match algorithm
+will fill: today the list is 0 or 1 long and every score is 1.0.
+
+WHY THE THREE-WAY CHOICE. An upload of a document already in the catalogue is
+usually not a mistake -- it is the same advisory being filed under another state
+or crop. So the decision is not "duplicate or not" but "what should exist
+afterwards", and the answer depends on the placements: `add` is only offered when
+this upload names a (state, crop) the chosen document does not already have.
+
+MongoDB note: there is no session/transaction to hold open -- pymongo writes
+apply immediately -- so get_session() simply hands out the Database and the
+`with` blocks below are kept purely for call-site symmetry with the rest of the
+package.
 """
 from __future__ import annotations
 
-import uuid
+import hashlib
+import os
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from dashboard import zoho_layout
-from dashboard.config import DUPLICATE_EMBEDDING_THRESHOLD, REPO_ROOT
+from bson import ObjectId
+from pymongo.errors import DuplicateKeyError
+
+from dashboard import events, vocabulary, zoho_layout
 from dashboard.db import get_session
-from dashboard.dedup import compute_signature, find_closest_match
-from dashboard.display_id import allocate_display_id
-from dashboard.models import Crop, DocumentAssociation, State, UniqueDocument, UploadQueueItem, UploadQueueStatus
+from dashboard.display_id import format_display_id, format_row_id, free_display_ids, free_row_ids
+from dashboard.models import (
+    COLL_DOCUMENTS,
+    COLL_UNIQUE_DOCUMENTS,
+    COLL_UPLOAD_QUEUE_ITEMS,
+    COLL_UPLOAD_TRAIL,
+    MANUAL_METADATA_FIELDS,
+    UploadQueueStatus,
+    link_placement,
+    new_copy_link,
+    new_document,
+    sha_match,
+    new_unique_document,
+    new_upload_candidate,
+    utcnow,
+)
+from dashboard.schemas import as_domain_list
 
+# Two workers, as before: the work per item is one Zoho upload plus a handful
+# of inserts, and keeping the pool small avoids competing for bandwidth with
+# the translation pipeline's own pool.
 _UPLOAD_WORKERS = 2
-_executor = ThreadPoolExecutor(max_workers=_UPLOAD_WORKERS, thread_name_prefix="upload-dedup")
+_executor = ThreadPoolExecutor(max_workers=_UPLOAD_WORKERS, thread_name_prefix="upload")
 
-# Every item's original bytes are cached here once it reaches
-# awaiting_review, since ANY item -- matched or not -- might later get
-# resolved via .../new, and by then the original request that carried the
-# bytes is long gone. Cleared on any resolution (add/new/cancel).
-_PENDING_UPLOADS_ROOT = REPO_ROOT / "pop-data" / "POP_Work" / "Dashboard_PendingUploads"
+_METADATA_FIELDS = MANUAL_METADATA_FIELDS
 
-
-def _pending_upload_path(item_id: uuid.UUID) -> Path:
-    return _PENDING_UPLOADS_ROOT / f"{item_id}.pdf"
-
-
-def discard_pending_upload(item_id: uuid.UUID) -> None:
-    _pending_upload_path(item_id).unlink(missing_ok=True)
-
-_METADATA_FIELDS = (
-    "advisory_type",
-    "advisory_scope",
-    "season",
-    "edition_revision_volume",
-    "date_of_release",
-    "month_of_release",
-    "year_of_release",
-    "date_of_collection",
-    "month_of_collection",
-    "year_of_collection",
-    "advisory_name",
-    "advisory_released_org",
-    "advisory_org_address",
-    "live_source_link",
-    "domain",
-    "verification_status",
-    "verified_by",
-    "document_status",
+# Uploaded bytes wait here between the duplicate check and the human's
+# decision. On disk rather than in memory because the wait is open-ended -- an
+# item can sit at awaiting_review for as long as the person takes -- and
+# holding every pending PDF in the process would be a slow leak.
+#
+# UPLOAD_STAGING_DIR overrides the location. In a container the default temp
+# directory dies with the container, so an item sitting at awaiting_review when
+# it restarts loses its bytes; docker-compose.yml points this at the
+# mounted pop-data volume instead.
+#
+# A staged file that disappears anyway fails its own item loudly at decision
+# time (see _finish) and is simply re-uploaded. It is never mistaken for a
+# successful upload.
+STAGING_DIR = Path(
+    os.environ.get("UPLOAD_STAGING_DIR") or (Path(tempfile.gettempdir()) / "pop_render_uploads")
 )
 
 
-def _classify_placements(
-    session, unique_document_id, state_names: list[str], crop_names: list[str]
-) -> tuple[list[tuple[int, int]], list[str], list[str]]:
-    """Cross product of state_names x crop_names against this document's
-    EXISTING placements -- returns (new_pairs as (state_id, crop_id),
-    new_labels, already_existing_labels). Read-only, no writes -- used both
-    to preview a pending duplicate's would-be effect and, at approval time,
-    to know exactly what to create."""
-    state_ids = {s.name: s.id for s in session.query(State).filter(State.name.in_(state_names)).all()}
-    crop_ids = {c.name: c.id for c in session.query(Crop).filter(Crop.name.in_(crop_names)).all()}
-    existing = {
-        (a.state_id, a.crop_id)
-        for a in session.query(DocumentAssociation).filter_by(unique_document_id=unique_document_id).all()
+def stage_path(item_id: ObjectId) -> Path:
+    return STAGING_DIR / f"{item_id}.pdf"
+
+
+def stage(item_id: ObjectId, pdf_bytes: bytes) -> None:
+    STAGING_DIR.mkdir(parents=True, exist_ok=True)
+    stage_path(item_id).write_bytes(pdf_bytes)
+
+
+def unstage(item_id: ObjectId) -> None:
+    stage_path(item_id).unlink(missing_ok=True)
+
+
+def _set_status(item_id: ObjectId, **fields) -> None:
+    fields["updated_at"] = utcnow()
+    # Enum members are stored by value, matching what the API serialises.
+    for key, value in list(fields.items()):
+        if isinstance(value, UploadQueueStatus):
+            fields[key] = value.value
+    with get_session() as db:
+        db[COLL_UPLOAD_QUEUE_ITEMS].update_one({"_id": item_id}, {"$set": fields})
+    events.upload_changed(item_id)
+
+
+def enqueue_check(item_id: ObjectId) -> None:
+    """Phase 1: hash, page-count and duplicate-check, then park for review."""
+    _executor.submit(_check, item_id)
+
+
+def enqueue_decision(item_id: ObjectId, document_id: ObjectId | None) -> None:
+    """Phase 2. `document_id` names an existing document to file this upload
+    under (add), or None to create a new one (new)."""
+    _executor.submit(_finish, item_id, document_id)
+
+
+def _optional_ref(db, source: dict, kind: str):
+    """The district or KVK id a queued item holds, or None.
+
+    Read from the item's METADATA, not from a placement: both are fields of the
+    document, so one upload carries one of each however many folders it is filed
+    in. They used to be per placement group.
+
+    Optional: a form that sends neither files the document without them, which
+    is every corpus row. An id that IS stored and no longer resolves fails the
+    upload rather than being silently dropped and leaving it untagged -- the
+    entry could have gone in the time the item sat in the queue.
+    """
+    stored = source.get(vocabulary.field(kind))
+    if not stored:
+        return None
+    entry = vocabulary.get(db, kind, stored)
+    if entry is None:
+        raise ValueError(f"{kind}_id {stored!r} does not name an existing {kind}")
+    return entry["_id"]
+
+
+def _placement_ids(db, placement: dict) -> tuple:
+    """(state_id, folder kind, folder id) for a queued placement, the folder
+    being a crop ("crop") or an organisation ("organization").
+
+    Read from the IDS the item stored at submit, which _parse_placements already
+    verified. Re-read here rather than trusted, because an item can sit in the
+    queue while a vocabulary is re-synced; anything that no longer resolves
+    comes back as None and fails the decision.
+
+    Nothing is looked up by name and nothing is created. The queued `state` and
+    `crop` strings are labels for the queue UI, not a fallback -- when they were
+    a fallback, a stored id that had gone silently re-resolved to whatever the
+    label now matched.
+    """
+    state = vocabulary.get(db, "state", placement["state_id"]) if placement.get("state_id") else None
+    folder = None
+    for kind in ("crop", "organization"):
+        stored = placement.get(vocabulary.field(kind))
+        if stored:
+            entry = vocabulary.get(db, kind, stored)
+            if entry is not None:
+                folder = (kind, entry)
+            break
+    return (state["_id"] if state else None,
+            folder[0] if folder else None,
+            folder[1]["_id"] if folder else None)
+
+
+def new_placements_for(db, document, placements: list[dict]) -> list[dict]:
+    """Which of `placements` the document does not already have.
+
+    Read from the `documents` collection rather than from the document's own
+    duplicate_links, because the rows are the authority on where a document is
+    filed -- links describe physical files, which is a different question.
+    Compared by id: a pair naming something that does not exist yet cannot
+    already be one of the document's placements.
+    """
+    have = {
+        (row.get("state_id"),
+         "crop" if row.get("crop_id") else "organization",
+         row.get("crop_id") or row.get("organization_id"))
+        for row in db[COLL_DOCUMENTS].find(
+            {"unique_document_id": document["_id"]},
+            {"state_id": 1, "crop_id": 1, "organization_id": 1})
     }
-    new_pairs, new_labels, already_labels = [], [], []
-    for state_name in state_names:
-        state_id = state_ids.get(state_name)
-        if state_id is None:
+    out, seen = [], set()
+    for placement in placements:
+        ids = _placement_ids(db, placement)
+        known = None not in ids
+        key = ids if known else (str(placement.get("state", "")).lower(),
+                                 str(placement.get("crop", "")).lower())
+        if (known and ids in have) or key in seen:
             continue
-        for crop_name in crop_names:
-            crop_id = crop_ids.get(crop_name)
-            if crop_id is None:
-                continue
-            label = f"{state_name} / {crop_name}"
-            if (state_id, crop_id) in existing:
-                already_labels.append(label)
-            else:
-                new_pairs.append((state_id, crop_id))
-                new_labels.append(label)
-    return new_pairs, new_labels, already_labels
+        seen.add(key)
+        out.append(placement)
+    return out
 
 
-def attach_new_placements(session, unique_document_id, state_names: list[str], crop_names: list[str]) -> list[str]:
-    """Create a DocumentAssociation for every (state, crop) combo that
-    doesn't already exist for this document; returns the labels actually
-    created. Used both when creating a brand-new unique_documents row
-    (nothing pre-existing to skip) and by /uploads/{id}/add once a matched
-    document is confirmed."""
-    new_pairs, new_labels, _already = _classify_placements(session, unique_document_id, state_names, crop_names)
-    for state_id, crop_id in new_pairs:
-        session.add(DocumentAssociation(unique_document_id=unique_document_id, state_id=state_id, crop_id=crop_id))
-    return new_labels
+def find_candidates(db, sha: str, placements: list[dict], limit: int = 3) -> list[dict]:
+    """Up to `limit` existing documents this upload might be, best first.
 
+    PLACEHOLDER: exact sha256 only, so the list is 0 or 1 long and the score is
+    always 1.0. An empty list means "this exact file is not in the catalogue",
+    NOT "this document is new" -- a re-scan or re-export has a different hash.
 
-def _review_note(
-    match_type: str | None,
-    similarity_score: float | None,
-    matched_display_id: int | None,
-    new_labels: list[str],
-    already_labels: list[str],
-) -> str:
-    """Every item lands here needing a human decision (add/new/cancel) --
-    never auto-resolved. match_type/similarity_score tell the human WHY:
-    an exact sha256 hit, a fuzzy embedding match (shown regardless of
-    confidence -- even below DUPLICATE_EMBEDDING_THRESHOLD, since a human,
-    not the threshold, makes the final call), or no candidate at all
-    (unique_documents was empty)."""
-    from dashboard.display_id import format_display_id
-
-    doc_ref = format_display_id(matched_display_id) if matched_display_id is not None else None
-
-    if match_type == "sha":
-        parts = [f"Exact SHA-256 match: byte-for-byte identical to {doc_ref}."]
-    elif match_type == "embedding":
-        pct = f"{similarity_score * 100:.1f}%"
-        confidence = (
-            "likely duplicate"
-            if similarity_score >= DUPLICATE_EMBEDDING_THRESHOLD
-            else "low confidence, shown for reference only"
+    THE SEAM. The real check reads this file's chunk vectors from local disk
+    (they are not in Mongo -- the cluster is a 512 MB free tier), compares them
+    against the corpus, and returns the best few with real scores. Everything
+    around it -- the queue item, the three-way decision, the endpoints -- already
+    works against a list and does not care how it was produced.
+    """
+    matches = list(db[COLL_UNIQUE_DOCUMENTS].find(sha_match(sha)).limit(limit))
+    out = []
+    for document in matches:
+        candidate = new_upload_candidate(
+            document=document,
+            score=1.0,
+            match_type="sha",
+            new_placements=new_placements_for(db, document, placements),
         )
-        parts = [f"Closest existing document by embedding similarity: {doc_ref} ({pct} similar, {confidence})."]
-    else:
-        parts = ["No existing documents to compare against yet (this would be the first)."]
-
-    parts.append("Awaiting a decision (add / new / cancel) -- nothing linked or created yet.")
-    if new_labels:
-        parts.append(f"'add' would link: {', '.join(new_labels)}.")
-    if already_labels:
-        parts.append(f"Already present on the matched document: {', '.join(already_labels)}.")
-    return " ".join(parts)
+        candidate["document_code"] = format_display_id(document.get("display_id"))
+        out.append(candidate)
+    return out
 
 
-def _set_status(item_id: uuid.UUID, **fields) -> None:
-    with get_session() as session:
-        item = session.get(UploadQueueItem, item_id)
+def describe_candidates(candidates: list[dict]) -> str:
+    """The note shown next to the decision buttons."""
+    if not candidates:
+        return ("No existing document has this exact file, so this will be filed as a "
+                "new document. Note that the similarity check is not implemented yet -- "
+                "a re-scanned or re-exported copy of an existing advisory would not "
+                "have been found.")
+    best = candidates[0]
+    if best["can_add"]:
+        pairs = ", ".join(f"{p['state']}/{p['crop']}" for p in best["new_placements"][:4])
+        return (f"This exact file is already in the catalogue as {best['document_code']}, "
+                f"filed in {best['placement_count']} place(s). Adding files it under "
+                f"{len(best['new_placements'])} new place(s): {pairs}.")
+    return (f"This exact file is already in the catalogue as {best['document_code']}, and "
+            f"already filed under every place you selected. There is nothing to add.")
+
+
+def find_or_create_document(db, *, sha: str, fields: dict) -> dict:
+    """The unique document for this file, creating it if it is new.
+
+    Reused rather than duplicated when the sha already exists. That is a
+    backstop, not the normal path -- an exact match is surfaced as a candidate
+    and the person is expected to choose "add". It matters when two uploads of
+    the same file race, where the second must join the first's document rather
+    than fail on the unique sha256 index.
+    """
+    existing = db[COLL_UNIQUE_DOCUMENTS].find_one(sha_match(sha))
+    if existing is not None:
+        return existing
+    display_id = free_display_ids(db, 1)[0]
+    doc = new_unique_document(display_id=display_id, sha256=sha, **fields)
+    doc["_id"] = db[COLL_UNIQUE_DOCUMENTS].insert_one(doc).inserted_id
+    return doc
+
+
+_ROW_ID_RETRIES = 5
+
+
+def _insert_row(db, row: dict) -> ObjectId:
+    """Insert one placement, moving to the next free row_id if another writer
+    took this one between the scan and the insert. Any other duplicate (or a
+    sixth loss in a row) still raises."""
+    for attempt in range(_ROW_ID_RETRIES + 1):
+        try:
+            return db[COLL_DOCUMENTS].insert_one(row).inserted_id
+        except DuplicateKeyError as e:
+            if attempt == _ROW_ID_RETRIES or "row_id" not in ((e.details or {}).get("keyPattern") or {}):
+                raise
+            row.pop("_id", None)
+            row["row_id"] = free_row_ids(db, 1)[0]
+    raise AssertionError("unreachable")
+
+
+def create_placements(db, *, document, placements: list[dict], copy: dict) -> list[dict]:
+    """Insert one `documents` row per placement, all pointing at `document`.
+
+    row_ids are drawn in bulk from one scan rather than one at a time, so filing
+    a document under 20 crops does not rescan the collection 20 times. The unique
+    index on row_id is still the arbiter if another writer takes one first, and
+    a row that loses that race draws the next free number and tries again
+    (_insert_row). It used to fail the whole decision instead: on 2026-10-13 an
+    admin's add on staging drew POP_00269 while the test suite briefly held it,
+    and the upload went to `failed` over a number nobody kept.
+
+    `copy` is the physical file each new placement is backed by. On the `add`
+    path that is the document's EXISTING anchor file: the dashboard stores
+    uploads in one flat WorkDrive folder, not per state/crop, so filing the same
+    document somewhere else needs no second upload and creates no second file.
+    Several copy entries then share a zoho_file_id, which is the truth for
+    dashboard uploads -- unlike the crawled corpus, where WorkDrive really does
+    hold a separate file per folder.
+    """
+    # Re-read from the stored ids and deduped on them, so the same folder
+    # arriving twice cannot become two rows. Nothing is created and nothing is
+    # matched by name: an id that no longer resolves fails the decision loudly
+    # rather than being invented or filed as something else.
+    resolved, seen = [], set()
+    for placement in placements:
+        ids = _placement_ids(db, placement)
+        if ids[0] is None:
+            raise ValueError(f"state_id {placement.get('state_id')!r} no longer names a state")
+        if ids[2] is None:
+            raise ValueError(
+                f"the folder this upload was filed under ({placement.get('crop')!r}) no longer "
+                f"names a crop or an organization")
+        if ids in seen:
+            continue
+        seen.add(ids)
+        resolved.append((placement, ids))
+    if not resolved:
+        return []
+    row_ids = free_row_ids(db, len(resolved))
+    rows = []
+    for (placement, (state_id, kind, folder_id)), row_id in zip(resolved, row_ids):
+        rows.append(new_document(
+            row_id=row_id, unique_document_id=document["_id"], state_id=state_id,
+            # Provenance only: the names as the queue recorded them. Nothing
+            # reads these -- the OCR language keys off the state's LGD code.
+            state_raw=placement.get("state") or "", crop_raw=placement.get("crop") or "",
+            **{vocabulary.field(kind): folder_id},
+        ))
+    for row in rows:
+        inserted_id = row["_id"] = _insert_row(db, row)
+        link_placement(
+            db, document["_id"],
+            row_obj_id=inserted_id,
+            row_id=row["row_id"],
+            copy_link=new_copy_link(**copy),
+        )
+    return rows
+
+
+def _check(item_id: ObjectId) -> None:
+    """Phase 1. Ends at awaiting_review for EVERY item that gets this far,
+    whether or not anything matched -- the person is the real check."""
+    try:
+        path = stage_path(item_id)
+        if not path.exists():
+            _set_status(item_id, status=UploadQueueStatus.failed,
+                        error_message="staged upload file is missing")
+            return
+        pdf_bytes = path.read_bytes()
+
+        with get_session() as db:
+            item = db[COLL_UPLOAD_QUEUE_ITEMS].find_one({"_id": item_id})
         if item is None:
             return
-        for k, v in fields.items():
-            setattr(item, k, v)
-
-
-def enqueue(item_id: uuid.UUID, pdf_bytes: bytes) -> None:
-    _executor.submit(_process, item_id, pdf_bytes)
-
-
-def _process(item_id: uuid.UUID, pdf_bytes: bytes) -> None:
-    try:
-        with get_session() as session:
-            item = session.get(UploadQueueItem, item_id)
-            if item is None:
-                return
-            payload = item.metadata_payload
-            filename = item.filename
-        state_names = payload.get("state_names", [])
-        crop_names = payload.get("crop_names", [])
-        language = payload["language"]
 
         _set_status(item_id, status=UploadQueueStatus.hashing, progress_pct=10)
+        # sha256 is both the placeholder check's only signal and the join key to
+        # the on-disk chunk fingerprints the real check will use.
+        sha = hashlib.sha256(pdf_bytes).hexdigest()
 
-        _set_status(item_id, status=UploadQueueStatus.embedding, progress_pct=30)
-        sha, embedding, _transcript = compute_signature(pdf_bytes, language)
+        num_pages = None
+        if (item["filename"] or "").lower().endswith(".pdf"):
+            import fitz
 
-        import fitz
+            with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+                num_pages = doc.page_count
 
-        with fitz.open(stream=pdf_bytes, filetype="pdf") as _doc:
-            num_pages = _doc.page_count
-        # Known regardless of what happens next -- persist now so the queue
-        # row can show it immediately.
-        _set_status(item_id, num_pages=num_pages, language=language)
+        _set_status(item_id, status=UploadQueueStatus.checking_duplicate,
+                    sha256=sha, num_pages=num_pages, progress_pct=30)
+        with get_session() as db:
+            candidates = find_candidates(db, sha, item.get("placements") or [])
 
-        _set_status(item_id, status=UploadQueueStatus.checking_duplicate, progress_pct=60)
-        with get_session() as session:
-            existing_doc = None
-            match_type = None
-            similarity_score = None
-
-            exact = session.query(UniqueDocument).filter_by(sha256=sha).first()
-            if exact is not None:
-                existing_doc, match_type, similarity_score = exact, "sha", 1.0
-            else:
-                # Shown regardless of DUPLICATE_EMBEDDING_THRESHOLD -- a human
-                # makes the final call now, not the threshold. None only when
-                # unique_documents is completely empty (nothing to compare to).
-                match, similarity = find_closest_match(session, embedding)
-                if match is not None:
-                    existing_doc, match_type, similarity_score = match, "embedding", similarity
-
-            if existing_doc is not None:
-                _new_pairs, new_labels, already_labels = _classify_placements(
-                    session, existing_doc.id, state_names, crop_names
-                )
-                matched_display_id = existing_doc.display_id
-            else:
-                new_labels, already_labels, matched_display_id = [], [], None
-
-            # Every item ends up here needing a human decision -- nothing is
-            # ever auto-created or auto-removed, even when there's no match
-            # at all. Bytes are cached now (not only on a match) since /new
-            # can be called from this status regardless of match_type.
-            _PENDING_UPLOADS_ROOT.mkdir(parents=True, exist_ok=True)
-            _pending_upload_path(item_id).write_bytes(pdf_bytes)
-
-            item = session.get(UploadQueueItem, item_id)
-            item.status = UploadQueueStatus.awaiting_review
-            item.duplicate_of_id = existing_doc.id if existing_doc is not None else None
-            item.similarity_score = similarity_score
-            item.match_type = match_type
-            item.note = _review_note(match_type, similarity_score, matched_display_id, new_labels, already_labels)
-            item.progress_pct = 100
-
+        _set_status(item_id, status=UploadQueueStatus.awaiting_review, progress_pct=50,
+                    candidates=candidates, note=describe_candidates(candidates))
     except Exception as e:  # noqa: BLE001
         _set_status(item_id, status=UploadQueueStatus.failed, error_message=str(e))
 
 
-def enqueue_as_new(item_id: uuid.UUID) -> None:
-    """POST /uploads/{id}/new -- the human has decided an awaiting_review
-    item should become its own unique_documents row: either there was no
-    candidate match at all, or there was one but the human judged it a false
-    positive. Same create path either way, using the cached bytes from when
-    this item first reached awaiting_review."""
-    _executor.submit(_process_as_new, item_id)
+def _finish(item_id: ObjectId, document_id: ObjectId | None) -> None:
+    """Phase 2, entered only from an explicit decision.
 
-
-def _process_as_new(item_id: uuid.UUID) -> None:
-    pdf_path = _pending_upload_path(item_id)
+    `document_id` set  -> ADD: file this upload's new placements onto that
+                          existing document. Nothing is uploaded to Zoho and no
+                          metadata is written; the document already has both.
+    `document_id` None -> NEW: upload the file and create a document for it.
+    """
     try:
-        pdf_bytes = pdf_path.read_bytes()
+        with get_session() as db:
+            item = db[COLL_UPLOAD_QUEUE_ITEMS].find_one({"_id": item_id})
+        if item is None:
+            return
+        metadata = item.get("metadata") or {}
+        filename = item["filename"]
+        placements = item.get("placements") or []
 
-        with get_session() as session:
-            item = session.get(UploadQueueItem, item_id)
-            if item is None:
-                return
-            payload = item.metadata_payload
-            filename = item.filename
-            num_pages = item.num_pages
-        state_names = payload.get("state_names", [])
-        crop_names = payload.get("crop_names", [])
-        language = payload["language"]
+        with get_session() as db:
+            if document_id is not None:
+                document = db[COLL_UNIQUE_DOCUMENTS].find_one({"_id": document_id})
+                if document is None:
+                    _set_status(item_id, status=UploadQueueStatus.failed,
+                                error_message="the chosen document no longer exists")
+                    return
+                # Only the placements it does not already have. Re-filing a
+                # document where it already is would create a duplicate row for
+                # the same folder.
+                placements = new_placements_for(db, document, placements)
+                copy = {
+                    "zoho_file_id": document.get("representative_file_id"),
+                    "shareable_link": document.get("shareable_link"),
+                    "shareable_name": document.get("shareable_name"),
+                }
+                verb = "Filed"
+            elif item.get("sha256") and (existing := db[COLL_UNIQUE_DOCUMENTS].find_one(
+                    sha_match(item["sha256"]))) is not None:
+                # NEW, but this exact file is already a document: an earlier
+                # attempt at this item got as far as creating it (a retry
+                # after a failure), or another upload of the file was filed in
+                # the meantime. Joined like an add -- no second WorkDrive
+                # upload, and only the folders it is not in yet.
+                document = existing
+                placements = new_placements_for(db, document, placements)
+                copy = {
+                    "zoho_file_id": document.get("representative_file_id"),
+                    "shareable_link": document.get("shareable_link"),
+                    "shareable_name": document.get("shareable_name"),
+                }
+                verb = "Filed"
+            else:
+                path = stage_path(item_id)
+                if not path.exists():
+                    _set_status(item_id, status=UploadQueueStatus.failed,
+                                error_message="staged upload file is missing -- upload the file again")
+                    return
+                pdf_bytes = path.read_bytes()
+                _set_status(item_id, status=UploadQueueStatus.uploading, progress_pct=60)
+                from pop_server import _get_zoho
 
-        # Re-derived from the cached bytes rather than persisted at
-        # duplicate-flag time -- avoids adding a sha256/embedding column to
-        # upload_queue_items just for this rare path; cost is the same one
-        # OCR+embed call the original upload already paid once.
-        sha, embedding, _transcript = compute_signature(pdf_bytes, language)
+                zoho_file_id = zoho_layout.upload_original(_get_zoho(), filename, pdf_bytes)
+                document = find_or_create_document(
+                    db,
+                    sha=item.get("sha256") or hashlib.sha256(pdf_bytes).hexdigest(),
+                    fields={
+                        "shareable_name": filename,
+                        "shareable_link": zoho_layout.shareable_link(zoho_file_id),
+                        "representative_file_id": zoho_file_id,
+                        "num_pages": item.get("num_pages"),
+                        "format_original": metadata.get("format_original")
+                        or (filename.rsplit(".", 1)[-1] or "pdf").lower(),
+                        # The uploader's tessdata choice is both the OCR setting
+                        # and the document's language, and a person choosing it
+                        # is its own provenance -- neither read off the file
+                        # (detected) nor inferred from the state.
+                        "language": metadata.get("language"),
+                        "language_source": "manual",
+                        **{k: metadata.get(k) for k in _METADATA_FIELDS},
+                        # A list; an item queued while it was one string holds that.
+                        "domain": as_domain_list(metadata.get("domain")),
+                        # Who uploaded it and passed it through the approval
+                        # chain, as the queue recorded them (routes_uploads):
+                        # names for showing, agriai.users ids beside them.
+                        "uploaded_by_id": item.get("expert"),
+                        "approved_by_approver": item.get("approved_by_approver"),
+                        "approved_by_approver_id": item.get("approved_by_approver_id"),
+                        "approved_by_admin": item.get("approved_by_admin"),
+                        "approved_by_admin_id": item.get("approved_by_admin_id"),
+                        # Where the document applies, re-read from the ids the
+                        # submit verified. Omitted when unset, like every other
+                        # optional reference.
+                        **{vocabulary.field(kind): ref
+                           for kind in ("district", "kvk")
+                           if (ref := _optional_ref(db, metadata, kind)) is not None},
+                    },
+                )
+                copy = {
+                    "zoho_file_id": zoho_file_id,
+                    "shareable_link": zoho_layout.shareable_link(zoho_file_id),
+                    "shareable_name": filename,
+                }
+                verb = "Created"
 
-        from pop_server import _get_zoho
-
-        wd = _get_zoho()
-        zoho_file_id = zoho_layout.upload_original(wd, filename, pdf_bytes)
-
-        with get_session() as session:
-            doc = UniqueDocument(
-                sha256=sha,
-                display_id=allocate_display_id(session),
-                zoho_file_id=zoho_file_id,
-                embedding=embedding,
-                shareable_name=filename,
-                shareable_link=zoho_layout.shareable_link(zoho_file_id),
-                language=language,
-                format_original="pdf",
-                num_pages=num_pages,
-                **{k: payload.get(k) for k in _METADATA_FIELDS},
-            )
-            session.add(doc)
-            session.flush()
-
-            attach_new_placements(session, doc.id, state_names, crop_names)
-
-            item = session.get(UploadQueueItem, item_id)
-            if item is not None:
-                session.delete(item)
+            # Re-checked against the rows as they are NOW, on every path: a
+            # document created a moment ago by a racing upload of the same file
+            # is joined above, and must not be filed twice in one folder.
+            placements = new_placements_for(db, document, placements)
+            rows = create_placements(db, document=document, placements=placements, copy=copy)
+            code = format_display_id(document["display_id"])
+            row_codes = [format_row_id(r["row_id"]) for r in rows]
+            # The decision is carried out, so the item leaves the queue for the
+            # trail. The queue holds work that is in flight or waiting on a
+            # person -- a finished upload is not either, and leaving a `done`
+            # row behind just makes someone clear it by hand. The trail keeps
+            # it, with what it became, for the history view (GET
+            # /uploads/history).
+            #
+            # `failed` items are the one thing that stays: they carry the error
+            # and are retryable via the same add/new endpoints.
+            done = db[COLL_UPLOAD_QUEUE_ITEMS].find_one_and_delete({"_id": item_id})
+            if done is not None:
+                db[COLL_UPLOAD_TRAIL].insert_one({
+                    **done, "status": UploadQueueStatus.done.value, "progress_pct": 100,
+                    "error_message": None, "created_document_id": code,
+                    "created_row_ids": row_codes, "updated_at": utcnow()})
+            # The item is gone, so the event says where it went: the frontend
+            # opens that document, and refreshes the tables for the new rows.
+            events.upload_removed(item_id, unique_document_id=str(document["_id"]),
+                                  document_code=code, row_ids=row_codes)
+            events.document_changed(document["_id"])
+            print(f"[upload] {verb} {code} in {len(rows)} place(s)"
+                  + (f": {', '.join(row_codes)}" if row_codes else ""), flush=True)
+        # Only once the rows exist: a failure above leaves the staged file in
+        # place so the decision can be retried without re-uploading.
+        unstage(item_id)
 
     except Exception as e:  # noqa: BLE001
-        _set_status(item_id, status=UploadQueueStatus.failed, error_message=f"'new' failed: {e}")
-    finally:
-        pdf_path.unlink(missing_ok=True)
+        _set_status(item_id, status=UploadQueueStatus.failed, error_message=str(e))

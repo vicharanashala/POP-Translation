@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - first_render
       - "feature/**"
       - "fix/**"
     # No paths: filter (removed 2026-08-30) -- the Dockerfile's `COPY . .`
@@ -30,6 +31,19 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # `latest` is what deployments pull, so ONLY main may move it. Every
+      # other branch gets a tag named after itself -- pushing a branch build to
+      # `latest` would put unreviewed code in front of whatever pulls it next.
+      # Slashes are not legal in a Docker tag, so feature/x becomes feature-x.
+      - name: Work out the moving tag
+        id: tag
+        run: |
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            echo "moving=latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "moving=$(echo '${{ github.ref_name }}' | tr '/' '-')" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
@@ -37,7 +51,7 @@ jobs:
           file: ./Dockerfile
           push: true
           tags: |
-            vicharanashala/pop-translation:latest
+            vicharanashala/pop-translation:${{ steps.tag.outputs.moving }}
             vicharanashala/pop-translation:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

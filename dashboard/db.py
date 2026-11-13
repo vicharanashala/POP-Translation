@@ -1,84 +1,294 @@
-"""SQLAlchemy engine/session setup for the dashboard package.
+"""MongoDB client/database setup for the dashboard package.
 
-New component -- no database exists anywhere else in this repo today (the
-existing pipeline's only persistence is a Zoho-hosted master.json blob, see
-docs/architecture.md). Sync engine (psycopg 3), plain session-per-request via
-get_db(); get_session() is the equivalent context-manager form for use from
-background threads (the upload queue worker, translation job runner) that
-aren't inside a FastAPI request.
+Sync driver (pymongo), matching the rest of this package -- the queue worker
+and translation runner are plain threads, so an async driver (Motor/Beanie)
+would fight the existing architecture for no gain.
+
+There is no session or transaction object to pass around: pymongo writes apply
+immediately, so `get_db()`/`get_session()` both simply hand out the Database.
+
+Which database this is depends on POP_ENV -- see dashboard/config.py. On
+staging it is SHARED with a different application, so every collection of ours
+is prefixed `pop_` and ours and theirs cannot collide; they have their own
+`states` and `crops`.
+
+No Atlas Vector Search index is created here. `unique_documents.chunk_embeddings`
+exists but is always empty -- fingerprints are computed and stored on local disk
+and joined back by sha256, because the cluster is a 512 MB free tier.
 """
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from pymongo import ASCENDING, DESCENDING, MongoClient
+from pymongo.collation import Collation
+from pymongo.database import Database
 
-from dashboard.config import DATABASE_URL
+from dashboard.config import (
+    CROP_MASTER_COLLECTION,
+    CROP_MASTER_DB_NAME,
+    CROP_MASTER_HOST_DB,
+    ORG_MASTER_COLLECTION,
+    _PREFIX,
+    DB_NAME,
+    DB_URL,
+    POP_ENV,
+)
+from dashboard.models import (
+    COLL_APPROVERS,
+    COLL_CONFIG,
+    COLL_CROP_ALIASES,
+    COLL_CROPS,
+    COLL_DISTRICTS,
+    COLL_DOCUMENTS,
+    COLL_KVKS,
+    COLL_LANGUAGES,
+    COLL_ORG_MASTER,
+    COLL_ORGANIZATIONS,
+    COLL_STATES,
+    COLL_TRANSLATION_JOBS,
+    COLL_UNIQUE_DOCUMENTS,
+    COLL_UPLOAD_QUEUE_ITEMS,
+    COLL_UPLOAD_TRAIL,
+)
+
+# Client/database are constructed lazily on first real use, not at import
+# time -- DB_URL may not be set yet, and pop_server.py imports this module
+# chain unconditionally at startup, so eagerly connecting here would crash the
+# already-working pipeline server before a single request is served.
+_client: MongoClient | None = None
+
+# Case-insensitive comparison, for state/crop names: the vocabulary's unique
+# index uses it, and so does every lookup of a typed name, so "beet root" finds
+# "Beet root".
+CI_COLLATION = Collation(locale="en", strength=2)
 
 
-class Base(DeclarativeBase):
-    pass
-
-
-# Engine/sessionmaker are constructed lazily on first real use, not at
-# import time -- DATABASE_URL may not be set yet (see config.py's comment),
-# and pop_server.py imports this module chain unconditionally at startup, so
-# eagerly calling create_engine(None) here would crash the already-working
-# pipeline server before a single request is served.
-_engine = None
-_SessionLocal: sessionmaker | None = None
-
-
-def _get_engine_and_sessionmaker():
-    global _engine, _SessionLocal
-    if _engine is None:
-        if not DATABASE_URL:
+def _get_client() -> MongoClient:
+    global _client
+    if _client is None:
+        if not DB_URL:
             raise RuntimeError(
-                "DATABASE_URL is not set -- the dashboard database is unavailable. "
-                "Set it in .env (see docs/dashboard_backend_plan.md §7) and restart."
+                "DB_URL is not set -- the dashboard database is unavailable. "
+                "Set it in .env (see docs/deployment.md) and restart."
             )
-        _engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-        _SessionLocal = sessionmaker(bind=_engine, autoflush=False, autocommit=False, expire_on_commit=False)
-    return _engine, _SessionLocal
+        if not DB_URL.startswith(("mongodb://", "mongodb+srv://")):
+            # Say WHICH value is wrong and show only its scheme, never the
+            # credentials. pymongo's own InvalidURI names neither, which made
+            # this hard to place when it first appeared in production.
+            raise RuntimeError(
+                "The configured MongoDB URL is not a MongoDB URI (it starts "
+                f"{DB_URL[:12]!r}...). POP_ENV={POP_ENV!r}, so the dashboard "
+                f"reads {'DB_URL' if os.environ.get('DB_URL') else _PREFIX + '_DB_URL'}"
+                " from .env. Note that `docker run --env-file` keeps the "
+                "surrounding quotes that `docker compose` strips."
+            )
+        _client = MongoClient(DB_URL, appname="pop-render")
+    return _client
+
+
+def get_database() -> Database:
+    return _get_client()[DB_NAME]
+
+
+def crops_collection(db: Database):
+    """Where `db`'s crops live: the crop master for the production dashboard
+    database, the local `pop_crops` copy for any other (staging, tests).
+
+    Same client either way -- the master is on the production cluster, in a
+    database the production user can read but not write.
+    """
+    if db.name == CROP_MASTER_HOST_DB:
+        return db.client[CROP_MASTER_DB_NAME][CROP_MASTER_COLLECTION]
+    return db[COLL_CROPS]
+
+
+def organizations_collection(db: Database):
+    """Where `db`'s organisations live, chosen exactly as crops_collection does:
+    agriai.organizations for the production dashboard database, the local
+    `pop_org_master` copy for any other. Its entries name themselves in
+    `org_name`, not `name` -- dashboard/vocabulary.py translates."""
+    if db.name == CROP_MASTER_HOST_DB:
+        return db.client[CROP_MASTER_DB_NAME][ORG_MASTER_COLLECTION]
+    return db[COLL_ORG_MASTER]
+
+
+# Index specs, applied by init_db(). Kept here rather than scattered through
+# the code so there is one place to see every constraint.
+#
+# Sort order note: every paginated listing sorts by (created_at DESC, _id ASC).
+# `created_at` alone is not a unique ordering -- a bulk migration inserts
+# thousands of documents with an identical timestamp -- and skip/limit over a
+# non-unique sort can return the same document on two pages or skip one
+# entirely. The compound indexes below serve that exact sort.
+_INDEXES: dict[str, list[dict]] = {
+    # -- the main table: pure association --------------------------------------
+    COLL_DOCUMENTS: [
+        # The placement's identity (POP_#####).
+        {"keys": [("row_id", ASCENDING)], "unique": True, "name": "uq_row_id"},
+        # Every join and every merge walks this. NOT unique: many placements
+        # point at one document -- that is the whole point.
+        {"keys": [("unique_document_id", ASCENDING)], "name": "unique_document_id"},
+        # The main table's two filter columns, by reference. Compound so
+        # "everything in Karnataka" and "Karnataka + Amaranthus" are both served
+        # by one index; `crop_id` alone gets its own, and is also what a crop
+        # delete checks before refusing.
+        {"keys": [("state_id", ASCENDING), ("crop_id", ASCENDING)], "name": "state_id_crop_id"},
+        {"keys": [("crop_id", ASCENDING)], "name": "crop_id"},
+        # No district_id / kvk_id here. They were placement references and are
+        # the DOCUMENT's fields now, so their indexes moved with them -- see
+        # COLL_UNIQUE_DOCUMENTS below. The two old sparse indexes on this
+        # collection are empty (no placement ever carried either value) and can
+        # be dropped by hand; init_db only creates.
+        # The other kind of folder: an organisation or grouping instead of a crop.
+        {"keys": [("state_id", ASCENDING), ("organization_id", ASCENDING)],
+         "name": "state_id_organization_id"},
+        {"keys": [("organization_id", ASCENDING)], "name": "organization_id"},
+        {"keys": [("created_at", DESCENDING), ("_id", ASCENDING)], "name": "created_at_id"},
+    ],
+    # -- one row per distinct document -----------------------------------------
+    COLL_UNIQUE_DOCUMENTS: [
+        {"keys": [("display_id", ASCENDING)], "unique": True, "name": "uq_display_id"},
+        # UNIQUE here, unlike the old flat schema: sha256 is the grouping key
+        # now, so two rows with the same hash would BE the same document. The
+        # index is what enforces that the corpus load and the upload path agree.
+        # partialFilterExpression rather than sparse: a document whose bytes were
+        # never hashed still needs a row, and `sparse` only skips a MISSING
+        # field -- an explicit sha256:null is still indexed, so several of them
+        # would collide. Restricting the index to actual strings is what makes
+        # unhashed documents possible.
+        {"keys": [("sha256", ASCENDING)], "unique": True, "name": "uq_sha256",
+         "partialFilterExpression": {"sha256": {"$type": "string"}}},
+        # A merged fingerprint belongs to one document, like an own one.
+        {"keys": [("merged_sha256s", ASCENDING)], "unique": True, "name": "uq_merged_sha256s",
+         "partialFilterExpression": {"merged_sha256s": {"$type": "string"}}},
+        {"keys": [("translation_status", ASCENDING)], "name": "translation_status"},
+        {"keys": [("review_status", ASCENDING)], "name": "review_status"},
+        # Finding the document behind a given physical copy -- used by the
+        # upload path and by anything starting from a WorkDrive file id.
+        {"keys": [("duplicate_links.zoho_file_id", ASCENDING)], "name": "copy_file_id"},
+        # Where the document applies. Sparse: nothing in the corpus has either,
+        # so indexing the ~8,750 documents that do not would be an index of
+        # nulls. A filter on one is a filter for the documents that have it.
+        {"keys": [("district_id", ASCENDING)], "name": "district_id", "sparse": True},
+        {"keys": [("kvk_id", ASCENDING)], "name": "kvk_id", "sparse": True},
+        {"keys": [("created_at", DESCENDING), ("_id", ASCENDING)], "name": "created_at_id"},
+    ],
+    # -- controlled vocabularies, referenced by id from every placement --------
+    # The name is unique CASE-INSENSITIVELY, so no write path can put "Beet
+    # Root" next to "Beet root". A differently-named index from the old
+    # case-sensitive `uq_name`, so creating it never conflicts with that one;
+    # scripts/migrate_vocabulary_refs.py drops the old index.
+    COLL_STATES: [{"keys": [("name", ASCENDING)], "unique": True, "name": "uq_name_ci",
+                   "collation": CI_COLLATION},
+                  # The LGD code the sync matches on. Partial rather than sparse:
+                  # `Central` has no LGD counterpart of its own, and several
+                  # code-less entries must not collide on null.
+                  {"keys": [("state_code", ASCENDING)], "unique": True, "name": "uq_state_code",
+                   "partialFilterExpression": {"state_code": {"$type": "number"}}}],
+    # pop_crops is a verbatim copy of the crop master, which has its own
+    # (case-SENSITIVE) unique name -- and "Amaranth" next to "amaranth" -- so no
+    # index of ours is imposed on the copy.
+    COLL_CROPS: [],
+    COLL_ORGANIZATIONS: [{"keys": [("name", ASCENDING)], "unique": True, "name": "uq_name_ci",
+                          "collation": CI_COLLATION}],
+    # Synced from LGD, so the CODE is the identity -- not the name. District
+    # names are NOT unique across India: Bilaspur is in both Chhattisgarh and
+    # Himachal Pradesh, Hamirpur in both Himachal Pradesh and Uttar Pradesh.
+    #
+    # Nor are they unique WITHIN a state, which is the tempting next guess and is
+    # also wrong: LGD keeps both halves of a split under one English name, so
+    # Rajasthan really does list `Jaipur` twice (codes 102 and 783) and `Jodhpur`
+    # twice (107 and 778), and one district lists two KVKs both called
+    # `Balrampur`. So (parent, name) is indexed for the dropdown's query but NOT
+    # unique -- the code carries uniqueness, and only the code.
+    COLL_DISTRICTS: [
+        {"keys": [("district_code", ASCENDING)], "unique": True, "name": "uq_district_code",
+         "partialFilterExpression": {"district_code": {"$type": "number"}}},
+        {"keys": [("state_id", ASCENDING), ("name", ASCENDING)],
+         "name": "state_name_ci", "collation": CI_COLLATION},
+        # Exactly ONE shared "All" row per collection. Partial on the flag being
+        # true, so the 786 synced rows (which have no such field) do not all
+        # collide on its absence.
+        {"keys": [("is_all", ASCENDING)], "unique": True, "name": "uq_is_all",
+         "partialFilterExpression": {"is_all": True}},
+    ],
+    COLL_KVKS: [
+        # kvk_code is LGD's "K0001" -- a string, unlike the numeric district and
+        # state codes.
+        {"keys": [("kvk_code", ASCENDING)], "unique": True, "name": "uq_kvk_code",
+         "partialFilterExpression": {"kvk_code": {"$type": "string"}}},
+        {"keys": [("district_id", ASCENDING), ("name", ASCENDING)],
+         "name": "district_name_ci", "collation": CI_COLLATION},
+        {"keys": [("is_all", ASCENDING)], "unique": True, "name": "uq_is_all",
+         "partialFilterExpression": {"is_all": True}},
+        # Only for the sync and for stats; the dropdown narrows by district.
+        {"keys": [("state_id", ASCENDING)], "name": "state_id"},
+    ],
+    COLL_CROP_ALIASES: [{"keys": [("spelling", ASCENDING)], "unique": True, "name": "uq_spelling_ci",
+                         "collation": CI_COLLATION}],
+    COLL_LANGUAGES: [{"keys": [("code", ASCENDING)], "unique": True, "name": "uq_code"}],
+    COLL_UPLOAD_QUEUE_ITEMS: [
+        {"keys": [("created_at", DESCENDING), ("_id", ASCENDING)], "name": "created_at_id"},
+        {"keys": [("status", ASCENDING)], "name": "status"},
+        # Who sees an item: its uploader, or whoever holds the stage it is at.
+        {"keys": [("expert", ASCENDING)], "name": "expert"},
+        # The same file may not be queued twice (routes_uploads._refuse_if_queued).
+        # Not unique: items queued before that check may already share one.
+        {"keys": [("sha256", ASCENDING)], "name": "sha256"},
+    ],
+    COLL_UPLOAD_TRAIL: [
+        {"keys": [("created_at", DESCENDING), ("_id", ASCENDING)], "name": "created_at_id"},
+    ],
+    COLL_APPROVERS: [
+        {"keys": [("list", ASCENDING), ("user_id", ASCENDING)], "unique": True, "name": "uq_list_user"},
+    ],
+    COLL_TRANSLATION_JOBS: [
+        # Scoped to a unique document now, not a placement -- translating a
+        # document once covers all of its placements.
+        {"keys": [("document_id", ASCENDING)], "name": "document_id"},
+        {"keys": [("status", ASCENDING), ("created_at", DESCENDING)], "name": "status_created_at"},
+        {"keys": [("created_at", DESCENDING), ("_id", ASCENDING)], "name": "created_at_id"},
+    ],
+    COLL_CONFIG: [],
+}
 
 
 def init_db() -> None:
-    """Create the pgvector extension (if missing) and all tables. Idempotent
-    -- safe to call on every startup, matching the existing lifespan()'s
-    idempotent Zoho-singleton init in pop_server.py. Raises RuntimeError
-    (caught and logged, not fatal) if DATABASE_URL isn't configured yet."""
-    engine, _ = _get_engine_and_sessionmaker()
-    with engine.begin() as conn:
-        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-    import dashboard.models  # noqa: F401  (registers all tables on Base.metadata)
+    """Create every collection index.
 
-    Base.metadata.create_all(engine)
+    Idempotent -- safe to call on every startup, matching the existing
+    idempotent Zoho-singleton init in pop_server.py. Raises RuntimeError
+    (caught and logged, not fatal) if DB_URL isn't configured yet.
+    """
+    db = get_database()
+    for collection_name, specs in _INDEXES.items():
+        collection = db[collection_name]
+        for spec in specs:
+            kwargs = {k: v for k, v in spec.items() if k != "keys"}
+            collection.create_index(spec["keys"], **kwargs)
 
 
 @contextmanager
 def get_session():
-    _, SessionLocal = _get_engine_and_sessionmaker()
-    session: Session = SessionLocal()
-    try:
-        yield session
-        session.commit()
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
+    """Context-manager form for use from background threads (the upload
+    worker, the translation job runner) that aren't inside a FastAPI request.
+
+    There is no transaction to commit or roll back -- pymongo writes apply
+    immediately -- so this simply yields the Database.
+    """
+    yield get_database()
 
 
 def get_db():
     """FastAPI dependency form of get_session()."""
-    _, SessionLocal = _get_engine_and_sessionmaker()
-    session: Session = SessionLocal()
-    try:
-        yield session
-        session.commit()
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
+    yield get_database()
+
+
+def close() -> None:
+    """Close the client. Only needed by tests and one-off scripts."""
+    global _client
+    if _client is not None:
+        _client.close()
+        _client = None

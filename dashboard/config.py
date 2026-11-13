@@ -23,21 +23,109 @@ load_dotenv(REPO_ROOT / ".env")
 # upload calls), not at import time -- same reasoning as ZohoWorkDrive()
 # itself only being constructed lazily via pop_server._get_zoho(), never at
 # import.
-DATABASE_URL = os.environ.get("DATABASE_URL")
+# MongoDB Atlas. There are two deployments, named by env-var PREFIX in .env:
+#
+#   STAGING_DB_URL / STAGING_DB_NAME   the shared agriai-test-riya database
+#   PROD_DB_URL    / PROD_DB_NAME      the dashboard's own database
+#
+# POP_ENV picks which one this process uses; it defaults to staging so a
+# deploy that forgets to set it does not write to production. Plain DB_URL /
+# DB_NAME still win when set, so an older .env (and the docker-compose that
+# passes them straight through) keeps working unchanged.
+#
+# The staging database is SHARED with a different application, which has its
+# own `users`, `questions`, `states`, `crops` and ~18k audit rows in it. Every
+# collection of ours is therefore prefixed `pop_` (see dashboard/models.py).
+# The prefix is not cosmetic: without it our `states` and `crops` would
+# collide with theirs.
+#
+# Nothing here reads any other database.
+#
+# The staging cluster is a 512 MB free tier. That is the reason
+# `chunk_embeddings` is always empty: the metadata is ~16 MB, while one
+# 768-float vector per document is another ~27 MB plus an Atlas Vector Search
+# index, and per-CHUNK vectors are many times that. Fingerprints live on local
+# disk instead (see fix/out/), keyed back to a document by sha256.
+
+
+def _env(name: str) -> str:
+    """Read an env var, stripped of whitespace AND of surrounding quotes.
+
+    The quotes matter in production. `.env` here writes the values quoted
+    (PROD_DB_URL="mongodb+srv://..."), and `docker compose` strips those
+    during ${VAR} interpolation -- which is why a local `docker compose up`
+    has never hit this. `docker run --env-file .env` does NOT strip them: the
+    value arrives beginning with a literal `"`, and MongoClient then raises
+    `InvalidURI: URI must begin with 'mongodb://' or 'mongodb+srv://'`.
+    """
+    value = (os.environ.get(name) or "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1].strip()
+    return value
+
+
+POP_ENV = _env("POP_ENV").lower() or "staging"
+_PREFIX = "PROD" if POP_ENV in ("prod", "production") else "STAGING"
+
+# The plain DB_URL override is only honoured when it really is a MongoDB URI.
+# It is read before the prefixed vars purely for backwards compatibility with
+# an older .env; anything else there (a bare database name, a leftover from
+# another service) is ignored rather than handed to MongoClient. DB_NAME
+# follows DB_URL rather than being read on its own -- a plain DB_NAME belongs
+# to whatever set that plain DB_URL, not to us.
+_plain_url = _env("DB_URL")
+if not _plain_url.startswith(("mongodb://", "mongodb+srv://")):
+    _plain_url = ""
+
+DB_URL = _plain_url or _env(f"{_PREFIX}_DB_URL")
+DB_NAME = (
+    (_env("DB_NAME") if _plain_url else "")
+    or _env(f"{_PREFIX}_DB_NAME")
+    or "agriai-test-riya"
+)
+
+# Crops are NOT ours. Production references the crop master that another
+# application maintains (agriai.crop_master, same cluster as PROD_DB_URL, read
+# access only). Staging's cluster cannot reach it, so staging keeps a copy in
+# its own `pop_crops` (dashboard/migrate_vocabulary_refs.py --sync-master).
+# Either way this backend only READS crops; see dashboard/vocabulary.py.
+#
+# Which one a database uses is decided per database, not per process: the
+# production dashboard database (PROD_DB_NAME) reads the master, any other reads
+# its local copy. That keeps a script that opens both deployments from reading
+# the wrong list for one of them.
+CROP_MASTER_HOST_DB = _env("PROD_DB_NAME") or "pop_dashboard"
+CROP_MASTER_DB_NAME = _env("CROP_MASTER_DB_NAME") or "agriai"
+CROP_MASTER_COLLECTION = _env("CROP_MASTER_COLLECTION") or "crop_master"
+# The organisation master, in the same database as the crop master and read the
+# same way: production reads agriai.organizations, anything else its local copy.
+ORG_MASTER_COLLECTION = _env("ORG_MASTER_COLLECTION") or "organizations"
+
+# Pages a dashboard translation sends to the LLM at once.
+DASHBOARD_TRANSLATE_CONCURRENCY = max(1, int(_env("DASHBOARD_TRANSLATE_CONCURRENCY") or 3))
+
+# The two-step translation (pipeline 1): a self-hosted OCR service reads each
+# page, then Gemini Flash translates the transcript. Without OCR_URL pipeline 1
+# is simply unavailable and every translation runs as pipeline 0, as before.
+OCR_URL = _env("OCR_URL")
+FLASH_MODEL = _env("GEMINI_FLASH_MODEL") or "gemini-3.8-flash"
+TRANSCRIPT_PROMPT_FILE = REPO_ROOT / "prompts" / "transcript_to_english.txt"
+
+
+def flash_api_key() -> str:
+    """Flash's own key when it is billed apart from the main one, else the main
+    Gemini key. Read at call time, like every key here."""
+    return _env("GEMINI_FLASH_API_KEY") or _env("GEMINI_API_KEY")
 
 # Fixed, pre-created Zoho WorkDrive subfolder IDs for the dashboard's three
 # upload kinds -- see dashboard/zoho_layout.py.
 ZOHO_DASHBOARD_ORIGINALS_FOLDER_ID = os.environ.get("ZOHO_DASHBOARD_ORIGINALS_FOLDER_ID")
 ZOHO_DASHBOARD_TRANSLATIONS_FOLDER_ID = os.environ.get("ZOHO_DASHBOARD_TRANSLATIONS_FOLDER_ID")
 ZOHO_DASHBOARD_REVIEWS_FOLDER_ID = os.environ.get("ZOHO_DASHBOARD_REVIEWS_FOLDER_ID")
-DUPLICATE_EMBEDDING_THRESHOLD = float(os.environ.get("DUPLICATE_EMBEDDING_THRESHOLD", "0.95"))
 
-# Kill switch for the dashboard's per-document translate button (2026-08-27):
-# production is Gemini-only for now (MiniMax isn't available there) and the
-# translate flow hasn't been properly load-tested/wired for that yet, so this
-# release ships document management only -- see dashboard/routes_translation.py.
-# Defaults to "on" so this doesn't silently disable translation anywhere this
-# var isn't explicitly set; this release's .env sets TRANS=off.
+# Kill switch for the dashboard's per-document translate button. Defaults to
+# "on" so this doesn't silently disable translation anywhere the var isn't
+# explicitly set.
 TRANS_ENABLED = os.environ.get("TRANS", "on").strip().lower() not in ("off", "0", "false")
 
 PAGE_SIZE = 100
