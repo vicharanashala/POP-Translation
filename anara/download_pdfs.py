@@ -1,7 +1,7 @@
 """Download every unique document's file from Zoho into data/pdfs/<doc_id>.<fmt>.
 
 Idempotent: files already on disk are skipped, so rerun freely after a failure.
-    python chunk_search_test/download_pdfs.py [--limit N]
+    python anara/download_pdfs.py [--limit N]
 """
 from __future__ import annotations
 

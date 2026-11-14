@@ -1,7 +1,7 @@
-# chunk_search_test: index
+# anara: index
 
 Standalone local test: do chunk embeddings find the right document and page for a query?
-Nothing here imports `dashboard/`. Run everything with `.venv/bin/python3 chunk_search_test/<script>`.
+Nothing here imports `dashboard/`. Run everything with `.venv/bin/python3 anara/<script>`.
 
 ## Decisions
 - Embedding model: `BAAI/bge-small-en-v1.5` (English, CPU, 384 dims). Not multilingual-e5.

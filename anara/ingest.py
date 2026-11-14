@@ -4,7 +4,7 @@ For each document marked english_text in data/text_report.csv:
     unique_documents  <- {_id: doc_id, name, link, pages, states, num_chunks}
     doc_embeddings    <- {document_id, page, chunk_index, text, embedding}
 Idempotent: a document that already has embeddings is skipped; --redo deletes and rebuilds.
-    python chunk_search_test/ingest.py [--limit N] [--redo]
+    python anara/ingest.py [--limit N] [--redo]
 """
 from __future__ import annotations
 

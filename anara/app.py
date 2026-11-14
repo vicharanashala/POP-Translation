@@ -1,6 +1,6 @@
 """Local search page: type a query, see the relevant documents and pages.
 
-    .venv/bin/python3 chunk_search_test/app.py        # then open http://127.0.0.1:8050
+    .venv/bin/python3 anara/app.py        # then open http://127.0.0.1:8050
     GET /api/search?q=...&k=50  ->  search() output as JSON
 
 Listens on 127.0.0.1 only. Loads the embedding model once at startup.

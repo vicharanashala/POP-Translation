@@ -1,7 +1,7 @@
 """Query -> ranked documents (and pages) by how many of their chunks match.
 
-    python chunk_search_test/search.py create-index          # Atlas vector index (once)
-    python chunk_search_test/search.py "your question" [-k 50] [--local]
+    python anara/search.py create-index          # Atlas vector index (once)
+    python anara/search.py "your question" [-k 50] [--local]
 
 Library use:  search(query, k=50, local=False) -> list of documents, best first:
     {"doc_id", "name", "link", "matches", "score_sum", "score_max", "pages": [page, ...],

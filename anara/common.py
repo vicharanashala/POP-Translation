@@ -1,4 +1,4 @@
-"""Shared helpers for chunk_search_test. Every script imports from here; see INDEX.md.
+"""Shared helpers for anara. Every script imports from here; see INDEX.md.
 
 Standalone: nothing in dashboard/ is imported. The only repo code reused is
 helpers/zoho_workdrive.py (read-only file download).
@@ -18,7 +18,7 @@ PDF_DIR = DATA / "pdfs"
 XLSX = HERE / "pop-documents-state-2026-11-12.xlsx"
 
 # Zoho credentials come from the repo's .env (read only). Mongo settings come
-# from chunk_search_test/.env so the test DB never mixes with POP's.
+# from anara/.env so the test DB never mixes with POP's.
 load_dotenv(ROOT / ".env")
 load_dotenv(HERE / ".env", override=True)
 for p in (str(ROOT),):

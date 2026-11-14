@@ -9,7 +9,7 @@ For each downloaded PDF: extract text per page with PyMuPDF (no OCR), then
     verdict      english_text | scanned_no_text | non_english | mixed | not_pdf
 
 Reusable: extract_pages(path) returns [page text, ...] and is what the chunker uses.
-    python chunk_search_test/textcheck.py
+    python anara/textcheck.py
 """
 from __future__ import annotations
 

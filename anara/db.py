@@ -1,4 +1,4 @@
-"""MongoDB Atlas access for the test (your own cluster, MONGO_URI in chunk_search_test/.env).
+"""MongoDB Atlas access for the test (your own cluster, MONGO_URI in anara/.env).
 
     db = get_db()                      # database MONGO_DB (default "chunk_search_test")
     db.unique_documents                # one row per document: _id, name, link, ...
