@@ -1,0 +1,110 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Source Mapper: document search, work so far</title>
+<style>
+@page{size:A4;margin:11mm 14mm}
+body{font:9.6pt/1.33 "DejaVu Sans",Arial,sans-serif;color:#222;margin:0}
+h1{font-size:18pt;margin:0 0 2pt}h2{font-size:12pt;margin:11pt 0 3pt;color:#2b3a8c;border-bottom:1px solid #ccd;padding-bottom:1pt}
+.sub{color:#666;margin-bottom:6pt}p{margin:3pt 0}ul{margin:3pt 0 3pt 14pt;padding:0}li{margin:1.5pt 0}
+table{border-collapse:collapse;width:100%;margin:4pt 0;font-size:9pt}
+th,td{border:1px solid #ccd;padding:2.5pt 5pt;text-align:left;vertical-align:top}th{background:#eef0fa}
+.pb{page-break-before:always}
+.box{background:#f4f6fc;border-left:3px solid #2b3a8c;padding:3pt 7pt;margin:4pt 0}
+.warn{background:#fff6e5;border-left-color:#d98a00}
+svg{display:block;margin:4pt auto}
+</style></head><body>
+
+<h1>Source Mapper: finding the right document and page for a question</h1>
+<div class="sub">What we set out to do, what we built, what we learned, and what is next. Branch <b>anara</b>, folder <b>anara/</b>. Local testing only; nothing here touches the POP dashboard.</div>
+
+<h2>1. The goal</h2>
+<p>A person types a question, for example <i>"How do I control pink bollworm in cotton?"</i>. The system should return the documents most likely to answer it, best first, and name the pages inside each. We are testing this on 533 Punjab agriculture documents before deciding whether to add it to POP.</p>
+
+<h2>2. How the search works today</h2>
+<svg width="640" height="212" viewBox="0 0 640 212" font-family="DejaVu Sans,Arial" font-size="11">
+ <defs><marker id="a" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#667"/></marker></defs>
+ <text x="4" y="12" fill="#667" font-size="10">Done once, when documents are loaded</text>
+ <g fill="#e7e9fb" stroke="#7c82d6">
+  <rect x="4" y="20" width="140" height="46" rx="7"/><rect x="168" y="20" width="140" height="46" rx="7"/>
+  <rect x="332" y="20" width="140" height="46" rx="7"/></g>
+ <rect x="496" y="20" width="140" height="46" rx="7" fill="#dff3ea" stroke="#3f8f73"/>
+ <g text-anchor="middle" fill="#222">
+  <text x="74" y="40">Download PDFs</text><text x="74" y="55" font-size="9.5" fill="#555">from Zoho (533)</text>
+  <text x="238" y="40">Read the text</text><text x="238" y="55" font-size="9.5" fill="#555">English only (306)</text>
+  <text x="402" y="40">Cut into chunks</text><text x="402" y="55" font-size="9.5" fill="#555">~180 words, one page</text>
+  <text x="566" y="40">Turn chunks into</text><text x="566" y="55" font-size="9.5" fill="#555">numbers, store (28,155)</text></g>
+ <g stroke="#667" stroke-width="1.5" marker-end="url(#a)"><line x1="144" y1="43" x2="164" y2="43"/><line x1="308" y1="43" x2="328" y2="43"/><line x1="472" y1="43" x2="492" y2="43"/></g>
+ <text x="4" y="112" fill="#667" font-size="10">Every search</text>
+ <rect x="4" y="120" width="140" height="46" rx="7" fill="#eee" stroke="#999"/>
+ <g fill="#e7e9fb" stroke="#7c82d6"><rect x="168" y="120" width="140" height="46" rx="7"/><rect x="332" y="120" width="140" height="46" rx="7"/></g>
+ <rect x="496" y="120" width="140" height="46" rx="7" fill="#dff3ea" stroke="#3f8f73"/>
+ <g text-anchor="middle" fill="#222">
+  <text x="74" y="140">Your question</text><text x="74" y="155" font-size="9.5" fill="#555">typed in the web page</text>
+  <text x="238" y="140">Turn it into numbers</text><text x="238" y="155" font-size="9.5" fill="#555">same method as chunks</text>
+  <text x="402" y="140">Find 500 closest</text><text x="402" y="155" font-size="9.5" fill="#555">chunks by meaning</text>
+  <text x="566" y="140">Rank documents</text><text x="566" y="155" font-size="9.5" fill="#555">mean of best 5 chunks</text></g>
+ <g stroke="#667" stroke-width="1.5" marker-end="url(#a)"><line x1="144" y1="143" x2="164" y2="143"/><line x1="308" y1="143" x2="328" y2="143"/><line x1="472" y1="143" x2="492" y2="143"/></g>
+ <path d="M566 66 L566 92 L402 92 L402 116" fill="none" stroke="#667" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#a)"/>
+ <text x="636" y="188" text-anchor="end" fill="#555" font-size="9.5">Dashed: the search reads the stored chunks (MongoDB Atlas, 167 MB)</text>
+</svg>
+<ul>
+<li><b>"Numbers" means an embedding.</b> A small English model (BAAI bge-small-en-v1.5, runs on an ordinary CPU) turns a piece of text into 384 numbers. Text with similar meaning gets similar numbers, so "foot rot" can match text that never uses those exact words.</li>
+<li><b>Chunks stay inside one page,</b> so every result names a real PDF page.</li>
+<li><b>A local web page</b> (<code>python anara/app.py</code>, address 127.0.0.1:8050) takes a typed question and lists documents with their pages and a text snippet.</li>
+</ul>
+
+<h2>3. What the 533 documents turned out to be</h2>
+<table>
+<tr><th>Group</th><th>Documents</th><th>What we did</th></tr>
+<tr><td>English text, readable</td><td>306 (11,555 pages)</td><td>Searchable now</td></tr>
+<tr><td>Scanned, no text layer</td><td>135 (834 pages)</td><td>Left out; needs OCR (text recognition)</td></tr>
+<tr><td>Images, web links, printed</td><td>78</td><td>Left out; not PDFs</td></tr>
+<tr><td>Punjabi script or mixed</td><td>13</td><td>Left out; English model</td></tr>
+<tr><td>Unreadable file</td><td>1</td><td>Left out</td></tr>
+</table>
+<p>The language label in the spreadsheet is unreliable: 36 documents marked Punjabi contain English. We checked the real text instead. The spreadsheet has 709 rows because one document is filed in several folders; there are 533 distinct documents.</p>
+
+<h2>4. How we rank documents (we changed this three times)</h2>
+<table>
+<tr><th>Version</th><th>Rule</th><th>What we saw</th></tr>
+<tr><td>1</td><td>Most matching chunks wins</td><td>Sensible, but a very long document can win just by having more chunks.</td></tr>
+<tr><td>2</td><td>Single best chunk wins</td><td>A page with one lucky match beat the real guide.</td></tr>
+<tr><td>3 (now)</td><td>Average of a document's best 5 chunks</td><td>Guides about the topic come first. Documents with fewer than 5 matching chunks are scored low.</td></tr>
+</table>
+<div class="box warn"><b>Not measured yet.</b> All judgments so far come from reading results for a handful of test questions. We have no list of questions with known right answers, so we cannot give an accuracy figure. Many documents are near-copies (the same guide from different years), and they sit next to each other in the results.</div>
+
+<h2>5. Adding keyword search: what we tried</h2>
+<p><b>Idea:</b> find the words that make a page special, list which pages hold each word, and let a question's words narrow the area before the meaning search runs, so only a fraction of the chunks is searched. If no question word is in the list, we fall back to searching everything. A page's neighbours (two pages either side) would be included.</p>
+<svg width="640" height="92" viewBox="0 0 640 92" font-family="DejaVu Sans,Arial" font-size="10.5">
+ <defs><marker id="b" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#667"/></marker></defs>
+ <g fill="#fff6e5" stroke="#d98a00"><rect x="2" y="10" width="112" height="44" rx="7"/><rect x="134" y="10" width="112" height="44" rx="7"/><rect x="266" y="10" width="112" height="44" rx="7"/><rect x="398" y="10" width="112" height="44" rx="7"/></g>
+ <rect x="530" y="10" width="108" height="44" rx="7" fill="#dff3ea" stroke="#3f8f73"/>
+ <g text-anchor="middle" fill="#222">
+  <text x="58" y="29">Score every</text><text x="58" y="43">word on every page</text>
+  <text x="190" y="29">Keep the important</text><text x="190" y="43">words per page</text>
+  <text x="322" y="29">Word to pages</text><text x="322" y="43">list (index)</text>
+  <text x="454" y="29">Question words</text><text x="454" y="43">look up pages, +/-2</text>
+  <text x="584" y="29">Meaning search</text><text x="584" y="43">only in that area</text></g>
+ <g stroke="#667" stroke-width="1.5" marker-end="url(#b)"><line x1="114" y1="32" x2="130" y2="32"/><line x1="246" y1="32" x2="262" y2="32"/><line x1="378" y1="32" x2="394" y2="32"/><line x1="510" y1="32" x2="526" y2="32"/></g>
+ <text x="2" y="78" fill="#a35f00">Yellow = designed and tested only on the scoring step; the index, lookup and narrowed search are not built yet.</text>
+</svg>
+<table>
+<tr><th>Attempt</th><th>Result</th></tr>
+<tr><td><b>TF-IDF with a cutoff.</b> A word scores high if it is frequent on a page but rare across documents.</td><td>Failed. Crop words such as wheat and paddy appear in about 40% of documents, so they can never score high. None of the words in our four test questions survived the cutoff.</td></tr>
+<tr><td><b>BM25</b>, a refined version: repeats count less and less, long pages are not favoured, scores never go negative.</td><td>Adopted. With a rule "word in 2 or more documents, under 60% of them", most test words stayed. But common words still listed 1,000 to 1,600 pages each, so the narrowed area was 9% to 28% of the corpus before adding neighbours.</td></tr>
+<tr><td><b>Top 10 words per page by BM25 alone.</b></td><td>Mostly noise: garbled text from PDF extraction (<i>aqi</i>, <i>qon</i>, <i>lei</i>) and words from unrelated documents (<i>student</i>, <i>clerk</i>). Wheat became a keyword on 3 pages, paddy on none. Basmati (72 pages) and bollworm (63) worked well.</td></tr>
+</table>
+
+<h2>6. Where we are, and the open decisions</h2>
+<ul>
+<li><b>Page counts are very uneven:</b> median 4 pages, mean 38, largest 1,705. 201 documents have 10 pages or fewer but hold only 6% of the pages; 36 documents over 100 pages hold 76%.</li>
+<li><b>Current plan:</b> split each long document into equal windows of about 10 pages, so a word concentrated in one stretch of a big book scores higher there than a word spread across the whole book. Short documents stay one window.</li>
+<li><b>Limit we found:</b> BM25 scores are capped by how rare a word is, so a fixed cutoff keeps only rare words. Choosing that deliberately means a question like "wheat late sowing" may have no keywords and fall back to the full search.</li>
+</ul>
+<table>
+<tr><th>Decision for the team</th><th>Our suggestion</th></tr>
+<tr><td>Keywords: only rare words, or each word's best pages?</td><td>Per word, so crop words stay useful</td></tr>
+<tr><td>Window size: 10 or 20 pages? Equal by pages or by text length?</td><td>Compare 10 and 20</td></tr>
+<tr><td>Test set of about 30 questions with known answers</td><td>Needed before any further tuning</td></tr>
+</table>
+<div class="box"><b>Status.</b> Working and tested: download, text check, chunking, embedding, storage in Atlas, vector search, local web page, top-5 ranking. Experimented but not finished: keyword scoring. Not built: the keyword index, the narrowed search, the comparison with the full search, and scanned-document OCR. The code is in <code>anara/</code>; <code>INDEX.md</code> lists every file.</div>
+</body></html>

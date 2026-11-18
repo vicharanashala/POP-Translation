@@ -18,6 +18,7 @@ sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from db import get_db  # noqa: E402
 from embedder import get_model  # noqa: E402
 from search import search  # noqa: E402
+from hybrid import search_hybrid  # noqa: E402
 
 
 @asynccontextmanager
@@ -42,13 +43,13 @@ button{padding:.6rem 1.2rem;font-size:16px;cursor:pointer}
 </style>
 <h2>Document search</h2>
 <form id=f><input id=q placeholder="Ask a question, e.g. how to control pink bollworm in cotton" autofocus>
-<button>Search</button></form>
+<select id=mode><option value=full>Embedding only</option><option value=hybrid>Keywords + embedding</option></select><button>Search</button></form>
 <div id=status></div><div id=out></div>
 <script>
 const esc=s=>s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 f.onsubmit=async e=>{e.preventDefault();const q=document.getElementById('q').value.trim();if(!q)return;
  status.textContent='Searching...';out.innerHTML='';const t=performance.now();
- const r=await fetch('/api/search?q='+encodeURIComponent(q));const d=await r.json();
+ const r=await fetch('/api/search?mode='+document.getElementById('mode').value+'&q='+encodeURIComponent(q));const d=await r.json();
  status.textContent=d.length+' documents in '+((performance.now()-t)/1000).toFixed(1)+' s';
  out.innerHTML=d.map((x,i)=>`<div class=doc><h3>${i+1}. <a href="${x.link}" target=_blank>${esc(x.name)}</a></h3>
  <div class=meta>top-5 mean ${x.top5_mean.toFixed(3)} &middot; ${x.matches} chunks in pool &middot; best chunk ${x.score_max.toFixed(3)} &middot; pages ${x.pages.join(', ')}</div>
@@ -63,7 +64,11 @@ def index():
 
 @app.get("/api/search")
 def api_search(q: str = Query(min_length=1), k: int | None = Query(None, ge=5, le=1000),
-               rank: str = Query("top5", pattern="^(top5|count|best)$")):
+               rank: str = Query("top5", pattern="^(top5|count|best)$"),
+               mode: str = Query("full", pattern="^(full|hybrid)$")):
+    """mode=hybrid narrows by keywords (+/-2 pages) before the embedding search; see hybrid.py."""
+    if mode == "hybrid":
+        return search_hybrid(q)
     return search(q, k, rank=rank)
 
 
