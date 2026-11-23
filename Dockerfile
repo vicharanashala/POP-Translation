@@ -9,7 +9,7 @@ FROM python:3.11-slim
 # No tesseract-ocr-<lang> packages -- OCR always points at the bundled
 # tessdata_best/ models (see scripts/hash_and_embed_report_true.py), never
 # the system tessdata dir.
-# tailscale curl: for tailscale VPN connectivity
+# curl: downloads the s6-overlay release below.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pandoc \
     tesseract-ocr \
@@ -18,20 +18,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     build-essential \
     curl \
-    iptables \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-
-# ============================================
-# Install Tailscale
-# ============================================
-RUN curl -fsSL https://pkgs.tailscale.com/stable/tailscale_1.78.1_amd64.tgz | tar -xz -C /usr/local
-RUN ldconfig
-
-# Create essential runtime directories for the Tailscale daemon
-RUN mkdir -p /var/run/tailscale /var/lib/tailscale /dev/net && \
-    touch /dev/net/tun && \
-    chmod 600 /dev/net/tun
 
 # ============================================
 # Install s6-overlay for process management
@@ -43,8 +31,8 @@ RUN curl -sL https://github.com/just-containers/s6-overlay/releases/download/v${
     tar -C / -Jxpf /tmp/s6-overlay-x86_64.tar.xz && \
     rm /tmp/s6-overlay-*.tar.xz
 
-# Create s6 service directories
-RUN mkdir -p /etc/services.d/tailscale /etc/services.d/python
+# Create s6 service directory
+RUN mkdir -p /etc/services.d/python
 
 WORKDIR /app
 
@@ -59,12 +47,11 @@ COPY . .
 
 RUN mkdir -p pop-data/POP_Work/Data pop-data/POP_Work/Workdir
 
-# Copy s6 service scripts
-COPY s6-scripts/tailscale-run /etc/services.d/tailscale/run
+# Copy the s6 service script
 COPY s6-scripts/python-run /etc/services.d/python/run
 
-# Make scripts executable
-RUN chmod +x /etc/services.d/tailscale/run /etc/services.d/python/run
+# Make it executable
+RUN chmod +x /etc/services.d/python/run
 
 VOLUME ["/app/pop-data"]
 
