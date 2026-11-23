@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Source Mapper</title>
+<style>
+:root{--bg:#f5f6fa;--card:#fff;--ink:#1d2433;--mut:#667085;--line:#e3e6ef;--acc:#3b4cca;--accbg:#eef0ff;
+--ok:#1f8a5b;--okbg:#e7f6ee;--warn:#a85f00;--warnbg:#fff4e0;--hl:#f0a020}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:940px;margin:0 auto;padding:30px 18px 70px}
+h1{margin:0;font-size:25px;letter-spacing:-.01em}
+.lead{margin:.2rem 0 1.1rem;color:var(--mut)}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;box-shadow:0 1px 2px rgba(16,24,40,.05)}
+.row{display:flex;gap:10px;flex-wrap:wrap}.row+.row{margin-top:10px}
+input,select{font:inherit;padding:.65rem .85rem;border:1px solid var(--line);border-radius:10px;background:#fff;color:var(--ink);min-width:0}
+input:focus,select:focus{outline:2px solid var(--acc);outline-offset:-1px;border-color:transparent}
+#q{flex:1 1 380px;font-size:16px}#link{flex:1 1 320px}
+button{font:inherit;font-weight:600;padding:.65rem 1.5rem;border:0;border-radius:10px;background:var(--acc);color:#fff;cursor:pointer}
+button:hover{background:#2f3fb5}button:disabled{opacity:.6;cursor:wait}
+#status{color:var(--mut);font-size:13px;margin:16px 2px 8px;min-height:1.3em}
+.note{padding:.6rem .9rem;border-radius:10px;margin:8px 0;font-size:14px;border:1px solid}
+.note.ok{background:var(--okbg);border-color:#bfe6d2;color:#14583b}
+.note.bad{background:var(--warnbg);border-color:#f3d9a8;color:#7a4500}
+#kw:empty{display:none}
+#kw{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 14px;margin:8px 0;font-size:13px}
+#kw .t{font-weight:600;margin-bottom:6px}
+.kwrow{display:flex;flex-wrap:wrap;align-items:center;gap:5px;margin:4px 0}
+.chip{display:inline-block;padding:1px 9px;border-radius:999px;background:#f0f2f8;color:#3a4256;font-size:12.5px;border:1px solid var(--line)}
+.chip.q{background:var(--accbg);color:var(--acc);border-color:#d5d9fb;font-weight:600}
+.chip.dim{color:var(--mut);background:#fafafa}
+.arrow{color:var(--mut)}
+.doc{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 16px;margin:12px 0;box-shadow:0 1px 2px rgba(16,24,40,.04)}
+.doc.hl{border:2px solid var(--hl);background:#fffaf0;box-shadow:0 0 0 5px #ffe8bf}
+.dh{display:flex;gap:12px;align-items:flex-start}
+.rank{flex:none;width:30px;height:30px;border-radius:50%;background:var(--accbg);color:var(--acc);display:grid;place-items:center;font-weight:700;font-size:13px}
+.dt{flex:1;min-width:0}
+.dt a{color:var(--ink);font-weight:600;font-size:16px;text-decoration:none;overflow-wrap:anywhere}
+.dt a:hover{color:var(--acc);text-decoration:underline}
+.tag{background:var(--hl);color:#fff;font-size:11px;font-weight:600;padding:1px 8px;border-radius:999px;margin-left:6px;vertical-align:middle}
+.sub{color:var(--mut);font-size:12.5px}
+.score{flex:none;text-align:right;font-weight:700;font-size:18px;line-height:1.1}
+.score small{display:block;font-weight:400;color:var(--mut);font-size:11px}
+.cov{display:flex;align-items:center;gap:10px;margin:10px 0 4px;font-size:12.5px;color:var(--mut)}
+.bar{flex:0 0 150px;height:8px;border-radius:99px;background:#e9ecf5;overflow:hidden}
+.bar i{display:block;height:100%;background:linear-gradient(90deg,#6c7ae0,var(--acc));border-radius:99px}
+.pages{margin:6px 0 2px;font-size:12.5px;color:var(--mut)}
+.grp{margin:10px 0 0;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.pg{padding:7px 11px;border-top:1px solid var(--line);background:#fcfcfe}
+.pg:first-child{border-top:0}
+.pg.top{background:var(--accbg)}
+.pg b{font-size:12.5px}.pg.top b{color:var(--acc)}.pg .s{color:var(--mut);font-size:12px;margin-left:4px}
+.pg .badge{background:var(--acc);color:#fff;font-size:10.5px;padding:0 7px;border-radius:99px;margin-left:6px}
+.pg p{margin:2px 0 0;font-size:13px;color:#3a4256}.pg.ctx p{color:var(--mut)}
+.minfo{margin-top:10px;padding:8px 12px;border:1px solid var(--line);border-radius:10px;background:#fafbff;font-size:13px}
+.minfo b.n{color:var(--acc)}.minfo ul{margin:4px 0 0;padding-left:18px;color:#3a4256}.minfo li b{color:var(--mut);font-weight:600}
+</style>
+<body><div class="wrap">
+<h1>Source Mapper</h1>
+<p class="lead">Find the document and the pages that answer a question.</p>
+<form id="f" class="panel">
+ <div class="row"><input id="q" placeholder="Ask a question, e.g. how to control pink bollworm in cotton" autofocus autocomplete="off"><button id="go">Search</button></div>
+ <div class="row"><input id="link" placeholder="Optional: paste a document link to find it in the results" autocomplete="off">
+  <select id="vec" title="Which Atlas vector index runs the Embedding only search"><option value="original">Vectors: original (float64, no quantization)</option><option value="scalar">Vectors: float32 blobs + scalar quantization</option><option value="binary">Vectors: float32 blobs + binary quantization</option></select>
+  <select id="scope" title="Which documents to search: state documents, central documents, or both"><option value="all">State + Central</option><option value="state">State only</option><option value="central">Central only</option></select>
+  <select id="mode" title="Search method; the box below says what it does"></select>
+  <label class="sub" title="Keyword proximity mode: also read the text of the matching pages (slower)"><input type="checkbox" id="content"> read page text</label>
+  <label class="sub" title="Run a method over the labelled questions and score it"><input type="checkbox" id="ttoggle"> Test with full data</label></div>
+ <div id="minfo" class="minfo"></div>
+</form>
+<div id="tp" class="panel" hidden style="margin-top:12px">
+ <div class="t" style="font-weight:600">Labelled test: run a method on questions with known answer documents and pages</div>
+ <div class="row"><label class="sub">Method <select id="tmode"></select></label>
+  <label class="sub">% of the labelled questions <input id="tpct" type="number" min="1" max="100" value="10" style="width:90px"></label>
+  <label class="sub">Seed (optional) <input id="tseed" type="number" placeholder="random" style="width:120px"></label>
+  <label class="sub">Scope <select id="tscope"><option value="all">State + Central</option><option value="state">State only</option><option value="central">Central only</option></select></label>
+  <button type="button" id="trun">Run</button><button type="button" id="tcancel" hidden style="background:#b42318">Cancel</button></div>
+ <div id="tbar" class="cov" hidden><div class="bar" style="flex:1 1 auto"><i id="tfill" style="width:0"></i></div><span id="tprog"></span></div>
+ <div id="tres" class="sub" style="margin-top:8px"></div>
+ <div class="sub" style="margin-top:6px">Only (question, document) pairs whose document is indexed, has extractable English text and lies inside the chosen scope are scored; the rest are listed in the report as excluded. <a id="tlink" href="/report">View report</a></div>
+</div>
+<div id="status"></div><div id="linkbox"></div><div id="kw"></div><div id="out"></div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const zoneKw=k=>(k.relaxed?'<div class="t" style="color:#b45309"><b>No document met the threshold.</b> These are the closest: most keyword groups found, then keywords closest together.</div>':'')+zoneKw0(k);
+const zoneKw0=k=>{
+ const gs=Object.entries(k.groups);
+ if(!k.crop) return '<div class="t">No crop from the crop list was found in the query, so this is a keyword search over every page: a document needs '+k.fallback_need+' of '+k.fallback_groups.length+' groups within '+k.max_span+' pages, closest keywords first.</div>'+
+  Object.entries(k.groups).map(([w,f])=>'<div class="kwrow"><span class="chip q">'+esc(w)+'</span><span class="arrow">&rarr;</span>'+f.slice(0,8).map(x=>'<span class="chip">'+esc(x)+'</span>').join('')+'</div>').join('');
+ return '<div class="t">Crop zone search: crop <b>'+esc(k.crop)+'</b> (from &ldquo;'+esc(k.crop_words.join(' '))+'&rdquo;). A crop zone starts at a heading naming the crop (or, without one, where its scores peak) and runs forward until the next crop chapter begins. A document needs '+k.need+' of '+gs.length+' groups within '+k.max_span+' pages (75% of the groups or 4, whichever is fewer).</div>'+
+ gs.map(([w,f])=>'<div class="kwrow"><span class="chip q">'+esc(w)+'</span><span class="arrow">&rarr;</span>'+f.slice(0,8).map(x=>'<span class="chip">'+esc(x)+'</span>').join('')+'</div>').join('')+
+ (k.unmatched.length?'<div class="kwrow"><span class="sub">Not in the corpus:</span>'+k.unmatched.map(w=>'<span class="chip dim">'+esc(w)+'</span>').join('')+'</div>':'')+
+ (k.fallback_need?'<div class="sub" style="margin-top:6px">Documents with no zone for '+esc(k.crop)+' are searched outside every crop zone; the crop word is required and counts as a keyword (<b>'+k.fallback_need+' of '+k.fallback_groups.length+'</b> groups needed). They follow the zone results, closest keywords first.</div>':'');
+};
+const proxKw=k=>k.rawsum?rawKw(k):proxKw0(k);
+const rawKw=k=>'<div class="t">'+(k.words.length?'BM25 page sum: every page scores the <b>sum</b> over the keyword groups of the group&rsquo;s best BM25 score on '+(k.near?(k.combine==='wmax'?'the best of each group: its score on the page itself, or half its best score on the '+k.near+' pages either side in the same document (a group counts once), scores of 1 or less left out':k.combine==='max'?'the best score of each group over it and the '+k.near+' pages either side in the same document (a group counts once), scores of 1 or less left out':'it and the '+k.near+' pages either side in the same document, scores of 1 or less left out')+(k.crop_radius?(k.scaled?'; raised by (BM25 score of the crop minus its distance in pages) % if the crop is within '+k.crop_radius+' pages, cut ':'; raised 30% if the crop is within '+k.crop_radius+' pages, cut ')+Math.round(k.crop_down*100)+'% if not':''):'that page, every score counted')+' (no 75% bar, no window, no crop filter). A document ranks by its best page. Each word stands for its suffix and spelling forms; the crop stands for all its aliases.':'None of the query words is in the index.')+'</div>'+
+ k.words.map(w=>'<div class="kwrow"><span class="chip q">'+esc(w)+'</span><span class="arrow">&rarr;</span>'+k.groups[w].slice(0,8).map(x=>'<span class="chip">'+esc(x)+'</span>').join('')+(k.groups[w].length>8?'<span class="sub">+'+(k.groups[w].length-8)+' more</span>':'')+'</div>').join('')+
+ (k.ignored.length?'<div class="kwrow"><span class="sub">Ignored (not in the index):</span>'+k.ignored.map(w=>'<span class="chip dim">'+esc(w)+'</span>').join('')+'</div>':'');
+const proxKw0=k=>'<div class="t">'+(k.words.length?'Keyword proximity: a document needs <b>'+k.need+' of '+k.words.length+'</b> keyword groups ('+(k.level==='75%'?'75%':k.level==='best available'?'<span style="color:#b45309">no document reached 75% or 4, so this is the best available</span>':'no document had 75%, so the bar dropped to '+k.level)+'). Among the closest stretches of pages with that many groups, the one whose keywords score highest (BM25, best form per group, summed) wins; from it pages are added both ways until a page holds no group (the range). Each word stands for its suffix forms and the word without its s; the crop is a keyword like the others.':'None of the query words is important on any page, so nothing can match.')+'</div>'+
+ (k.crop?'<div class="sub">Crop <b>'+esc(k.crop.name)+'</b> (from &ldquo;'+esc(k.crop.words.join(' '))+'&rdquo;) (or any alias of it) must be on a page of the document: <b>'+k.crop.docs_with+'</b> of '+k.crop.docs_in_scope+' documents have it. Aliases found in the corpus: '+k.crop.aliases.slice(0,14).map(esc).join(', ')+(k.crop.aliases.length>14?' (+'+(k.crop.aliases.length-14)+' more)':'')+'.</div>':'')+
+ k.words.map(w=>'<div class="kwrow"><span class="chip q">'+esc(w)+'</span><span class="arrow">&rarr;</span>'+k.groups[w].slice(0,8).map(x=>'<span class="chip">'+esc(x)+'</span>').join('')+(k.groups[w].length>8?'<span class="sub">+'+(k.groups[w].length-8)+' more</span>':'')+'</div>').join('')+
+ (k.ignored.length?'<div class="kwrow"><span class="sub">Ignored (not important on any page):</span>'+k.ignored.map(w=>'<span class="chip dim">'+esc(w)+'</span>').join('')+'</div>':'');
+const pr=r=>r[0]===r[1]?'p'+r[0]:'pp'+r[0]+'-'+r[1];
+const kwHtml=k=>{
+ if(!k)return '';
+ if(k.proximity)return proxKw(k);
+ if(!k.used)return zoneKw(k);      // zone mode has no `used`; its crop may be null (no crop in the query)
+ const un=k.unmatched.length?'<div class="kwrow"><span class="sub">Not in the corpus:</span>'+k.unmatched.map(w=>'<span class="chip dim">'+esc(w)+'</span>').join('')+'</div>':'';
+ const ent=Object.entries(k.used),dc=k.doc_counts;
+ if(!ent.length)return '<div class="t">No query word was found, so the full embedding search ran.</div>'+un;
+ const rows=ent.map(([w,f])=>'<div class="kwrow"><span class="chip q">'+esc(w)+'</span><span class="arrow">&rarr;</span>'+
+  f.slice(0,8).map(x=>'<span class="chip">'+esc(x)+'</span>').join('')+(f.length>8?'<span class="sub">+'+(f.length-8)+' more</span>':'')+
+  (dc?'<span class="sub">&middot; in '+dc[w]+' docs</span>':'')+'</div>').join('');
+ const head=dc?'Keyword groups: a document needs one form of every group':'Query words used in the keyword index';
+ const foot=dc?'<div class="sub" style="margin-top:6px"><b>'+k.candidate_docs+'</b> document'+(k.candidate_docs==1?'':'s')+' contain every group'+(k.candidate_docs?'; only their chunks were searched.':'.')+'</div>':'';
+ return '<div class="t">'+head+'</div>'+rows+un+foot;
+};
+const pageHtml=p=>'<div class="pg '+(p.top?'top':'ctx')+'"><b>Page '+p.page+'</b>'+
+ (p.score!==null?'<span class="s">score '+p.score.toFixed(3)+'</span>':'')+(p.top?'<span class="badge">top match</span>':'')+
+ '<p>'+esc(p.snippet.slice(0,p.top?280:170))+'...</p></div>';
+const zoneDoc=(x,i,hl)=>{
+ const pct=Math.round(x.fraction*100),z=(x.zones||[]).map(r=>r[0]===r[1]?r[0]:r[0]+'-'+r[1]).join(', ');
+ return '<article class="doc'+(hl?' hl':'')+'"'+(hl?' id="target"':'')+'>'+
+ '<div class="dh"><div class="rank">'+i+'</div><div class="dt"><a href="'+esc(x.link)+'">'+esc(x.name)+'</a>'+
+ (hl?'<span class="tag">your link</span>':'')+'<div class="sub">'+x.total_pages+' pages &middot; best stretch p'+x.stretch[0]+(x.stretch[1]>x.stretch[0]?'-'+x.stretch[1]:'')+'</div></div>'+
+ '<div class="score" title="Share of the query keyword groups found inside the stretch">'+pct+'%<small>of groups</small></div></div>'+
+ '<div class="cov"><div class="bar"><i style="width:'+Math.max(pct,2)+'%"></i></div><span>'+x.covered.length+' of '+x.n_groups+' groups'+(x.missing.length?' (missing: '+esc(x.missing.join(', '))+')':'')+'</span></div>'+
+ '<div class="pages">'+(x.mode==='proximity'&&x.keywords.rawsum?'Best page '+pr(x.stretch)+', score '+x.strength+(x.keywords.near?' (sum over p'+x.range[0]+'-'+x.range[1]+')':'')+(x.pages.length>1?'; next best pages '+x.pages.slice(1).map(p=>'p'+p).join(', '):'')+'.':x.mode==='proximity'?'Answer '+pr(x.stretch)+' holds '+x.covered.length+' of '+x.n_groups+' groups; page range '+pr(x.range)+(x.clusters.length>1?' &middot; '+x.clusters.length+' clusters in this document':'')+'.':x.fallback&&x.no_crop?'<b>No crop from the crop list in the query.</b> Keywords only, all pages; ranked by how close together the keywords are.':x.fallback?'<b>No crop zone for this crop in this document.</b> Found on pages outside every crop zone; the crop word is required and counts as a keyword; ranked by how close together the keywords are.':'Crop zones (pages): '+z+' &middot; '+(x.zone_source==='heading'?'start taken from a heading':'found from keyword scores'))+'</div>'+
+ x.page_groups.map((g,j)=>(x.mode==='proximity'&&!x.keywords.rawsum&&x.clusters.length>1?'<div class="sub" style="margin-top:6px">Cluster '+(j+1)+': answer '+pr(x.clusters[j].core)+', range '+pr(x.clusters[j].range)+', '+x.clusters[j].covered.length+' of '+x.n_groups+' groups</div>':'')+'<div class="grp">'+g.map(p=>'<div class="pg top"><b>Page '+p.page+'</b><span class="s">score '+p.score+(p.cover!==null&&p.cover!==undefined?' &middot; coverage x'+p.cover:'')+(p.own!==undefined&&p.own!==p.score?' (this page '+p.own+')':'')+(x.keywords.crop_radius?(p.crop_near?' &middot; crop within '+x.keywords.crop_radius+' pages, '+(p.crop_bump!==null&&p.crop_bump!==undefined?'+'+p.crop_bump+'%':'+30%'):' &middot; no crop within '+x.keywords.crop_radius+' pages, -'+Math.round(x.keywords.crop_down*100)+'%'):'')+' &middot; '+esc(p.groups.join(', ')||'no group on this page')+'</span>'+(p.snippet?'<p>'+esc(p.snippet)+'</p>':'')+'</div>').join('')+'</div>').join('')+'</article>';
+};
+const docHtml=(x,i,hl)=>{
+ if(x.mode==='crop-zone'||x.mode==='proximity')return zoneDoc(x,i,hl);
+ const pct=Math.round(x.coverage*100);
+ return '<article class="doc'+(hl?' hl':'')+'"'+(hl?' id="target"':'')+'>'+
+ '<div class="dh"><div class="rank">'+i+'</div><div class="dt"><a href="'+esc(x.link)+'">'+esc(x.name)+'</a>'+
+ (hl?'<span class="tag">your link</span>':'')+'<div class="sub">'+x.total_pages+' pages &middot; '+x.num_chunks+' chunks</div></div>'+
+ '<div class="score" title="Mean similarity of the document\'s 5 best chunks">'+x.top5_mean.toFixed(3)+'<small>top-5 mean</small></div></div>'+
+ '<div class="cov" title="Chunks of this document that were scored: among the 500 nearest (embedding only) or inside the keyword radius (keywords + embedding)">'+
+ '<div class="bar"><i style="width:'+Math.max(pct,2)+'%"></i></div><span><b>'+pct+'%</b> of its chunks searched ('+x.matches+' of '+x.num_chunks+')</span></div>'+
+ '<div class="pages">Matching pages, best first: '+x.pages.slice(0,12).join(', ')+(x.pages.length>12?' +'+(x.pages.length-12)+' more':'')+'</div>'+
+ x.page_groups.map(g=>'<div class="grp">'+g.map(pageHtml).join('')+'</div>').join('')+'</article>';
+};
+async function run(){
+ const q=$('q').value.trim(),url=$('link').value.trim();
+ if(!q&&!url)return;
+ $('go').disabled=true;$('status').textContent='Searching...';$('out').innerHTML='';$('kw').innerHTML='';$('linkbox').innerHTML='';
+ const t=performance.now();
+ history.replaceState(null,'','/?'+new URLSearchParams({q,link:url,mode:$('mode').value,vector:$('vec').value,scope:$('scope').value,...($('ttoggle').checked?{test:1}:{})}));
+ try{
+  let d=[],doc=null;
+  if(url)doc=await (await fetch('/api/link?url='+encodeURIComponent(url))).json();
+  if(q){d=await (await fetch('/api/search?mode='+$('mode').value+'&vector='+$('vec').value+'&scope='+$('scope').value+'&content='+($('content').checked?1:0)+'&q='+encodeURIComponent(q))).json();
+   let kinfo=d.length?d[0].keywords:null;
+   if(!d.length&&$('mode').value==='restrict')kinfo=await (await fetch('/api/groups?q='+encodeURIComponent(q))).json();
+   $('kw').innerHTML=kwHtml(kinfo);}
+  $('status').textContent=(q?d.length+' documents':'Link lookup')+' in '+((performance.now()-t)/1000).toFixed(1)+' s'+(q&&d.length&&d[0].vector_backend?' \u00b7 vector search: '+d[0].vector_backend:'');
+  if(!isC($('mode').value)&&$('scope').value!=='all')$('status').textContent+=' \u00b7 this mode only holds the original (state) documents; central documents are searchable in Crop zone mode only';
+  const hit=doc&&doc.found?d.findIndex(x=>x.doc_id===doc.doc_id):-1;
+  const note=(c,h)=>'<div class="note '+c+'">'+h+'</div>';
+  let n='';
+  if(doc&&!doc.found)n=note('bad','No document in the spreadsheet has that link.');
+  else if(doc&&!doc.indexed)n=note('bad','<b>'+esc(doc.name)+'</b> is not in the search index (text check: '+esc(doc.verdict)+'), so it cannot be retrieved.');
+  else if(doc&&doc.modes==='zone'&&!isC($('mode').value))n=note('bad','<b>'+esc(doc.name)+'</b> is indexed for <b>Crop zone</b> mode only (keywords, no embeddings), so this mode cannot retrieve it.');
+  else if(doc&&q&&hit<0)n=note('bad','<b>'+esc(doc.name)+'</b> ('+doc.pages+' pages) was <b>not retrieved</b> for this query.');
+  else if(doc&&q)n=note('ok','<b>'+esc(doc.name)+'</b> was retrieved at rank <b>'+(hit+1)+'</b> of '+d.length+'. Highlighted below.');
+  else if(doc)n=note('ok','<b>'+esc(doc.name)+'</b> &middot; '+doc.pages+' pages &middot; <a href="'+esc(doc.link)+'">open</a>'+(doc.duplicate?' (your link is a copy; this is the original link)':'')+'. Add a query to see where it ranks.');
+  $('linkbox').innerHTML=n;
+  if(q&&!d.length&&['bm25sum','bm25near','bm25nearmax','bm25nearscaled','bm25nearown','bm25nearcov'].includes($('mode').value))$('out').innerHTML='<div class="note bad">None of the query words is in the index.</div>';
+  else if(q&&!d.length&&$('mode').value==='proximity')$('out').innerHTML='<div class="note bad">No document has the query\'s crop on any page, or none of the query words is important on any page.</div>';
+  else if(q&&!d.length&&$('mode').value==='zone')$('out').innerHTML='<div class="note bad">No document has a crop zone holding enough of the keyword groups, or no crop from the crop master was found in the query.</div>';
+  else if(q&&!d.length&&$('mode').value==='restrict')$('out').innerHTML='<div class="note bad">No document contains a form of every keyword group. The counts above show which groups are the restrictive ones.</div>';
+  else $('out').innerHTML=d.map((x,i)=>docHtml(x,i+1,i===hit)).join('');
+  if(hit>=0)$('target').scrollIntoView({behavior:'smooth',block:'center'});
+ }catch(e){$('status').textContent='Something went wrong: '+e;}
+ $('go').disabled=false;
+}
+$('f').addEventListener('submit',e=>{e.preventDefault();run();});
+const P=new URLSearchParams(location.search);   // ?q=...&link=...&mode=hybrid runs a search on load; ?test=1 opens the test panel
+let MODES=[];const isC=k=>!!(MODES.find(m=>m.key===k)||{}).central;
+const modeLabel=m=>'#'+m.number+' '+m.name;
+function showInfo(){
+ const m=MODES.find(x=>x.key===$('mode').value);if(!m){$('minfo').innerHTML='';return;}
+ $('minfo').innerHTML='<b class="n">#'+m.number+' '+esc(m.name)+'</b>'+(m.built_on?' <span class="sub">(built on #'+m.built_on+')</span>':'')+' &mdash; '+esc(m.description)+
+  '<ul>'+m.config.map(c=>'<li><b>'+esc(c[0])+':</b> '+esc(c[1])+'</li>').join('')+'</ul>';
+}
+const syncVec=()=>{$('vec').disabled=$('mode').value!=='full';$('vec').style.opacity=$('vec').disabled?.45:1;};
+$('mode').addEventListener('change',()=>{syncVec();showInfo();});
+(async()=>{
+ MODES=await (await fetch('/api/modes')).json();
+ $('mode').innerHTML=MODES.map(m=>'<option value="'+m.key+'">'+esc(modeLabel(m))+'</option>').join('');
+ $('tmode').innerHTML=$('mode').innerHTML;
+ if(P.get('mode'))$('mode').value=P.get('mode');
+ if(P.get('vector'))$('vec').value=P.get('vector');
+ if(P.get('scope'))$('scope').value=P.get('scope');
+ $('tmode').value=$('mode').value;
+ syncVec();showInfo();
+ if(P.get('test')){$('ttoggle').checked=true;$('tp').hidden=false;tPoll();}
+ if(P.get('q')||P.get('link')){$('q').value=P.get('q')||'';$('link').value=P.get('link')||'';run();}
+})();
+// ---- labelled test panel
+$('ttoggle').addEventListener('change',()=>{$('tp').hidden=!$('ttoggle').checked;if($('ttoggle').checked)tPoll();});
+let tTimer=null;
+async function tPoll(){
+ clearTimeout(tTimer);
+ const s=await (await fetch('/api/test/status')).json(),run=s.status==='running';
+ $('trun').disabled=run;$('tcancel').hidden=!run;$('tbar').hidden=s.status==='idle';
+ if(s.status!=='idle'){const pct=s.total?Math.round(100*s.done/s.total):0;$('tfill').style.width=Math.max(pct,2)+'%';
+  $('tprog').textContent=s.done+' of '+s.total+(run&&s.current?' \u00b7 '+s.current.slice(0,70):'')+(s.status==='cancelled'?' \u00b7 cancelled':'')+(s.status==='error'?' \u00b7 '+s.error:'');}
+ if(run){tTimer=setTimeout(tPoll,1000);return;}
+ if(s.status==='done'){
+  const r=(await (await fetch('/api/test/runs')).json()).find(x=>x.run_id===s.run_id);
+  if(r)$('tlink').href='/report?run='+encodeURIComponent(r.run_id);
+  const sp=(n,sc,t)=>' &middot; '+n+': '+(sc||0)+' scored'+(sc?', top-10 '+t+'%':'');
+  $('tres').innerHTML=r?'<b>#'+r.number+' '+esc(r.name)+'</b>, scope '+esc(r.scope)+', '+r.percent+'% ('+r.questions_picked+' questions, seed '+r.seed+'): '+r.scored+' scored &middot; top-1 '+r.top1+'% &middot; top-10 '+r.top10+'% &middot; median rank '+r.rank_median+' &middot; mean page distance '+r.page_distance_mean+sp('state',r.state_scored,r.state_top10)+sp('central',r.central_scored,r.central_top10)+' &middot; '+r.pairs_excluded+' pairs excluded &middot; '+r.seconds+' s':'';}
+}
+$('trun').addEventListener('click',async()=>{
+ $('tres').textContent='';
+ const res=await fetch('/api/test/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:$('tmode').value,percent:+$('tpct').value,seed:$('tseed').value===''?null:+$('tseed').value,scope:$('tscope').value})});
+ if(!res.ok){$('tres').textContent=(await res.json()).detail;return;}
+ tPoll();
+});
+$('tcancel').addEventListener('click',async()=>{await fetch('/api/test/cancel',{method:'POST'});tPoll();});
+</script></html>

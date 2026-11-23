@@ -19,7 +19,7 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=4)
     args = ap.parse_args()
 
-    docs = load_documents()
+    docs = load_documents(central=False)   # central docs: central_ingest.py
     if args.limit:
         docs = docs.head(args.limit)
     PDF_DIR.mkdir(parents=True, exist_ok=True)

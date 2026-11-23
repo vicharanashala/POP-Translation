@@ -25,6 +25,14 @@ from db import EMBEDDINGS, UNIQUE_DOCS, get_db  # noqa: E402
 from embedder import DIMS, embed_query  # noqa: E402
 
 INDEX_NAME = "chunk_vector_index"
+# Atlas vector indexes the page can search: name -> (collection, index, label). The blob collection
+# (binvec.py migrate) holds the same chunks and _ids with 4-byte float32 vectors; its indexes are
+# quantized on the Atlas side. M0 allows 3 search indexes, so there is no unquantized blob index.
+BACKENDS = {
+    "original": (EMBEDDINGS, INDEX_NAME, "Original: float64 lists, no quantization"),
+    "scalar": ("doc_embeddings_bin", "bin_scalar", "Float32 blobs + scalar quantization"),
+    "binary": ("doc_embeddings_bin", "bin_binary", "Float32 blobs + binary quantization"),
+}
 
 
 def create_index(db) -> None:
@@ -46,9 +54,10 @@ def create_index(db) -> None:
         time.sleep(5)
 
 
-def _nearest_atlas(db, qvec, k: int) -> list[dict]:
-    return list(db[EMBEDDINGS].aggregate([
-        {"$vectorSearch": {"index": INDEX_NAME, "path": "embedding", "queryVector": qvec,
+def _nearest_atlas(db, qvec, k: int, backend: str = "original") -> list[dict]:
+    coll, index, _ = BACKENDS[backend]
+    return list(db[coll].aggregate([
+        {"$vectorSearch": {"index": index, "path": "embedding", "queryVector": qvec,
                            "numCandidates": max(k * 10, 100), "limit": k}},
         {"$project": {"_id": 1, "document_id": 1, "page": 1, "chunk_index": 1,
                       "score": {"$meta": "vectorSearchScore"}}}]))
@@ -76,11 +85,11 @@ TOP5_K = 500       # chunks fetched for it: a document's 5 best must be inside t
 
 
 def search(query: str, k: int | None = None, local: bool = False, db=None,
-           rank: str = "top5") -> list[dict]:
+           rank: str = "top5", backend: str = "original") -> list[dict]:
     db = get_db() if db is None else db
     k = k or (TOP5_K if rank == "top5" else 50)
     qvec = embed_query(query)
-    hits = (_nearest_local if local else _nearest_atlas)(db, qvec, k)
+    hits = _nearest_local(db, qvec, k) if local else _nearest_atlas(db, qvec, k, backend)
     texts = {t["_id"]: t["text"] for t in
              db[EMBEDDINGS].find({"_id": {"$in": [h["_id"] for h in hits]}}, {"text": 1})}
     groups: dict[str, dict] = defaultdict(lambda: {"matches": 0, "score_sum": 0.0,
@@ -106,6 +115,7 @@ def search(query: str, k: int | None = None, local: bool = False, db=None,
         top_mean = (sum(top) + floor * (TOP_N - len(top))) / TOP_N
         ranked.append({"top5_mean": round(top_mean, 4), "doc_id": doc_id, "name": names[doc_id]["name"], "link": names[doc_id]["link"],
                        "matches": g["matches"], "score_sum": round(g["score_sum"], 4),
+                       "vector_backend": BACKENDS[backend][2] if not local else "exact, in memory",
                        "score_max": round(g["score_max"], 4),
                        "pages": sorted(g["pages"], key=lambda p: -g["pages"][p]),
                        "page_hits": [{"page": p, "score": round(g["pages"][p], 4),

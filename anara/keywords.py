@@ -25,9 +25,11 @@ from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 import common  # noqa: E402
+import pagetext  # noqa: E402
 from textcheck import extract_pages  # noqa: E402
 
 STATS = common.DATA / "keyword_stats.pkl"
+ZONE_STATS = common.DATA / "zone_stats.pkl"   # same as STATS plus the central documents (keyword-only, no embeddings)
 INDEX = common.DATA / "keyword_index.json"
 
 _word = re.compile(r"[a-z][a-z0-9]+(?:-[a-z0-9]+)*")
@@ -42,57 +44,69 @@ def tokenize(text: str) -> list[str]:
             if len(w) >= 3 and w not in ENGLISH_STOP_WORDS and _vowel.search(w)]
 
 
-MAX_SUFFIX = 4      # prefix rule: a match may extend the query word by at most this many letters
-MIN_PREFIX_LEN = 4  # shorter query words match exactly only (rot must not become rotation)
-MIN_EDIT_LEN = 6    # one-edit matches (OCR slips) only for words at least this long
+SUFFIXES = ("s", "es", "d", "ed", "ing", "ly", "er", "ers", "est", "ion", "ions", "al", "ally",
+            "ness", "ment", "ments", "able", "ful", "ive", "ize", "ized", "izing", "ise", "ised", "ity")
+MIN_BASE = 4        # a word is only stripped down to a base of at least this many letters
 
 
-def _within_one_edit(a: str, b: str) -> bool:
-    if a == b:
-        return True
-    if abs(len(a) - len(b)) > 1:
-        return False
-    i = 0
-    while i < min(len(a), len(b)) and a[i] == b[i]:
-        i += 1
-    if len(a) == len(b):
-        return a[i + 1:] == b[i + 1:]              # substitution
-    if len(a) > len(b):
-        a, b = b, a
-    return a[i:] == b[i + 1:]                        # insertion / deletion
-
-
-def fuzzy_match(word: str, vocab) -> list[str]:
-    """Vocabulary words a query word stands for: itself; words that extend it by at most
-    MAX_SUFFIX letters (control -> controlled, controlling); and, for words of MIN_EDIT_LEN+
-    letters, words one edit away (managemen -> management). Words under MIN_PREFIX_LEN
-    match only themselves."""
-    out = []
-    for v in vocab:
-        if v == word:
-            out.append(v)
-        elif len(word) >= MIN_PREFIX_LEN and v.startswith(word) and len(v) - len(word) <= MAX_SUFFIX:
-            out.append(v)
-        elif len(word) >= MIN_EDIT_LEN and _within_one_edit(word, v):
-            out.append(v)
+def _bases(word: str) -> set[str]:
+    """The word, and the word with one suffix taken off (undoing a doubled consonant, and
+    turning -ies back into -y): controlling -> controll -> control; varieties -> variet -> variety."""
+    out = {word}
+    for suf in SUFFIXES:
+        if word.endswith(suf) and len(word) - len(suf) >= MIN_BASE:
+            base = word[: -len(suf)]
+            out.add(base)
+            if len(base) > MIN_BASE and base[-1] == base[-2] and base[-1] not in "aeiou":
+                out.add(base[:-1])
+            if suf == "es" and base.endswith("i"):
+                out.add(base[:-1] + "y")
+    if word.endswith("ies") and len(word) - 3 >= MIN_BASE:
+        out.add(word[:-3] + "y")
     return out
 
 
-def build_stats(refresh: bool = False) -> dict:
-    """{'pages': {doc_id: [Counter per page]}, 'df': Counter, 'n_docs': int}"""
-    if STATS.exists() and not refresh:
-        return pickle.loads(STATS.read_bytes())
+def fuzzy_match(word: str, vocab) -> list[str]:
+    """Index words a query word stands for. ONLY suffix changes: strip a suffix from the word
+    and/or add one (control -> controlled, controlling, controls; bollworms -> bollworm). Single-
+    letter slips, misspellings and unrelated words one edit away are NOT matched. Candidate
+    forms are generated and kept if they are in `vocab`."""
+    vocab = vocab if isinstance(vocab, (set, dict)) else set(vocab)
+    forms = set()
+    for base in _bases(word):
+        forms.add(base)
+        for suf in SUFFIXES:
+            forms.add(base + suf)
+            forms.add(base + "e" + suf)                 # make -> making: mak + e + ing
+            if suf in ("ing", "ed", "er", "ers", "est") and base[-1] not in "aeiou":
+                forms.add(base + base[-1] + suf)         # run -> running
+        if base.endswith("y"):
+            forms.add(base[:-1] + "ies")
+            forms.add(base[:-1] + "ied")
+    return sorted(f for f in forms if f in vocab)
+
+
+def build_stats(refresh: bool = False, zone: bool = False) -> dict:
+    """{'pages': {doc_id: [Counter per page]}, 'df': Counter, 'n_docs': int}
+
+    zone=True: the file for zone mode, which also holds the central documents (they have no embeddings,
+    so hybrid/restrict, which pair this data with Atlas chunks, keep reading the file without them)."""
+    path = ZONE_STATS if zone else STATS
+    if path.exists() and not refresh:
+        return pickle.loads(path.read_bytes())
     report = pd.read_csv(common.DATA / "text_report.csv")
     ids = report.loc[report.verdict == "english_text", "doc_id"].tolist()
+    if not zone:
+        ids = [i for i in ids if i in set(common.load_documents(central=False)["doc_id"])]
     pages, df = {}, Counter()
     for n, doc_id in enumerate(ids, 1):
-        counts = [Counter(tokenize(p)) for p in extract_pages(common.pdf_path(doc_id))]
+        counts = [Counter(tokenize(p)) for p in pagetext.pages(doc_id)]
         pages[doc_id] = counts
         df.update(set().union(*counts) if counts else set())
         if n % 50 == 0:
             print(f"  {n}/{len(ids)} documents", flush=True)
     stats = {"pages": pages, "df": df, "n_docs": len(ids)}
-    STATS.write_bytes(pickle.dumps(stats))
+    path.write_bytes(pickle.dumps(stats))
     return stats
 
 

@@ -50,7 +50,7 @@ def _load() -> dict:
     _state.update(ids=ids, docs=docs, pages=pages, mat=mat, doc_names=doc_names, doc_no=doc_no,
                   key=np.array([doc_no[d] for d in docs], dtype="int64") * 100000 + pages,
                   index=kw.load_index())
-    _state["vocab"] = list(_state["index"])
+    _state["vocab"] = set(_state["index"])
     return _state
 
 
@@ -76,20 +76,11 @@ def blast_radius(matched: dict[str, list[str]], radius: int = RADIUS) -> set[tup
     return hit
 
 
-def search_hybrid(query: str, radius: int = RADIUS, db=None, fallback=None) -> list[dict]:
+def _rank_chunks(query: str, idx, db, mode: str, info: dict) -> list[dict]:
+    """Score the chunks at positions `idx` of the cached matrix exactly against the query and
+    rank their documents by the mean of the TOP_N best chunks (shared by hybrid and restrict)."""
     from bson import ObjectId
     s = _load()
-    db = get_db() if db is None else db
-    matched = query_keywords(query)
-    if not matched:
-        from search import search as full_search
-        res = (fallback or full_search)(query, db=db)
-        for r in res:
-            r["mode"], r["radius"] = "full-fallback", None
-        return res
-    cells = blast_radius(matched, radius)
-    keys = np.array([s["doc_no"][d] * 100000 + p for d, p in cells if d in s["doc_no"]], dtype="int64")
-    idx = np.nonzero(np.isin(s["key"], keys))[0]
     qvec = np.array(embed_query(query), dtype="float32")
     sims = s["mat"][idx] @ qvec
     floor = float(sims.min()) if len(sims) else 0.0
@@ -115,9 +106,84 @@ def search_hybrid(query: str, radius: int = RADIUS, db=None, fallback=None) -> l
                     "page_hits": [{"page": p, "score": round(page_best[p], 4),
                                    "snippet": texts.get(best_id, "") if p == v[0][1] else ""}
                                   for p in order],
-                    "mode": "keyword-radius", "radius": len(idx)})
+                    "mode": mode, "radius": len(idx), "keywords": info})
     out.sort(key=lambda r: (-r["top5_mean"], -r["matches"]))
     return out
+
+
+def _doc_words() -> dict[str, set[str]]:
+    """{word: {doc ids containing it anywhere}} from the raw per-page counts (no BM25
+    threshold: 'contains' means the word is in the document at all). Built once, cached."""
+    s = _load()
+    if "doc_words" not in s:
+        st = kw.build_stats()
+        dw: dict[str, set[str]] = defaultdict(set)
+        for doc, pages in st["pages"].items():
+            for c in pages:
+                for w in c:
+                    dw[w].add(doc)
+        s["doc_words"], s["all_words"] = dict(dw), set(st["df"])
+    return s["doc_words"]
+
+
+def keyword_groups(query: str) -> dict[str, list[str]]:
+    """{query word: [every word of the corpus that is a suffix variant of it]}: one group per
+    query word. A query word with no form in the corpus has no group."""
+    dw = _doc_words()
+    out = {}
+    for w in dict.fromkeys(kw.tokenize(query)):
+        forms = kw.fuzzy_match(w, _state["all_words"])
+        if forms:
+            out[w] = forms
+    return out
+
+
+def restrict_docs(groups: dict[str, list[str]]) -> tuple[set[str], dict[str, int]]:
+    """Documents containing at least one form of EVERY group, and per-group document counts."""
+    dw = _doc_words()
+    per = {g: set().union(*(dw.get(f, set()) for f in forms)) for g, forms in groups.items()}
+    docs = set.intersection(*per.values()) if per else set()
+    return docs, {g: len(d) for g, d in per.items()}
+
+
+def search_restrict(query: str, db=None, fallback=None) -> list[dict]:
+    """Third mode. Keep only documents that contain, for every query keyword, at least one of
+    its forms (any one form per group will do); then score ALL chunks of those documents
+    exactly. No query keyword in the corpus -> full search (mode "full-fallback"). No document
+    holds every group -> an empty list."""
+    s = _load()
+    db = get_db() if db is None else db
+    groups = keyword_groups(query)
+    info = {"used": groups, "unmatched": [w for w in dict.fromkeys(kw.tokenize(query)) if w not in groups]}
+    if not groups:
+        from search import search as full_search
+        res = (fallback or full_search)(query, db=db)
+        for r in res:
+            r["mode"], r["radius"], r["keywords"] = "full-fallback", None, info
+        return res
+    docs, counts = restrict_docs(groups)
+    info["doc_counts"], info["candidate_docs"] = counts, len(docs)
+    if not docs:
+        return []
+    idx = np.nonzero(np.isin(np.array(s["docs"]), list(docs)))[0]
+    return _rank_chunks(query, idx, db, "keyword-restriction", info)
+
+
+def search_hybrid(query: str, radius: int = RADIUS, db=None, fallback=None) -> list[dict]:
+    s = _load()
+    db = get_db() if db is None else db
+    matched = query_keywords(query)
+    info = {"used": matched, "unmatched": [w for w in dict.fromkeys(kw.tokenize(query)) if w not in matched]}
+    if not matched:
+        from search import search as full_search
+        res = (fallback or full_search)(query, db=db)
+        for r in res:
+            r["mode"], r["radius"], r["keywords"] = "full-fallback", None, info
+        return res
+    cells = blast_radius(matched, radius)
+    keys = np.array([s["doc_no"][d] * 100000 + p for d, p in cells if d in s["doc_no"]], dtype="int64")
+    idx = np.nonzero(np.isin(s["key"], keys))[0]
+    return _rank_chunks(query, idx, db, "keyword-radius", info)
 
 
 if __name__ == "__main__":
