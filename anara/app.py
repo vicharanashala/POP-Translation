@@ -20,11 +20,12 @@ import common  # noqa: E402
 from db import EMBEDDINGS, UNIQUE_DOCS, get_db  # noqa: E402
 from embedder import get_model  # noqa: E402
 from search import search  # noqa: E402
+import docinfo  # noqa: E402
 import labelled_test  # noqa: E402
 import modes  # noqa: E402
 import zonesearch  # noqa: E402
 from zonesearch import search_zone  # noqa: E402
-from proximity import search_bm25near, search_bm25nearcov, search_bm25nearmax, search_bm25nearown, search_bm25nearscaled, search_bm25sum, search_proximity  # noqa: E402
+from proximity import search_bm25near, search_bm25nearcov, search_bm25nearcov2, search_bm25nearmax, search_bm25nearown, search_bm25nearscaled, search_bm25sum, search_proximity  # noqa: E402
 from hybrid import keyword_groups, restrict_docs, search_hybrid, search_restrict  # noqa: E402
 
 
@@ -39,6 +40,7 @@ app = FastAPI(lifespan=lifespan)
 
 PAGE_FILE = Path(__file__).with_name("page.html")   # read per request: UI edits need no restart
 REPORT_FILE = Path(__file__).with_name("report.html")
+DOCS_FILE = Path(__file__).with_name("docs.html")
 
 
 GROUPS = 5   # page blocks shown per document
@@ -100,18 +102,49 @@ def report_page():
     return REPORT_FILE.read_text()
 
 
+@app.get("/documents", response_class=HTMLResponse)
+def docs_page():
+    return DOCS_FILE.read_text()
+
+
+@app.get("/api/docs/summary")
+def api_docs_summary():
+    return docinfo.summary()
+
+
+@app.get("/api/docs/list")
+def api_docs_list(state: str = "", verdict: str = "", lang: str = "", q: str = "", indexed: bool = False,
+                  offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=500)):
+    return docinfo.listing(state, verdict, lang, q, indexed, offset, limit)
+
+
+@app.get("/api/docs/export")
+def api_docs_export(state: str = "", verdict: str = "", lang: str = "", q: str = "", indexed: bool = False):
+    return Response(docinfo.to_xlsx(state, verdict, lang, q, indexed), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": 'attachment; filename="source_mapper_documents.xlsx"'})
+
+
 @app.get("/api/modes")
 def api_modes():
     """The mode registry (modes.py): key, number in order of invention, short name, description, config."""
     return modes.modes()
 
 
+@app.get("/api/test/options")
+def api_test_options():
+    """What the test panel offers: question states (with counts), statuses, source-document states."""
+    return labelled_test.question_options()
+
+
 @app.post("/api/test/run")
 def api_test_run(body: dict = Body(...)):
-    """Start a labelled test (see labelled_test.py): {mode, percent, scope, seed}. One run at a time."""
+    """Start a labelled test (see labelled_test.py): {mode, percent, seed, question_state, status, states}. One run at a time."""
     try:
         return labelled_test.start(body.get("mode", "bm25nearcov"), float(body.get("percent", 10)),
-                                   body.get("scope", "all"), body.get("seed") if body.get("seed") not in (None, "") else None)
+                                   states=body.get("states") or None,
+                                   seed=body.get("seed") if body.get("seed") not in (None, "") else None,
+                                   question_state=body.get("question_state") or labelled_test.DEFAULT_QUESTION_STATE,
+                                   status=body.get("status") or "closed")
     except RuntimeError as e:
         raise HTTPException(409, str(e))
     except ValueError as e:
@@ -148,18 +181,37 @@ def api_test_report(run: str = Query(min_length=1), format: str = Query("json", 
                     headers={"Content-Disposition": f'attachment; filename="test-{run}.xlsx"'})
 
 
+MAX_DOCS = 50      # a normal query returns at most this many documents
+
+
 @app.get("/api/search")
 def api_search(q: str = Query(min_length=1), k: int | None = Query(None, ge=5, le=1000),
                rank: str = Query("top5", pattern="^(top5|count|best)$"),
-               mode: str = Query("full", pattern="^(full|hybrid|restrict|zone|proximity|bm25sum|bm25near|bm25nearmax|bm25nearscaled|bm25nearown|bm25nearcov)$"),
+               mode: str = Query("full", pattern="^(full|hybrid|restrict|zone|proximity|bm25sum|bm25near|bm25nearmax|bm25nearscaled|bm25nearown|bm25nearcov|bm25nearcov2)$"),
                cover: float = Query(0.75, ge=0.1, le=1.0), span: int = Query(6, ge=1, le=30), need_cap: int = Query(4, ge=0, le=20),
                vector: str = Query("original", pattern="^(original|scalar|binary)$"),
-               scope: str = Query("all", pattern="^(all|state|central)$"),
+               scope: str = Query("all", pattern="^(all|state|state_central|central)$"), state: str = Query(""),
+               content: bool = Query(False)):
+    """The ranked documents of the mode (see _search_all), at most MAX_DOCS (50) of them."""
+    return _search_all(q, k, rank, mode, cover, span, need_cap, vector, scope, state, content)[:MAX_DOCS]
+
+
+def _search_all(q: str = Query(min_length=1), k: int | None = Query(None, ge=5, le=1000),
+               rank: str = Query("top5", pattern="^(top5|count|best)$"),
+               mode: str = Query("full", pattern="^(full|hybrid|restrict|zone|proximity|bm25sum|bm25near|bm25nearmax|bm25nearscaled|bm25nearown|bm25nearcov|bm25nearcov2)$"),
+               cover: float = Query(0.75, ge=0.1, le=1.0), span: int = Query(6, ge=1, le=30), need_cap: int = Query(4, ge=0, le=20),
+               vector: str = Query("original", pattern="^(original|scalar|binary)$"),
+               scope: str = Query("all", pattern="^(all|state|state_central|central)$"), state: str = Query(""),
                content: bool = Query(False)):
     """mode=hybrid narrows by keywords (+/-2 pages) before the embedding search; mode=restrict keeps
     only documents containing every keyword group (see hybrid.py); mode=proximity matches keywords on 5-page BM25 pages, closest together first (see proximity.py);
     mode=zone maps the query's crop to
-    page zones and scans them forward for the keyword groups (see zonesearch.py)."""
+    page zones and scans them forward for the keyword groups (see zonesearch.py).
+    scope: all = every document; state_central = `state`'s documents + Central; state = `state`'s documents only
+    (with no `state`: state = every non-Central document); central. See common.scope_key."""
+    scope = common.scope_key(scope, state)
+    if mode == "bm25nearcov2":  # bm25nearcov with coverage weights 0.9 (+/-1 page) and 0.7 (+/-2 pages) for neighbour-only groups
+        return search_bm25nearcov2(q, scope=scope, content=content)
     if mode == "bm25nearcov":  # bm25nearown x group coverage (page groups + half neighbour-only groups) / all groups
         return search_bm25nearcov(q, scope=scope, content=content)
     if mode == "bm25nearown":  # own page score in full, neighbours at half, best per group, scaled crop factor
@@ -192,6 +244,30 @@ def api_groups(q: str = Query(min_length=1)):
     groups = keyword_groups(q)
     docs, counts = restrict_docs(groups)
     return {"used": groups, "unmatched": [], "doc_counts": counts, "candidate_docs": len(docs)}
+
+
+@app.get("/api/random_question/states")
+def api_random_states():
+    """Document states with the number of labelled questions that have an eligible source in them (+ "All")."""
+    return labelled_test.random_states()
+
+
+@app.get("/api/random_question")
+def api_random_question(state: str = Query(labelled_test.ALL_STATES), seed: int | None = Query(None)):
+    """A random labelled closed question with an eligible source (indexed, English text, labelled pages) whose document
+    is in `state` ("All" = any); see labelled_test.random_question."""
+    return labelled_test.random_question(state, seed)
+
+
+@app.get("/api/known")
+def api_known(q: str = Query(min_length=1), mode: str = Query("bm25nearcov"),
+              scope: str = Query("all", pattern="^(all|state|state_central|central)$"), state: str = Query("")):
+    """Labelled questions with exactly this text and their sources/pages (see labelled_test.known_question). A source whose
+    document is outside the search scope (as in /api/search) is reported as not checkable, not as a miss."""
+    names = labelled_test.doc_state_names()
+    chosen = {"all": names, "central": ["Central"], "state_central": [state, "Central"] if state else names,
+              "state": [state] if state else [n for n in names if n != "Central"]}[scope]
+    return labelled_test.known_question(q, mode, tuple(chosen))
 
 
 @app.get("/api/link")

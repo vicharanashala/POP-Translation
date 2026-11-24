@@ -5,6 +5,7 @@ helpers/zoho_workdrive.py (read-only file download).
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -13,7 +14,7 @@ from dotenv import load_dotenv
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
-DATA = HERE / "data"
+DATA = Path(os.environ["ANARA_DATA"]) if os.environ.get("ANARA_DATA") else HERE / "data"   # ANARA_DATA: staging builds (other_states_finish.sh)
 PDF_DIR = DATA / "pdfs"
 XLSX = HERE / "pop-documents-state-2026-11-12.xlsx"
 
@@ -27,6 +28,7 @@ for p in (str(ROOT),):
 
 
 CENTRAL = DATA / "central_docs.csv"   # written by central_docs.py
+OTHER = DATA / "other_state_docs.csv"  # written by other_state_docs.py: documents of the other states (state scope)
 ALIASES = DATA / "link_aliases.json"  # written by link_aliases.py
 
 
@@ -35,6 +37,16 @@ def _central() -> pd.DataFrame:
         return pd.DataFrame()
     import json
     c = pd.read_csv(CENTRAL, keep_default_na=False)
+    c["states"] = c["states"].map(json.loads)
+    return c
+
+
+def _other() -> pd.DataFrame:
+    """Other states' documents (state scope, not Central): same columns as the central csv."""
+    if not OTHER.exists():
+        return pd.DataFrame()
+    import json
+    c = pd.read_csv(OTHER, keep_default_na=False)
     c["states"] = c["states"].map(json.loads)
     return c
 
@@ -51,13 +63,27 @@ def central_ids() -> set[str]:
 
 
 def in_scope(doc_id: str, scope: str) -> bool:
-    """scope: "all", "state" or "central"."""
+    """scope: "all", "state" (every non-Central document) or "central"; or "state:<Name>" (documents of that state),
+    "state_central:<Name>" (that state's documents plus every Central one) -- see `scope_key`."""
+    if ":" in scope:
+        import labelled_test   # lazy: it imports this module; its document -> state names table is the one the test uses
+        kind, state = scope.split(":", 1)
+        return state in labelled_test._doc_states().get(doc_id, ()) or (kind == "state_central" and doc_id in central_ids())
     return scope == "all" or (doc_id in central_ids()) == (scope == "central")
+
+
+def scope_key(scope: str, state: str = "") -> str:
+    """The string the search functions take as `scope`: the page's "state" / "state_central" with a state name become
+    "state:<Name>" / "state_central:<Name>"; "state_central" with no state is every document ("all")."""
+    if scope == "state_central":
+        return f"state_central:{state}" if state else "all"
+    return f"state:{state}" if scope == "state" and state else scope
 
 
 def load_documents(central: bool = True) -> pd.DataFrame:
     """One row per UNIQUE document (the sheet has one row per placement), then, if `central`,
-    the Central-scope documents of data/central_docs.csv whose doc_id is not in the sheet.
+    the Central-scope documents of data/central_docs.csv and the other states' documents of data/other_state_docs.csv
+    whose doc_id is not in the sheet (the latter are state documents: not in central_ids()).
 
     Columns: doc_id (pop_unique_documents _id), name, link, file_id, pages,
     language (as catalogued), fmt, states.
@@ -76,10 +102,10 @@ def load_documents(central: bool = True) -> pd.DataFrame:
     }).reset_index(drop=True)
     out["states"] = out["doc_id"].map(states)
     if central:
-        c = _central()
-        if len(c):
-            c = c[~c["doc_id"].isin(out["doc_id"])][list(out.columns)]
-            out = pd.concat([out, c], ignore_index=True)
+        for c in (_central(), _other()):
+            if len(c):
+                c = c[~c["doc_id"].isin(out["doc_id"])][list(out.columns)]
+                out = pd.concat([out, c], ignore_index=True)
     orig = {k: v["original_link"] for k, v in aliases()["docs"].items() if v["original_link"]}
     out["link"] = out["doc_id"].map(orig).fillna(out["link"])   # the DB's original link when known
     return out
@@ -130,9 +156,7 @@ def link_map() -> dict[str, str]:
             except (TypeError, ValueError):
                 pass
             m.update({i: doc for i in ids if i and i != "nan"})
-        c = _central()
-        if len(c):
-            import json
+        for c in (_central(), _other()):
             for r in c.itertuples():
                 for i in json.loads(r.alt_ids):
                     m.setdefault(i, r.doc_id)

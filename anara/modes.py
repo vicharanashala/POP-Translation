@@ -3,7 +3,7 @@ exact configuration. app.py serves it as GET /api/modes; page.html, report.html 
 
 Numbers and constants are read from the modules that implement the modes (proximity.py, hybrid.py, search.py,
 zonesearch.py), so a changed constant changes the text. Order of invention follows METHODS_TRIED.md:
-A (1-3), D zone, F proximity, G bm25sum, I+J bm25near, K bm25nearmax, L/L2 bm25nearscaled, M bm25nearown, N bm25nearcov.
+A (1-3), D zone, F proximity, G bm25sum, I+J bm25near, K bm25nearmax, L/L2 bm25nearscaled, M bm25nearown, N bm25nearcov, O bm25nearcov2.
 """
 from __future__ import annotations
 
@@ -95,6 +95,11 @@ def _build() -> list[dict]:
         _near(("Combine", f"as near-own (own page full, neighbours x{px.NEIGHBOUR_WEIGHT:g}, best per group)"),
               ("Coverage factor", f"x (groups on the page + {px.NEIGHBOUR_WEIGHT:g} x groups only on neighbours) / all groups"),
               ("Crop rule", _CROP_BUMP_SCALED)), 10)
+    add("bm25nearcov2", "BM25 near-cov 2 (distance-weighted)",
+        "As near-cov, but a neighbouring page counts 0.9 one page away and 0.7 two pages away, both in the page score and in the coverage factor.",
+        _near(("Combine", f"per group the best of: its score on the page, {px.COVER_WEIGHTS[1]:g} x its best score on a page 1 away, {px.COVER_WEIGHTS[2]:g} x its best score on a page 2 away; then sum over groups"),
+              ("Coverage factor", f"x (groups on the page + sum over groups only on neighbours of {px.COVER_WEIGHTS[1]:g} at +/-1 page or {px.COVER_WEIGHTS[2]:g} at +/-2 pages, nearest page decides) / all groups"),
+              ("Crop rule", _CROP_BUMP_SCALED)), 11)
     return m
 
 

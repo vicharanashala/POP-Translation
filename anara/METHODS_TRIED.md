@@ -249,3 +249,54 @@ O2. LABELLED TEST, second version (eligibility, state vs central, mode registry)
   #10 bm25nearown 74: 2.7/23.0/36.5/68.9, 24, 0.80; 36 (30.6), 16 (25.0), 22 (54.5)
   #11 bm25nearcov 74: 5.4/21.6/39.2/78.4, 17, 0.72; 36 (36.1), 16 (25.0), 22 (54.5)
   Pairs: 211 in all; modes 4-11 score 131 (76 state, 55 central) and exclude 80 (58 not in index, 22 no extractable text, 0 not English); modes 1-3 also exclude the 55 central pairs (135). Small set: differences of a few points are noise.
+
+P. OTHER STATES (keyword-only, no embeddings, nothing written to Atlas, no PDFs kept)
+- Source of a document's state: the unique document has none; it is the placement collection `pop_documents`
+  (state_raw, joined on unique_document_id), normalised to `pop_states` names ("State Tamilnadu"/"Tamil Nadu" -> Tamil Nadu,
+  Kerala -> Keralam). 7,645 of the 10,905 unique documents have advisory_scope empty (they sit under one state), 254 State,
+  18 District, 2,988 Central.
+- Selected by `other_state_docs.py` (-> data/other_state_docs.csv): not in the sheet or central_docs.csv, scope State or
+  empty, at least one placement state other than Punjab: 6,996 documents (6,579 pdf, 114,332 pdf pages by the catalogue;
+  Tamil Nadu 2,120, Haryana 703, Karnataka 642, Keralam 593, Uttar Pradesh 372, Madhya Pradesh 354, ...; 29 states/UTs).
+  Not selected: already indexed 3,511 (sheet + Central), Central Advisories placement without a scope 380 (they look Central
+  but central_docs.py keys on advisory_scope, so they were never in the Central set either; not added), Punjab-only not in the
+  sheet 8, Central scope 5 (not placed), District scope 3, no placement 2. Non-pdf selected documents (png 277, url 95, jpg 19,
+  html 17, docx 6, printed 2, jpeg 1 = 417) are recorded as not_pdf and not downloaded.
+- All catalogued languages are downloaded (the catalogue language is unreliable, 80% of the Hindi-catalogued central sample had
+  English text); `textcheck.check` decides: english_text goes to the page-text store, scanned_no_text / mixed / non_english /
+  unreadable are only recorded (data/other_states/text_report_other.csv) and stay out of the index. No OCR, no translation.
+- `other_states_stream.py`: per document one worker downloads to data/other_states/tmp (4 workers, 3 tries, backoff 4/8/16 s),
+  checks, stores text + headings (pagetext.py), deletes the file. Done list data/other_states/done.txt (resume = rerun), failures in
+  failed.txt, log data/other_states/stream_full.log, stops under 3 GB free. About 50-60 documents per minute.
+- Other states' documents are state documents: `common.load_documents()` appends data/other_state_docs.csv (their `states` list),
+  `link_map()` takes their alt_ids, `central_ids()` does not contain them, so scope state = Punjab + other states, central unchanged.
+  `link_aliases.py build` covers them (it reads load_documents()).
+- Rebuilt, like the central ingest: text_report.csv (other-state rows merged), zone_stats.pkl, zone_* (zonesearch build, zone_levels.json),
+  prox_matrix/prox_raw/prox_meta (proximity build), link_aliases.json. Not rebuilt: keyword_stats.pkl, keyword_index.json, chunk_matrix.npz
+  (paired with Atlas chunks), zone_headings.json (the new documents' headings are in the page-text store). Builds run into data/staging
+  (env ANARA_DATA, `other_states_stage.sh`) and are swapped in by `other_states_finish.sh` (backup data/backup_before_other_states/).
+- First check on a 36-document staging build (Keralam, Haryana, Andhra Pradesh...): a query made of words of one new document's page finds it
+  (proximity rank 1/3 and 5/50, bm25nearcov rank 1/50 and 4/50); its link resolves, scope state yes, central no. The ranking said nothing
+  about quality: the queries were built from the document itself.
+- Final counts (english_text / scanned / not English / failed) are in the final log line of data/other_states/stream_full.log.
+- Not done: OCR of scanned documents, translation of non-English ones, the 380 Central-Advisories-placed documents without a scope, embeddings
+  for any other-state document (full/hybrid/restrict still see only the original 306), labelled evaluation on other states.
+
+### P2. Central Advisories added as Central; test samples only answerable questions
+
+- 380 documents with no advisory scope whose placements are all "Central Advisories" (optionally plus Punjab) are now Central: `central_docs.py` writes them into `data/central_docs.csv` (2,989 scope + 380) and alone into `data/central_adv_docs.csv`. Backup of the old csv: `data/central_docs.csv.before_advisories`.
+- They were streamed with `other_states_stream.py --docs data/central_adv_docs.csv` (PDF deleted after text extraction): 227 english_text, 142 scanned_no_text, 10 mixed, 1 not_pdf, 0 failed.
+- `other_states_finish.sh` then rebuilt the BM25 page matrices (`prox_matrix.npz`, `prox_raw.npz`, `prox_meta.json`), the zone index and the link aliases from all text: 6,402 documents, 153,925 pages (was 6,175 / ~148k). The old files are in `data/backup_before_other_states/`. `keyword_stats.pkl`, `keyword_index.json` and `chunk_matrix.npz` (embedding modes, original documents only) were not rebuilt.
+- Document list: 10,894 documents, Central 3,369 (2,302 with English text).
+- `labelled_test.start()` now samples only questions that have at least one source in the index with English text, in the chosen states and searchable by the chosen mode. Settings record `questions_of_state`, `questions_without_indexed_source` and `questions_available`. Punjab: 1,775 questions, 690 without a usable source, 1,085 sampled from. Runs made before this change were on the old index and the old sampling.
+
+### Q. bm25nearcov2: distance-weighted neighbours (mode 12)
+
+- `bm25nearcov` counts every neighbour (+/-1, +/-2) at 0.5 in two places: a group's score from a neighbour (page score: per group the best of own score and 0.5 x neighbour score, summed) and the coverage factor ((groups on the page + 0.5 x groups only on neighbours) / all groups). Mode 12, `bm25nearcov2` (`search_bm25nearcov2`, `COVER_WEIGHTS`), uses 0.9 for a neighbour 1 page away and 0.7 for one 2 pages away in both places (for a group in the coverage factor the nearest page holding it decides). The scaled crop factor is unchanged.
+- Checked: with weights 0.5 / 0.5 the ranking and scores equal mode 11 exactly; the page score and coverage factor of the returned pages of one query match a hand recomputation.
+- Not yet measured on labelled questions.
+
+### R. Curated crop aliases (mode 13) - tried, removed
+
+- Problem (Dila weed in sesame, Rupnagar): the crop master lists "till" and "til" as sesame aliases. "till" is an ordinary English word ("zero till drill", "tillage"), so pages 89-90 of the Punjab Kharif POP counted as "sesame nearby" and page 91 (dila weed control, no sesame) got the crop bump and ranked first. The real sesame pages are 108-109. Other noisy aliases seen: batta, vat, chal, khul, patti, gom, jab.
+- A mode 13 (`bm25nearcov3`, mode 12 with a curated alias list, 1,690 aliases kept / 52 removed) and a review page were built and then removed at the user's request before any labelled run. Nothing was measured. The problem above is still open in modes 4-12.

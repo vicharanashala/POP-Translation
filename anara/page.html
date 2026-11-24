@@ -53,18 +53,33 @@ button:hover{background:#2f3fb5}button:disabled{opacity:.6;cursor:wait}
 .pg p{margin:2px 0 0;font-size:13px;color:#3a4256}.pg.ctx p{color:var(--mut)}
 .minfo{margin-top:10px;padding:8px 12px;border:1px solid var(--line);border-radius:10px;background:#fafbff;font-size:13px}
 .minfo b.n{color:var(--acc)}.minfo ul{margin:4px 0 0;padding-left:18px;color:#3a4256}.minfo li b{color:var(--mut);font-weight:600}
+.ms{position:relative}.msp{position:absolute;z-index:20;top:100%;left:0;margin-top:4px;width:290px;max-height:340px;overflow:auto;background:#fff;border:1px solid var(--line);border-radius:12px;box-shadow:0 8px 24px rgba(16,24,40,.15);padding:10px}
+.msp input[type=text]{width:100%}.msp[hidden]{display:none}#msb{font:inherit;font-weight:400;padding:.5rem .8rem;border:1px solid var(--line);border-radius:10px;background:#fff;color:var(--ink);cursor:pointer;min-width:200px;text-align:left}#msb:hover{background:#f7f8ff}#tstates label{display:flex;gap:7px;align-items:center;padding:3px 2px;margin:0!important;cursor:pointer}#tstates label:hover{background:#f3f4ff}#tstates label[hidden]{display:none}
+.msp a{font-size:12.5px;margin-right:10px}
+#mmb{font:inherit;font-weight:400;padding:.65rem .85rem;border:1px solid var(--line);border-radius:10px;background:#fff;color:var(--ink);cursor:pointer;min-width:230px;text-align:left}#mmb:hover{background:#f7f8ff}
+#mmodes label{display:flex;gap:7px;align-items:center;padding:3px 2px;margin:0!important;cursor:pointer}#mmodes label:hover{background:#f3f4ff}
+.tabs{display:flex;gap:6px;overflow-x:auto;margin:10px 0 4px;padding-bottom:5px}
+.tab{flex:none;white-space:nowrap;background:#fff;color:var(--ink);border:1px solid var(--line);padding:.35rem .8rem;font-weight:500;font-size:13px}.tab:hover{background:#f7f8ff}
+.tab.on,.tab.on:hover{background:var(--acc);color:#fff;border-color:var(--acc)}.tab .mk{font-size:11.5px;font-weight:700;background:#fff;border-radius:99px;padding:0 6px;margin-left:3px}
 </style>
 <body><div class="wrap">
 <h1>Source Mapper</h1>
-<p class="lead">Find the document and the pages that answer a question.</p>
+<p class="lead">Find the document and the pages that answer a question. <a href="/documents">Document inventory</a> &middot; <a href="/report">Labelled test report</a></p>
 <form id="f" class="panel">
  <div class="row"><input id="q" placeholder="Ask a question, e.g. how to control pink bollworm in cotton" autofocus autocomplete="off"><button id="go">Search</button></div>
  <div class="row"><input id="link" placeholder="Optional: paste a document link to find it in the results" autocomplete="off">
   <select id="vec" title="Which Atlas vector index runs the Embedding only search"><option value="original">Vectors: original (float64, no quantization)</option><option value="scalar">Vectors: float32 blobs + scalar quantization</option><option value="binary">Vectors: float32 blobs + binary quantization</option></select>
-  <select id="scope" title="Which documents to search: state documents, central documents, or both"><option value="all">State + Central</option><option value="state">State only</option><option value="central">Central only</option></select>
-  <select id="mode" title="Search method; the box below says what it does"></select>
+  <select id="scope" title="Which documents to search. State: only the chosen state's documents. State + central: that state's documents plus every Central document. All: every state and Central."><option value="state">State</option><option value="state_central">State + central</option><option value="all" selected>All</option></select>
+  <select id="sstate" title="The state used by the scopes State and State + central, and the state of the random question. The count is its labelled questions with an indexed, page-mapped source"></select>
+  <div class="ms" id="mm"><button type="button" id="mmb" class="ghost" title="Search methods; tick several to run them all on one query">Method</button>
+   <div class="msp" id="mmp" hidden style="width:340px"><input type="text" id="mms" placeholder="Search methods" autocomplete="off">
+    <div class="row" style="margin:6px 0"><a href="#" id="mmall">Select all shown</a><a href="#" id="mmnone">Clear shown</a><span class="sub" id="mmn"></span></div>
+    <div id="mmodes"></div></div></div>
   <label class="sub" title="Keyword proximity mode: also read the text of the matching pages (slower)"><input type="checkbox" id="content"> read page text</label>
   <label class="sub" title="Run a method over the labelled questions and score it"><input type="checkbox" id="ttoggle"> Test with full data</label></div>
+ <div class="row"><button type="button" id="rnd" title="Picks one random labelled closed question asked in the state chosen in the state dropdown (scope All: any state) that has at least one source indexed with English text and labelled pages, whatever state the source is in. Puts it in the question box and searches it with the options chosen above.">Random near search</button>
+  <span class="sub">random labelled question of the state chosen above (scope All: any state)</span></div>
+ <div id="embnote" class="note bad" hidden style="margin-bottom:0"></div>
  <div id="minfo" class="minfo"></div>
 </form>
 <div id="tp" class="panel" hidden style="margin-top:12px">
@@ -72,13 +87,18 @@ button:hover{background:#2f3fb5}button:disabled{opacity:.6;cursor:wait}
  <div class="row"><label class="sub">Method <select id="tmode"></select></label>
   <label class="sub">% of the labelled questions <input id="tpct" type="number" min="1" max="100" value="10" style="width:90px"></label>
   <label class="sub">Seed (optional) <input id="tseed" type="number" placeholder="random" style="width:120px"></label>
-  <label class="sub">Scope <select id="tscope"><option value="all">State + Central</option><option value="state">State only</option><option value="central">Central only</option></select></label>
+  <label class="sub">Questions of state <select id="tqstate"></select></label>
+  <label class="sub">Status <select id="tqstatus"><option value="closed">closed</option></select></label>
   <button type="button" id="trun">Run</button><button type="button" id="tcancel" hidden style="background:#b42318">Cancel</button></div>
+ <div class="row" style="margin-top:6px"><span class="sub" title="Source-document states that count: a labelled source whose document is in none of the ticked states is left out of the test">Source-document states:</span><div class="ms" id="ms"><button type="button" id="msb" class="ghost">All states</button>
+  <div class="msp" id="msp" hidden><input type="text" id="mss" placeholder="Search states" autocomplete="off">
+   <div class="row" style="margin:6px 0"><a href="#" id="msall">Select all shown</a><a href="#" id="msnone">Clear shown</a><span class="sub" id="msn"></span></div>
+   <div id="tstates"></div></div></div></div>
  <div id="tbar" class="cov" hidden><div class="bar" style="flex:1 1 auto"><i id="tfill" style="width:0"></i></div><span id="tprog"></span></div>
  <div id="tres" class="sub" style="margin-top:8px"></div>
- <div class="sub" style="margin-top:6px">Only (question, document) pairs whose document is indexed, has extractable English text and lies inside the chosen scope are scored; the rest are listed in the report as excluded. <a id="tlink" href="/report">View report</a></div>
+ <div class="sub" style="margin-top:6px">Only (question, document) pairs whose document is indexed, has extractable English text and lies in one of the chosen states are scored; the rest are listed in the report as excluded. <a id="tlink" href="/report">View report</a></div>
 </div>
-<div id="status"></div><div id="linkbox"></div><div id="kw"></div><div id="out"></div>
+<div id="status"></div><div id="tabs" class="tabs" hidden></div><div id="linkbox"></div><div id="kw"></div><div id="out"></div>
 </div>
 <script>
 const $=id=>document.getElementById(id);
@@ -123,7 +143,7 @@ const zoneDoc=(x,i,hl)=>{
  const pct=Math.round(x.fraction*100),z=(x.zones||[]).map(r=>r[0]===r[1]?r[0]:r[0]+'-'+r[1]).join(', ');
  return '<article class="doc'+(hl?' hl':'')+'"'+(hl?' id="target"':'')+'>'+
  '<div class="dh"><div class="rank">'+i+'</div><div class="dt"><a href="'+esc(x.link)+'">'+esc(x.name)+'</a>'+
- (hl?'<span class="tag">your link</span>':'')+'<div class="sub">'+x.total_pages+' pages &middot; best stretch p'+x.stretch[0]+(x.stretch[1]>x.stretch[0]?'-'+x.stretch[1]:'')+'</div></div>'+
+ (hl?'<span class="tag">'+HLTAG+'</span>':'')+'<div class="sub">'+x.total_pages+' pages &middot; best stretch p'+x.stretch[0]+(x.stretch[1]>x.stretch[0]?'-'+x.stretch[1]:'')+'</div></div>'+
  '<div class="score" title="Share of the query keyword groups found inside the stretch">'+pct+'%<small>of groups</small></div></div>'+
  '<div class="cov"><div class="bar"><i style="width:'+Math.max(pct,2)+'%"></i></div><span>'+x.covered.length+' of '+x.n_groups+' groups'+(x.missing.length?' (missing: '+esc(x.missing.join(', '))+')':'')+'</span></div>'+
  '<div class="pages">'+(x.mode==='proximity'&&x.keywords.rawsum?'Best page '+pr(x.stretch)+', score '+x.strength+(x.keywords.near?' (sum over p'+x.range[0]+'-'+x.range[1]+')':'')+(x.pages.length>1?'; next best pages '+x.pages.slice(1).map(p=>'p'+p).join(', '):'')+'.':x.mode==='proximity'?'Answer '+pr(x.stretch)+' holds '+x.covered.length+' of '+x.n_groups+' groups; page range '+pr(x.range)+(x.clusters.length>1?' &middot; '+x.clusters.length+' clusters in this document':'')+'.':x.fallback&&x.no_crop?'<b>No crop from the crop list in the query.</b> Keywords only, all pages; ranked by how close together the keywords are.':x.fallback?'<b>No crop zone for this crop in this document.</b> Found on pages outside every crop zone; the crop word is required and counts as a keyword; ranked by how close together the keywords are.':'Crop zones (pages): '+z+' &middot; '+(x.zone_source==='heading'?'start taken from a heading':'found from keyword scores'))+'</div>'+
@@ -134,67 +154,165 @@ const docHtml=(x,i,hl)=>{
  const pct=Math.round(x.coverage*100);
  return '<article class="doc'+(hl?' hl':'')+'"'+(hl?' id="target"':'')+'>'+
  '<div class="dh"><div class="rank">'+i+'</div><div class="dt"><a href="'+esc(x.link)+'">'+esc(x.name)+'</a>'+
- (hl?'<span class="tag">your link</span>':'')+'<div class="sub">'+x.total_pages+' pages &middot; '+x.num_chunks+' chunks</div></div>'+
+ (hl?'<span class="tag">'+HLTAG+'</span>':'')+'<div class="sub">'+x.total_pages+' pages &middot; '+x.num_chunks+' chunks</div></div>'+
  '<div class="score" title="Mean similarity of the document\'s 5 best chunks">'+x.top5_mean.toFixed(3)+'<small>top-5 mean</small></div></div>'+
  '<div class="cov" title="Chunks of this document that were scored: among the 500 nearest (embedding only) or inside the keyword radius (keywords + embedding)">'+
  '<div class="bar"><i style="width:'+Math.max(pct,2)+'%"></i></div><span><b>'+pct+'%</b> of its chunks searched ('+x.matches+' of '+x.num_chunks+')</span></div>'+
  '<div class="pages">Matching pages, best first: '+x.pages.slice(0,12).join(', ')+(x.pages.length>12?' +'+(x.pages.length-12)+' more':'')+'</div>'+
  x.page_groups.map(g=>'<div class="grp">'+g.map(pageHtml).join('')+'</div>').join('')+'</article>';
 };
+let HLTAG='your link';
+const topPages=(x,mode)=>mode==='zone'?((x.page_groups[0]||[]).slice().sort((a,b)=>b.score-a.score||a.page-b.page).slice(0,5).map(p=>p.page)):x.pages.slice(0,5);
+const fmtPages=a=>a.length?a.join(', '):'none';
+function knownHtml(k,kIdx,d,mode){
+ const rows=k.sources.map((s,j)=>{
+  const nm='<b>'+esc(s.name||'(unnamed)')+'</b>',lab='labelled pages '+fmtPages(s.pages);
+  if(!s.searchable)return '<li>'+nm+' &mdash; '+lab+'. <span class="sub">Cannot be checked: '+esc(s.reason)+' ('+esc(s.detail)+').</span></li>';
+  const i=kIdx[j];
+  if(i<0)return '<li>'+nm+' &mdash; '+lab+'. <b style="color:#b91c1c">Not retrieved</b>: not among the '+d.length+' documents listed (the page shows only the top '+d.length+'; the labelled test ranks every document).</li>';
+  const ret=topPages(d[i],mode),dist=Math.min(...ret.flatMap(a=>s.pages.map(b=>Math.abs(a-b))));
+  const pg=!s.pages.length?'no labelled pages to compare':dist===0?'<b style="color:#15803d">page hit</b>':'no page hit, nearest returned page is '+dist+' page'+(dist==1?'':'s')+' away';
+  return '<li>'+nm+' &mdash; <b style="color:#15803d">rank '+(i+1)+'</b> of '+d.length+'. Top pages returned: '+fmtPages(ret)+'; '+lab+' &rarr; '+pg+'.</li>';
+ }).join('');
+ return '<div class="note ok"><div>This question is in the labelled collection ('+k.matches+' record'+(k.matches==1?'':'s')+'), so it was checked against its '+k.sources.length+' source'+(k.sources.length==1?'':'s')+'. The first five pages returned per document are compared with the labelled pages.</div><ul style="margin:6px 0 0 18px">'+rows+'</ul></div>';
+}
+const modeOn=()=>[...document.querySelectorAll('#mmodes input:checked')].map(b=>b.value);   // checkboxes are in mode-number order
+const mLabel=k=>{const m=MODES.find(x=>x.key===k);return m?modeLabel(m):k;};
+let R={},FOCUS=null;     // results of the last search per mode key: {d, known, kinfo, doc, secs} or {error}
+const knownHit=(k,d,mode)=>{   // 'page' | 'doc' | 'miss' | null (no checkable labelled source)
+ let any=false,doc=false,page=false;
+ for(const s of k.sources){if(!s.searchable)continue;any=true;const i=s.doc_id?d.findIndex(x=>x.doc_id===s.doc_id):-1;if(i<0)continue;doc=true;if(topPages(d[i],mode).some(a=>s.pages.includes(a)))page=true;}
+ return !any?null:page?'page':doc?'doc':'miss';
+};
+const MARK={page:['\u2713 page','#15803d','a labelled page was among the top five pages returned'],doc:['\u25D0 doc','#b45309','a labelled document was returned but none of its labelled pages'],miss:['\u2717 miss','#b91c1c','no labelled document was returned']};
+function markOf(key){
+ const r=R[key];if(r.error)return ['!','#b91c1c','this method failed: '+r.error];
+ if(r.known)return MARK[knownHit(r.known,r.d,key)]||null;
+ if(r.doc&&r.doc.found&&r.doc.indexed&&r.q)return r.d.some(x=>x.doc_id===r.doc.doc_id)?MARK.doc:MARK.miss;
+ return null;
+}
+function drawTabs(keys){
+ $('tabs').hidden=keys.length<2;
+ $('tabs').innerHTML=keys.length<2?'':keys.map(k=>{const r=R[k],mk=r?markOf(k):null;
+  return '<button type="button" class="tab'+(k===FOCUS?' on':'')+'" data-k="'+k+'"'+(mk?' title="'+esc(mk[2])+'"':'')+'>'+esc(mLabel(k))+
+   (r?(mk?' <span class="mk" style="color:'+mk[1]+'">'+mk[0]+'</span>':''):' <span class="mk">&hellip;</span>')+'</button>';}).join('');
+ const on=$('tabs').querySelector('.on');if(on&&on.scrollIntoView)on.scrollIntoView({block:'nearest',inline:'nearest'});
+}
+$('tabs').addEventListener('click',e=>{const b=e.target.closest('.tab');if(b&&R[b.dataset.k]){FOCUS=b.dataset.k;drawTabs(Object.keys(R));show(FOCUS);}});
+async function runMode(key,q,url,doc){
+ const res={d:[],known:null,kinfo:null,doc,q};
+ if(!q)return res;
+ if(!url){res.known=await (await fetch('/api/known?mode='+key+'&scope='+$('scope').value+'&state='+encodeURIComponent($('sstate').value)+'&q='+encodeURIComponent(q))).json();if(!res.known.matches||!res.known.sources.length)res.known=null;}
+ const r=await fetch('/api/search?mode='+key+'&vector='+$('vec').value+'&scope='+$('scope').value+'&state='+encodeURIComponent($('sstate').value)+'&content='+($('content').checked?1:0)+'&q='+encodeURIComponent(q));
+ if(!r.ok)throw new Error('HTTP '+r.status+' '+(await r.text()).slice(0,200));
+ res.d=await r.json();
+ res.kinfo=res.d.length?res.d[0].keywords:null;
+ if(!res.d.length&&key==='restrict')res.kinfo=await (await fetch('/api/groups?q='+encodeURIComponent(q))).json();
+ return res;
+}
+function show(key){      // draws one method's stored result: the page as it was for a single search
+ const r=R[key],q=r.q,doc=r.doc;
+ $('out').innerHTML='';$('kw').innerHTML='';$('linkbox').innerHTML='';
+ showInfo(key);
+ if(r.error){$('status').textContent=mLabel(key)+' failed';$('out').innerHTML='<div class="note bad">This method failed: '+esc(r.error)+'</div>';return;}
+ const d=r.d,known=r.known;
+ $('kw').innerHTML=kwHtml(r.kinfo);
+ $('status').textContent=(Object.keys(R).length>1?mLabel(key)+': ':'')+(q?d.length+' documents':'Link lookup')+' in '+(r.secs/1000).toFixed(1)+' s'+(q&&d.length&&d[0].vector_backend?' \u00b7 vector search: '+d[0].vector_backend:'');
+ const hit=doc&&doc.found?d.findIndex(x=>x.doc_id===doc.doc_id):-1;
+ const kIdx=known?known.sources.map(s=>s.doc_id?d.findIndex(x=>x.doc_id===s.doc_id):-1):[];
+ HLTAG=known?'labelled source':'your link';
+ const note=(c,h)=>'<div class="note '+c+'">'+h+'</div>';
+ let n='';
+ if(doc&&!doc.found)n=note('bad','No document in the spreadsheet has that link.');
+ else if(doc&&!doc.indexed)n=note('bad','<b>'+esc(doc.name)+'</b> is not in the search index (text check: '+esc(doc.verdict)+'), so it cannot be retrieved.');
+ else if(doc&&doc.modes==='zone'&&!isC(key))n=note('bad','<b>'+esc(doc.name)+'</b> is indexed for <b>Crop zone</b> mode only (keywords, no embeddings), so this mode cannot retrieve it.');
+ else if(doc&&q&&hit<0)n=note('bad','<b>'+esc(doc.name)+'</b> ('+doc.pages+' pages) was <b>not retrieved</b> for this query.');
+ else if(doc&&q)n=note('ok','<b>'+esc(doc.name)+'</b> was retrieved at rank <b>'+(hit+1)+'</b> of '+d.length+'. Highlighted below.');
+ else if(doc)n=note('ok','<b>'+esc(doc.name)+'</b> &middot; '+doc.pages+' pages &middot; <a href="'+esc(doc.link)+'">open</a>'+(doc.duplicate?' (your link is a copy; this is the original link)':'')+'. Add a query to see where it ranks.');
+ if(known)n=knownHtml(known,kIdx,d,key);
+ $('linkbox').innerHTML=n;
+ if(q&&!d.length&&['bm25sum','bm25near','bm25nearmax','bm25nearscaled','bm25nearown','bm25nearcov','bm25nearcov2'].includes(key))$('out').innerHTML='<div class="note bad">None of the query words is in the index.</div>';
+ else if(q&&!d.length&&key==='proximity')$('out').innerHTML='<div class="note bad">No document has the query\'s crop on any page, or none of the query words is important on any page.</div>';
+ else if(q&&!d.length&&key==='zone')$('out').innerHTML='<div class="note bad">No document has a crop zone holding enough of the keyword groups, or no crop from the crop master was found in the query.</div>';
+ else if(q&&!d.length&&key==='restrict')$('out').innerHTML='<div class="note bad">No document contains a form of every keyword group. The counts above show which groups are the restrictive ones.</div>';
+ else if(q&&!d.length&&!isC(key))$('out').innerHTML='<div class="note bad">No document returned. This method only has vectors for the original documents; none of them is in the chosen scope.</div>';
+ else $('out').innerHTML=d.map((x,i)=>docHtml(x,i+1,known?kIdx.includes(i):i===hit)).join('');
+ if(document.getElementById('target'))$('target').scrollIntoView({behavior:'smooth',block:'center'});
+}
 async function run(){
  const q=$('q').value.trim(),url=$('link').value.trim();
  if(!q&&!url)return;
- $('go').disabled=true;$('status').textContent='Searching...';$('out').innerHTML='';$('kw').innerHTML='';$('linkbox').innerHTML='';
- const t=performance.now();
- history.replaceState(null,'','/?'+new URLSearchParams({q,link:url,mode:$('mode').value,vector:$('vec').value,scope:$('scope').value,...($('ttoggle').checked?{test:1}:{})}));
+ const keys=modeOn();
+ if(!keys.length){$('status').textContent='Choose at least one method.';return;}
+ $('go').disabled=true;$('rnd').disabled=true;$('status').textContent='Searching...';$('out').innerHTML='';$('kw').innerHTML='';$('linkbox').innerHTML='';
+ history.replaceState(null,'','/?'+new URLSearchParams({q,link:url,mode:keys.join(','),vector:$('vec').value,scope:$('scope').value,state:$('sstate').value,...($('ttoggle').checked?{test:1}:{})}));
+ R={};FOCUS=null;drawTabs(keys);
  try{
-  let d=[],doc=null;
-  if(url)doc=await (await fetch('/api/link?url='+encodeURIComponent(url))).json();
-  if(q){d=await (await fetch('/api/search?mode='+$('mode').value+'&vector='+$('vec').value+'&scope='+$('scope').value+'&content='+($('content').checked?1:0)+'&q='+encodeURIComponent(q))).json();
-   let kinfo=d.length?d[0].keywords:null;
-   if(!d.length&&$('mode').value==='restrict')kinfo=await (await fetch('/api/groups?q='+encodeURIComponent(q))).json();
-   $('kw').innerHTML=kwHtml(kinfo);}
-  $('status').textContent=(q?d.length+' documents':'Link lookup')+' in '+((performance.now()-t)/1000).toFixed(1)+' s'+(q&&d.length&&d[0].vector_backend?' \u00b7 vector search: '+d[0].vector_backend:'');
-  if(!isC($('mode').value)&&$('scope').value!=='all')$('status').textContent+=' \u00b7 this mode only holds the original (state) documents; central documents are searchable in Crop zone mode only';
-  const hit=doc&&doc.found?d.findIndex(x=>x.doc_id===doc.doc_id):-1;
-  const note=(c,h)=>'<div class="note '+c+'">'+h+'</div>';
-  let n='';
-  if(doc&&!doc.found)n=note('bad','No document in the spreadsheet has that link.');
-  else if(doc&&!doc.indexed)n=note('bad','<b>'+esc(doc.name)+'</b> is not in the search index (text check: '+esc(doc.verdict)+'), so it cannot be retrieved.');
-  else if(doc&&doc.modes==='zone'&&!isC($('mode').value))n=note('bad','<b>'+esc(doc.name)+'</b> is indexed for <b>Crop zone</b> mode only (keywords, no embeddings), so this mode cannot retrieve it.');
-  else if(doc&&q&&hit<0)n=note('bad','<b>'+esc(doc.name)+'</b> ('+doc.pages+' pages) was <b>not retrieved</b> for this query.');
-  else if(doc&&q)n=note('ok','<b>'+esc(doc.name)+'</b> was retrieved at rank <b>'+(hit+1)+'</b> of '+d.length+'. Highlighted below.');
-  else if(doc)n=note('ok','<b>'+esc(doc.name)+'</b> &middot; '+doc.pages+' pages &middot; <a href="'+esc(doc.link)+'">open</a>'+(doc.duplicate?' (your link is a copy; this is the original link)':'')+'. Add a query to see where it ranks.');
-  $('linkbox').innerHTML=n;
-  if(q&&!d.length&&['bm25sum','bm25near','bm25nearmax','bm25nearscaled','bm25nearown','bm25nearcov'].includes($('mode').value))$('out').innerHTML='<div class="note bad">None of the query words is in the index.</div>';
-  else if(q&&!d.length&&$('mode').value==='proximity')$('out').innerHTML='<div class="note bad">No document has the query\'s crop on any page, or none of the query words is important on any page.</div>';
-  else if(q&&!d.length&&$('mode').value==='zone')$('out').innerHTML='<div class="note bad">No document has a crop zone holding enough of the keyword groups, or no crop from the crop master was found in the query.</div>';
-  else if(q&&!d.length&&$('mode').value==='restrict')$('out').innerHTML='<div class="note bad">No document contains a form of every keyword group. The counts above show which groups are the restrictive ones.</div>';
-  else $('out').innerHTML=d.map((x,i)=>docHtml(x,i+1,i===hit)).join('');
-  if(hit>=0)$('target').scrollIntoView({behavior:'smooth',block:'center'});
+  const doc=url?await (await fetch('/api/link?url='+encodeURIComponent(url))).json():null;
+  for(const [i,key] of keys.entries()){
+   if(!FOCUS)$('status').textContent='Searching'+(keys.length>1?' '+mLabel(key)+' ('+(i+1)+' of '+keys.length+')':'')+'...';
+   const t=performance.now();
+   try{R[key]=await runMode(key,q,url,doc);}catch(e){R[key]={error:String(e.message||e)};}
+   R[key].secs=performance.now()-t;
+   if(!FOCUS){FOCUS=key;show(key);}
+   drawTabs(keys);
+  }
  }catch(e){$('status').textContent='Something went wrong: '+e;}
- $('go').disabled=false;
+ $('go').disabled=false;$('rnd').disabled=false;
 }
 $('f').addEventListener('submit',e=>{e.preventDefault();run();});
 const P=new URLSearchParams(location.search);   // ?q=...&link=...&mode=hybrid runs a search on load; ?test=1 opens the test panel
 let MODES=[];const isC=k=>!!(MODES.find(m=>m.key===k)||{}).central;
 const modeLabel=m=>'#'+m.number+' '+m.name;
-function showInfo(){
- const m=MODES.find(x=>x.key===$('mode').value);if(!m){$('minfo').innerHTML='';return;}
+function showInfo(key){
+ const m=MODES.find(x=>x.key===(key||modeOn()[0]));if(!m){$('minfo').innerHTML='';return;}
  $('minfo').innerHTML='<b class="n">#'+m.number+' '+esc(m.name)+'</b>'+(m.built_on?' <span class="sub">(built on #'+m.built_on+')</span>':'')+' &mdash; '+esc(m.description)+
   '<ul>'+m.config.map(c=>'<li><b>'+esc(c[0])+':</b> '+esc(c[1])+'</li>').join('')+'</ul>';
 }
-const syncVec=()=>{$('vec').disabled=$('mode').value!=='full';$('vec').style.opacity=$('vec').disabled?.45:1;};
-$('mode').addEventListener('change',()=>{syncVec();showInfo();});
+const syncVec=()=>{$('vec').disabled=!modeOn().includes('full');$('vec').style.opacity=$('vec').disabled?.45:1;};
+function syncNote(){     // embedding methods only have vectors for the original documents
+ const emb=MODES.filter(m=>m.needs_embeddings&&modeOn().includes(m.key));
+ $('sstate').disabled=$('scope').value==='all';
+ $('embnote').hidden=!emb.length;
+ $('embnote').innerHTML=!emb.length?'':'<b>'+emb.map(m=>'#'+m.number).join(', ')+':</b> embedding methods only have vectors for the original documents (mostly Punjab, some other states), so '+
+  ($('scope').value==='state'?'they return only the chosen state\'s documents that have vectors; nothing if it has none.':'with scope '+($('scope').value==='all'?'All':'State + central')+' they cannot reach the other states or Central: they search the same vectors and return what is in the chosen scope.');
+}
+function syncModes(){
+ const on=modeOn();
+ $('mmb').textContent=(on.length===1?mLabel(on[0]):on.length===0?'No method chosen':on.length+' of '+MODES.length+' methods')+' \u25BE';
+ $('mmn').textContent=on.length+' of '+MODES.length+' chosen';
+ syncVec();syncNote();showInfo(on[0]);
+}
+$('scope').addEventListener('change',syncNote);
+$('mmb').onclick=e=>{e.stopPropagation();$('mmp').hidden=!$('mmp').hidden;if(!$('mmp').hidden)$('mms').focus();};
+$('mmp').onclick=e=>e.stopPropagation();document.addEventListener('click',()=>{$('mmp').hidden=true;});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')$('mmp').hidden=true;});
+$('mms').oninput=()=>{const q=$('mms').value.trim().toLowerCase();document.querySelectorAll('#mmodes label').forEach(l=>l.hidden=!!q&&!l.textContent.toLowerCase().includes(q));};
+$('mms').onkeydown=e=>{if(e.key==='Enter')e.preventDefault();};
+$('mmall').onclick=e=>{e.preventDefault();document.querySelectorAll('#mmodes label:not([hidden]) input').forEach(b=>b.checked=true);syncModes();};
+$('mmnone').onclick=e=>{e.preventDefault();document.querySelectorAll('#mmodes label:not([hidden]) input').forEach(b=>b.checked=false);syncModes();};
+$('mmodes').onchange=syncModes;
+$('rnd').onclick=async()=>{
+ const st=$('scope').value==='all'?'All':$('sstate').value;$('status').textContent='Picking a random question...';
+ try{
+  const r=await (await fetch('/api/random_question?state='+encodeURIComponent(st))).json();
+  if(!r.found){$('status').textContent='No labelled '+st+' question has an indexed, page-mapped source.';return;}
+  $('q').value=r.question;$('link').value='';
+  run();
+ }catch(e){$('status').textContent='Something went wrong: '+e;}
+};
 (async()=>{
  MODES=await (await fetch('/api/modes')).json();
- $('mode').innerHTML=MODES.map(m=>'<option value="'+m.key+'">'+esc(modeLabel(m))+'</option>').join('');
- $('tmode').innerHTML=$('mode').innerHTML;
- if(P.get('mode'))$('mode').value=P.get('mode');
+ const want=(P.get('mode')||'full').split(',').filter(k=>MODES.some(m=>m.key===k));
+ $('mmodes').innerHTML=MODES.map(m=>'<label class="sub"><input type="checkbox" value="'+m.key+'"'+(want.includes(m.key)?' checked':'')+'> '+esc(modeLabel(m))+'</label>').join('');
+ $('tmode').innerHTML=MODES.map(m=>'<option value="'+m.key+'">'+esc(modeLabel(m))+'</option>').join('');
+ const rs=await (await fetch('/api/random_question/states')).json();
+ $('sstate').innerHTML=rs.filter(x=>x.state!=='All'&&x.state!=='Central').map(x=>'<option value="'+esc(x.state)+'">'+esc(x.state)+' ('+x.questions+')</option>').join('');
  if(P.get('vector'))$('vec').value=P.get('vector');
- if(P.get('scope'))$('scope').value=P.get('scope');
- $('tmode').value=$('mode').value;
- syncVec();showInfo();
+ if([...$('scope').options].some(o=>o.value===P.get('scope')))$('scope').value=P.get('scope');
+ if(P.get('state'))$('sstate').value=P.get('state');else if([...$('sstate').options].some(o=>o.value==='Punjab'))$('sstate').value='Punjab';
+ $('tmode').value=modeOn()[0]||'full';
+ syncModes();
  if(P.get('test')){$('ttoggle').checked=true;$('tp').hidden=false;tPoll();}
  if(P.get('q')||P.get('link')){$('q').value=P.get('q')||'';$('link').value=P.get('link')||'';run();}
 })();
@@ -211,14 +329,29 @@ async function tPoll(){
  if(s.status==='done'){
   const r=(await (await fetch('/api/test/runs')).json()).find(x=>x.run_id===s.run_id);
   if(r)$('tlink').href='/report?run='+encodeURIComponent(r.run_id);
-  const sp=(n,sc,t)=>' &middot; '+n+': '+(sc||0)+' scored'+(sc?', top-10 '+t+'%':'');
-  $('tres').innerHTML=r?'<b>#'+r.number+' '+esc(r.name)+'</b>, scope '+esc(r.scope)+', '+r.percent+'% ('+r.questions_picked+' questions, seed '+r.seed+'): '+r.scored+' scored &middot; top-1 '+r.top1+'% &middot; top-10 '+r.top10+'% &middot; median rank '+r.rank_median+' &middot; mean page distance '+r.page_distance_mean+sp('state',r.state_scored,r.state_top10)+sp('central',r.central_scored,r.central_top10)+' &middot; '+r.pairs_excluded+' pairs excluded &middot; '+r.seconds+' s':'';}
+  const sp=Object.entries(r?r.by_state:{}).map(([n,v])=>' &middot; '+esc(n)+': '+v.scored+' scored'+(v.scored?', top-10 '+v.top10+'%':'')).join('');
+  $('tres').innerHTML=r?'<b>#'+r.number+' '+esc(r.name)+'</b>, '+esc(r.question_state)+' questions, source states '+esc(r.states)+', '+r.percent+'% ('+r.questions_picked+' questions, seed '+r.seed+'): '+r.scored+' scored &middot; top-1 '+r.top1+'% &middot; top-10 '+r.top10+'% &middot; median rank '+r.rank_median+' &middot; mean page distance '+r.page_distance_mean+sp+' &middot; '+r.pairs_excluded+' pairs excluded &middot; '+r.seconds+' s':'';}
 }
 $('trun').addEventListener('click',async()=>{
  $('tres').textContent='';
- const res=await fetch('/api/test/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:$('tmode').value,percent:+$('tpct').value,seed:$('tseed').value===''?null:+$('tseed').value,scope:$('tscope').value})});
+ const res=await fetch('/api/test/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:$('tmode').value,percent:+$('tpct').value,seed:$('tseed').value===''?null:+$('tseed').value,question_state:$('tqstate').value,status:$('tqstatus').value,states:[...document.querySelectorAll('#tstates input:checked')].map(x=>x.value)})});
  if(!res.ok){$('tres').textContent=(await res.json()).detail;return;}
  tPoll();
 });
+(async()=>{const o=await (await fetch('/api/test/options')).json();
+ $('tqstate').innerHTML=o.question_states.map(x=>'<option value="'+esc(x.state)+'"'+(x.state===o.default_state?' selected':'')+'>'+esc(x.state)+' ('+x.questions+')</option>').join('');
+ $('tqstatus').innerHTML=o.statuses.map(x=>'<option>'+esc(x)+'</option>').join('');
+ $('tstates').innerHTML=o.doc_states.map(x=>'<label class="sub"><input type="checkbox" value="'+esc(x)+'" checked> '+esc(x)+'</label>').join('');
+ const boxes=()=>[...document.querySelectorAll('#tstates input')],shown=()=>boxes().filter(b=>!b.parentElement.hidden);
+ const sync=()=>{const on=boxes().filter(b=>b.checked),n=boxes().length;$('msb').textContent=(on.length===n?'All states ('+n+')':on.length===0?'No state chosen':on.length<=2?on.map(b=>b.value).join(', '):on.length+' of '+n+' states')+' \u25BE';$('msn').textContent=on.length+' of '+n+' chosen';};
+ $('msb').onclick=e=>{e.stopPropagation();$('msp').hidden=!$('msp').hidden;if(!$('msp').hidden)$('mss').focus();};
+ $('msp').onclick=e=>e.stopPropagation();document.addEventListener('click',()=>{$('msp').hidden=true;});
+ document.addEventListener('keydown',e=>{if(e.key==='Escape')$('msp').hidden=true;});
+ $('mss').oninput=()=>{const q=$('mss').value.trim().toLowerCase();boxes().forEach(b=>b.parentElement.hidden=!!q&&!b.value.toLowerCase().includes(q));};
+ $('mss').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();}};
+ $('msall').onclick=e=>{e.preventDefault();shown().forEach(b=>b.checked=true);sync();};
+ $('msnone').onclick=e=>{e.preventDefault();shown().forEach(b=>b.checked=false);sync();};
+ $('tstates').onchange=sync;sync();
+})();
 $('tcancel').addEventListener('click',async()=>{await fetch('/api/test/cancel',{method:'POST'});tPoll();});
 </script></html>

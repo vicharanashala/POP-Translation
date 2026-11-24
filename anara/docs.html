@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Document inventory - Source Mapper</title>
+<style>
+:root{--bg:#f5f6fa;--card:#fff;--ink:#1d2433;--mut:#667085;--line:#e3e6ef;--acc:#3b4cca;--accbg:#eef0ff;
+--ok:#1f8a5b;--okbg:#e7f6ee;--warn:#a85f00;--warnbg:#fff4e0}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:1280px;margin:0 auto;padding:30px 18px 70px}
+h1{margin:0;font-size:25px;letter-spacing:-.01em}h2{font-size:17px;margin:26px 0 8px}
+.lead{margin:.2rem 0 1.1rem;color:var(--mut)}
+a{color:var(--acc)}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;box-shadow:0 1px 2px rgba(16,24,40,.05)}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+select,input[type=text]{font:inherit;padding:.5rem .8rem;border:1px solid var(--line);border-radius:10px;background:#fff;color:var(--ink);min-width:0}
+button,a.btn{font:inherit;font-weight:600;padding:.5rem 1.2rem;border:0;border-radius:10px;background:var(--acc);color:#fff;cursor:pointer;text-decoration:none;display:inline-block}
+button:hover,a.btn:hover{background:#2f3fb5}button.ghost{background:#fff;color:var(--acc);border:1px solid var(--line)}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:10px;margin-top:10px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 14px}
+.card b{display:block;font-size:24px;line-height:1.2}.card span{color:var(--mut);font-size:12.5px}
+.card.ok b{color:var(--ok)}
+.sub{color:var(--mut);font-size:12.5px}
+table{border-collapse:collapse;width:100%;background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden;font-size:13px}
+th,td{padding:6px 9px;border-top:1px solid var(--line);text-align:left;vertical-align:top}
+th{background:#fafbff;font-size:12px;color:var(--mut);white-space:nowrap}
+#st th{cursor:pointer;user-select:none}
+.num{text-align:right;white-space:nowrap}
+tr.tot td{background:var(--accbg);font-weight:600}
+tr.sel td{background:#fff9e8}
+.scroll{overflow-x:auto}
+.note{padding:.6rem .9rem;border-radius:10px;margin:8px 0;font-size:13.5px;border:1px solid #f3d9a8;background:var(--warnbg);color:#7a4500}
+.pill{display:inline-block;font-size:11.5px;font-weight:600;padding:1px 8px;border-radius:999px;background:#eef0f5;color:#475467}
+.pill.ok{background:var(--okbg);color:var(--ok)}.pill.warn{background:var(--warnbg);color:var(--warn)}
+td.st a{text-decoration:none;color:var(--acc);font-weight:600}
+</style>
+<body><div class="wrap">
+<h1>Document inventory</h1>
+<p class="lead">Every document the Source Mapper knows about, by state (Central included), with whether its text could be read. <a href="/">Back to Source Mapper</a> &middot; <a href="/report">Labelled test report</a></p>
+
+<div class="cards" id="cards"></div>
+<div class="note" id="notes"></div>
+
+<h2>By state</h2>
+<div class="sub" style="margin-bottom:6px">Click a state to list its documents below; click a column heading to sort. A document that belongs to several states is counted in each of them, so the rows add up to more than the total.</div>
+<div class="scroll"><table id="st"></table></div>
+
+<h2>Documents <span class="sub" id="count"></span></h2>
+<div class="panel">
+ <div class="row">
+  <select id="fs"><option value="">All states</option></select>
+  <select id="fv"><option value="">Any text status</option></select>
+  <select id="fl"><option value="">Any catalogued language</option></select>
+  <label class="sub"><input type="checkbox" id="fi"> only searchable (indexed)</label>
+  <input type="text" id="fq" placeholder="Search the document name" style="flex:1;min-width:200px">
+  <button id="go">Show</button><a class="btn ghost" id="xl" href="#">Download Excel</a>
+ </div>
+</div>
+<div class="scroll" style="margin-top:10px"><table id="dl"></table></div>
+<div class="row" style="margin-top:10px"><button class="ghost" id="more" style="display:none">Show 100 more</button></div>
+</div>
+<script>
+const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const N=x=>Number(x).toLocaleString('en-US'),pc=(a,b)=>b?Math.round(1000*a/b)/10+'%':'-';
+const LANG={eng:'English',hin:'Hindi',kan:'Kannada',tam:'Tamil',ben:'Bengali',mal:'Malayalam',tel:'Telugu',pan:'Punjabi',mar:'Marathi',guj:'Gujarati',ori:'Odia',urd:'Urdu',asm:'Assamese'};
+const ln=c=>LANG[c]||c||'?';
+let S=null,sortKey='docs',sortDir=-1,offset=0,PAGE=100;
+const COLS=[['state','State'],['docs','Documents'],['catalogued_english','Catalogued English'],['checked','Checked'],['english_text','English text extractable'],['pct','% of documents'],
+ ['scanned_no_text','Scanned, no text'],['mixed','Mixed'],['non_english','Text not English'],['not_pdf','Not a PDF'],['not_checked','Not checked'],['indexed_pages','Searchable pages']];
+const val=(r,k)=>k==='pct'?(r.docs?r.english_text/r.docs:0):r[k];
+function renderStates(){
+ const rows=S.states.slice().sort((a,b)=>{const x=val(a,sortKey),y=val(b,sortKey);return (typeof x==='string'?x.localeCompare(y):x-y)*sortDir;});
+ const cur=$('fs').value,t=S.total;
+ const cell=(k,r)=>k==='state'?'<td class="st"><a href="#" data-s="'+esc(r.state)+'">'+esc(r.state)+'</a></td>':k==='pct'?'<td class="num">'+pc(r.english_text,r.docs)+'</td>':'<td class="num">'+N(r[k])+'</td>';
+ $('st').innerHTML='<tr>'+COLS.map(([k,h])=>'<th data-k="'+k+'" class="'+(k==='state'?'':'num')+'">'+h+(k===sortKey?(sortDir<0?' \u25BE':' \u25B4'):'')+'</th>').join('')+'</tr>'+
+  '<tr class="tot">'+COLS.map(([k])=>k==='state'?'<td>Total (each document once)</td>':cell(k,t)).join('')+'</tr>'+
+  rows.map(r=>'<tr'+(r.state===cur?' class="sel"':'')+'>'+COLS.map(([k])=>cell(k,r)).join('')+'</tr>').join('');
+ $('st').querySelectorAll('th').forEach(h=>h.onclick=()=>{const k=h.dataset.k;sortDir=sortKey===k?-sortDir:(k==='state'?1:-1);sortKey=k;renderStates();});
+ $('st').querySelectorAll('td.st a').forEach(a=>a.onclick=e=>{e.preventDefault();$('fs').value=a.dataset.s;load(true);$('dl').scrollIntoView({behavior:'smooth'});renderStates();});
+}
+function renderTop(){
+ const t=S.total;
+ const c=(n,l,cls)=>'<div class="card '+(cls||'')+'"><b>'+N(n)+'</b><span>'+l+'</span></div>';
+ $('cards').innerHTML=c(t.docs,'documents in total ('+N(t.pages)+' catalogued pages)')+c(t.catalogued_english,'catalogued as English ('+pc(t.catalogued_english,t.docs)+')')+
+  c(t.checked,'downloaded and text-checked')+c(t.english_text,'with English text extractable ('+pc(t.english_text,t.docs)+') = searchable','ok')+
+  c(t.indexed_pages,'pages of those searchable documents')+c(t.scanned_no_text+t.mixed,'scanned or mixed, no usable text')+c(t.non_english,'text in another language')+c(t.not_pdf+t.unreadable+t.not_checked,'not a PDF, unreadable or not checked');
+ $('notes').innerHTML='<b>How to read this.</b> &ldquo;Catalogued English&rdquo; is the language column of the document list. &ldquo;English text extractable&rdquo; is what the text check found when the file was read: '+
+  'only these documents are in the search index (indexed = '+N(t.indexed)+'). The two differ: '+N(t.english_text_not_catalogued_english)+' documents catalogued as another language (or none) actually contain English text, and '+
+  N(t.catalogued_english-t.catalogued_english_extractable)+' catalogued-English documents have no extractable English text (scanned images, mixed or non-PDF files; no OCR is done). '+
+  N(S.multi_state_docs)+' documents belong to more than one state.';
+}
+function qs(extra){const p=new URLSearchParams({state:$('fs').value,verdict:$('fv').value,lang:$('fl').value,q:$('fq').value,indexed:$('fi').checked?'true':'false',...extra});return p.toString();}
+const VL=()=>S.verdicts;
+async function load(reset){
+ if(reset){offset=0;$('dl').innerHTML='';}
+ const d=await (await fetch('/api/docs/list?'+qs({offset,limit:PAGE}))).json();
+ if(reset)$('dl').innerHTML='<tr><th>Document</th><th>States</th><th>Type</th><th class="num">Pages</th><th>Catalogued language</th><th>Text language</th><th>Text status</th><th>Searchable</th></tr>';
+ $('dl').insertAdjacentHTML('beforeend',d.rows.map(r=>'<tr><td><a href="'+esc(r.link)+'" target="_blank" rel="noopener">'+esc(r.name)+'</a></td><td>'+esc(r.states.join(', '))+'</td><td>'+esc(r.fmt)+'</td><td class="num">'+N(r.pages)+'</td><td>'+esc(ln(r.catalogued_lang))+'</td><td>'+esc(r.text_lang?ln(r.text_lang):'')+'</td>'+
+  '<td><span class="pill '+(r.verdict==='english_text'?'ok':'warn')+'">'+esc(VL()[r.verdict]||r.verdict)+'</span></td><td>'+(r.indexed?'<span class="pill ok">yes</span>':'<span class="pill">no</span>')+'</td></tr>').join(''));
+ offset+=d.rows.length;
+ $('count').textContent='('+N(Math.min(offset,d.total))+' of '+N(d.total)+' shown)';
+ $('more').style.display=offset<d.total?'':'none';
+ $('xl').href='/api/docs/export?'+qs({});
+}
+(async()=>{
+ S=await (await fetch('/api/docs/summary')).json();
+ $('fs').insertAdjacentHTML('beforeend',S.states.map(r=>'<option>'+esc(r.state)+'</option>').join(''));
+ $('fv').insertAdjacentHTML('beforeend',Object.entries(S.verdicts).map(([k,v])=>'<option value="'+k+'">'+esc(v)+'</option>').join(''));
+ $('fl').insertAdjacentHTML('beforeend',S.catalogued_languages.map(l=>'<option value="'+esc(l.lang)+'">'+esc(ln(l.lang))+' ('+N(l.docs)+')</option>').join(''));
+ renderTop();renderStates();load(true);
+ $('go').onclick=()=>{load(true);renderStates();};$('more').onclick=()=>load(false);
+ $('fq').addEventListener('keydown',e=>{if(e.key==='Enter')$('go').click();});
+ ['fs','fv','fl','fi'].forEach(i=>$(i).addEventListener('change',()=>$('go').click()));
+})();
+</script>
+</html>

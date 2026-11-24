@@ -35,6 +35,7 @@ NEAR = 2            # bm25near: neighbouring pages counted either side of a page
 CROP_RADIUS, CROP_UP, CROP_DOWN = 5, 0.3, 0.3   # bm25near: crop within this many pages: score x(1+0.3), else x(1-0.3)
 CROP_DOWN_SCALED = 0.25   # bm25nearscaled: no crop within the radius
 CROP_PER_SCORE = 1.0      # bm25nearscaled: percent of bump per BM25 point of the crop, minus 1 point per page of distance
+COVER_WEIGHTS = {1: 0.9, 2: 0.7}   # bm25nearcov2: a neighbour page 1 / 2 pages away counts this fraction, in the page score and in the coverage factor
 NEIGHBOUR_WEIGHT = 0.5   # bm25nearown: a neighbouring page's score counts this fraction of the page's own
 CROP_DOWN_MAX = 0.15  # bm25nearmax: the no-crop cut is smaller, since a group counts only once
 SEED_SLACK = 2      # windows up to this many pages longer than a document's tightest one are also seeds
@@ -382,6 +383,16 @@ def search_bm25nearcov(query: str, scope: str = "all", limit: int = MAX_DOCS, co
     return _page_sum_search(query, _strong(), radius, scope, limit, content, crop_radius, "wmax", CROP_DOWN_SCALED, True, True)
 
 
+def search_bm25nearcov2(query: str, scope: str = "all", limit: int = MAX_DOCS, content: bool = False,
+                        radius: int = NEAR, crop_radius: int = CROP_RADIUS) -> list[dict]:
+    """bm25nearcov with distance-weighted neighbours (COVER_WEIGHTS: 0.9 one page away, 0.7 two pages away) instead of
+    NEIGHBOUR_WEIGHT 0.5, in both places: a group's score from a neighbour counts that fraction (best per group, own page
+    in full), and a group found only on neighbours counts that fraction (nearest page decides) in the coverage factor.
+    The crop factor is that of bm25nearcov."""
+    return _page_sum_search(query, _strong(), radius, scope, limit, content, crop_radius, "wmax", CROP_DOWN_SCALED, True, True,
+                            COVER_WEIGHTS)
+
+
 def search_bm25nearmax(query: str, scope: str = "all", limit: int = MAX_DOCS, content: bool = False,
                        radius: int = NEAR, crop_radius: int = CROP_RADIUS) -> list[dict]:
     """Like bm25near, but each group takes its BEST score over the page and its +/-`radius` neighbours (not the sum
@@ -392,7 +403,7 @@ def search_bm25nearmax(query: str, scope: str = "all", limit: int = MAX_DOCS, co
 
 def _page_sum_search(query: str, m: sp.csr_matrix, radius: int, scope: str, limit: int, content: bool,
                      crop_radius: int = 0, combine: str = "sum", crop_down: float = CROP_DOWN, scaled: bool = False,
-                     coverage: bool = False) -> list[dict]:
+                     coverage: bool = False, cover_weights: dict | None = None) -> list[dict]:
     """A page's score is the SUM over the query's groups of the group's best BM25 score (matrix `m`) on the page and,
     when `radius` > 0, on the `radius` pages either side inside the same document (so a word on a neighbouring page
     counts as many times as the page sum adds it). No 75%/4 bar, no window, no crop filter; the crop is one group like
@@ -403,7 +414,7 @@ def _page_sum_search(query: str, m: sp.csr_matrix, radius: int, scope: str, limi
     words = list(groups)
     n = len(words)
     used = {t for w in words for t in ([w] + snip[w])} | skip
-    info = {"proximity": True, "rawsum": True, "near": radius, "combine": combine, "crop_down": crop_down, "scaled": scaled, "coverage": coverage,
+    info = {"proximity": True, "rawsum": True, "near": radius, "combine": combine, "crop_down": crop_down, "scaled": scaled, "coverage": coverage, "cover_weights": cover_weights,
             "crop_radius": crop_radius if crop_info else 0, "words": words, "groups": groups, "need": 0,
             "level": "raw BM25 sum", "crop": crop_info, "ignored": [t for t in tokens if t not in used]}
     if not n:
@@ -430,7 +441,8 @@ def _page_sum_search(query: str, m: sp.csr_matrix, radius: int, scope: str, limi
                 if d:
                     src = idx + d
                     valid = (src >= off[doc_of]) & (src < (off + ln)[doc_of])
-                    mx = np.maximum(mx, NEIGHBOUR_WEIGHT * np.where(valid, score0[:, np.clip(src, 0, npg - 1)], 0))
+                    w = NEIGHBOUR_WEIGHT if cover_weights is None else cover_weights.get(abs(d), min(cover_weights.values()))
+                    mx = np.maximum(mx, w * np.where(valid, score0[:, np.clip(src, 0, npg - 1)], 0))
             page = mx.sum(axis=0)
         else:
             page = cs[hi + 1] - cs[lo]
@@ -444,13 +456,14 @@ def _page_sum_search(query: str, m: sp.csr_matrix, radius: int, scope: str, limi
         doc_of = np.repeat(np.arange(len(off)), ln)
         idx = np.arange(npg)
         here = score0 > 0
-        nb = np.zeros_like(here)
+        nb = np.zeros(here.shape)             # per group and page: the weight of the best neighbour that holds the group
         for d in range(-radius, radius + 1):
             if d:
                 src = idx + d
                 valid = (src >= off[doc_of]) & (src < (off + ln)[doc_of])
-                nb |= valid & here[:, np.clip(src, 0, npg - 1)]
-        cover = (here.sum(axis=0) + NEIGHBOUR_WEIGHT * (nb & ~here).sum(axis=0)) / n
+                w = NEIGHBOUR_WEIGHT if cover_weights is None else cover_weights.get(abs(d), min(cover_weights.values()))
+                nb = np.maximum(nb, w * (valid & here[:, np.clip(src, 0, npg - 1)]))
+        cover = (here.sum(axis=0) + (nb * ~here).sum(axis=0)) / n
         page = page * cover
     if crop_info and crop_radius:             # the crop group is words[0]; its pages within +/-crop_radius, same document
         doc_of = np.repeat(np.arange(len(off)), ln)

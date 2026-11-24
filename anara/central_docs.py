@@ -21,12 +21,36 @@ sys.path.insert(0, __file__.rsplit("/", 1)[0])
 import common  # noqa: E402
 
 OUT = common.DATA / "central_docs.csv"
+ADV_OUT = common.DATA / "central_adv_docs.csv"    # just the Central-Advisories rows (not in the sheet), the ones to ingest
+EXTRA = {"centraladvisories": "Central"}
+
+
+def _key(s: str) -> str:
+    return re.sub(r"[^a-z]", "", re.sub(r"^\s*state\s+", "", str(s), flags=re.I).lower())
+
+
+def _advisory_ids(db) -> set[str]:
+    """Documents with no Central scope whose placements are all "Central Advisories" (plus possibly Punjab): they are
+    Central documents that the scope field misses. Documents also placed in another state stay state documents."""
+    canon = {_key(s["name"]): s["name"] for s in db.pop_states.find()}
+    canon.update(EXTRA)
+    placed: dict[str, set] = {}
+    for d in db.pop_documents.find({}, {"unique_document_id": 1, "state_raw": 1}):
+        raw = d.get("state_raw") or ""
+        placed.setdefault(str(d["unique_document_id"]), set()).add(canon.get(_key(raw), raw.strip() or "?"))
+    return {u for u, st in placed.items() if "Central" in st and not (st - {"Central", "Punjab", "?"})}
 
 
 def main() -> None:
-    col = MongoClient(os.environ["PROD_DB_URL"], serverSelectionTimeoutMS=20000)[os.environ["PROD_DB_NAME"]]["pop_unique_documents"]
-    rows = []
-    for d in col.find({"advisory_scope": "Central"}, {"chunk_embeddings": 0}):
+    db = MongoClient(os.environ["PROD_DB_URL"], serverSelectionTimeoutMS=20000)[os.environ["PROD_DB_NAME"]]
+    col = db["pop_unique_documents"]
+    adv = _advisory_ids(db)
+    sheet_ids = set(pd.read_excel(common.XLSX)["unique_document__id"])
+    rows, extra = [], []
+    for d in col.find({}, {"chunk_embeddings": 0}):
+        scope, doc = d.get("advisory_scope"), str(d["_id"])
+        if scope != "Central" and not (scope != "District" and doc in adv and doc not in sheet_ids):
+            continue
         ids = [str(d.get("representative_file_id"))]
         ids += re.findall(r"/file/([A-Za-z0-9]+)", str(d.get("shareable_link")))
         dup = d.get("duplicate_links") or []
@@ -40,17 +64,16 @@ def main() -> None:
             pages = int(d.get("num_pages"))
         except (TypeError, ValueError):
             pages = 0
-        rows.append({"doc_id": str(d["_id"]), "name": d.get("shareable_name"), "link": d.get("shareable_link"),
+        (rows if scope == "Central" else extra).append({"doc_id": doc, "name": d.get("shareable_name"), "link": d.get("shareable_link"),
                      "file_id": d.get("representative_file_id"), "pages": pages, "language": d.get("language"),
                      "fmt": d.get("format_original"), "states": json.dumps(["Central"]),
                      "alt_ids": json.dumps(sorted({i for i in ids if i and i != "None"}))})
-    out = pd.DataFrame(rows)
+    out = pd.DataFrame(rows + extra)
     out.to_csv(OUT, index=False)
-    print(len(out), "central documents ->", OUT)
+    pd.DataFrame(extra).to_csv(ADV_OUT, index=False)
+    print(len(rows), "Central-scope +", len(extra), "Central-Advisories documents ->", OUT, "; the latter alone ->", ADV_OUT)
     print(pd.crosstab(out["fmt"], out["language"]).to_string())
-    sheet = pd.read_excel(common.XLSX)
-    ids = set(sheet["unique_document__id"])
-    print("central ids also in the sheet:", len(ids & set(out["doc_id"])))
+    print("central ids also in the sheet:", len(sheet_ids & set(out["doc_id"])))
 
 
 if __name__ == "__main__":

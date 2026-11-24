@@ -36,7 +36,7 @@ tr.cur td{background:#eef0ff}.tag{background:var(--hl);color:#fff;font-size:11px
 <h1>Labelled test report</h1>
 <p class="lead">How the search methods did on questions whose answer documents and pages were labelled by experts. <a href="/?test=1">Back to Source Mapper</a></p>
 <details id="allbox" open><summary style="font-size:17px;font-weight:600;color:var(--ink)">All methods: latest run of each, side by side</summary>
- <div class="sub" style="margin:6px 0">Numbers are in the order the methods were invented. Each row is the most recent run of that method; compare only rows with the same % and scope. "State" and "central" give the same metric over the questions whose labelled document is state or central scope (a method that cannot search central documents is scored on state only). Click a method to see its configuration, or the date to open that run.</div>
+ <div class="sub" style="margin:6px 0">Numbers are in the order the methods were invented. Each row is the most recent run of that method; compare only rows with the same % and scope. The per-state cells give scored questions and top-10 % over the questions whose labelled document is in that state (a question counts under every state of its documents; a method that cannot search central documents is scored on state documents only). Click a method to see its configuration, or the date to open that run.</div>
  <div class="scroll"><table id="cmp"></table></div>
 </details>
 <h2>One run</h2>
@@ -53,46 +53,53 @@ const MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','De
 const when=c=>{const m=/(\d+)-(\d+)-(\d+)T(\d+:\d+)/.exec(c||'');return m?(+m[3])+' '+MON[+m[2]-1]+' '+m[4]:c;};
 let MODES=[],RUNS=[],REP=null,sortKey='worst',sortDir=1;
 const cfg=m=>'<ul class="cfg">'+m.config.map(c=>'<li><b>'+esc(c[0])+':</b> '+esc(c[1])+'</li>').join('')+'</ul>';
-const runText=r=>'#'+r.number+' '+r.name+' - '+r.percent+'% of questions ('+r.scored+' scored'+(r.scope!=='all'?', '+r.scope+' only':'')+') - '+when(r.created)+' - top-10 '+f(r.top10,'%')+(r.old_run?' - old run, before eligibility filter':'');
-const cols=[['id','Question ID'],['question','Question'],['crop','Crop'],['channel','Channel'],['scope','Source scope'],['n_eligible','Eligible sources / all'],
+const runText=r=>'#'+r.number+' '+r.name+' - '+r.percent+'% of '+r.question_state+' questions ('+r.scored+' scored'+(r.states!=='all'?', source states '+r.states:'')+') - '+when(r.created)+' - top-10 '+f(r.top10,'%')+(r.old_run?' - old run, before eligibility filter':'');
+const cols=[['id','Question ID'],['question','Question'],['crop','Crop'],['channel','Channel'],['states','Source states'],['n_eligible','Eligible sources / all'],
  ['best_rank','Best rank'],['best_page_distance','Page distance'],['any_page_hit','Page hit'],['ret','Returned pages (best source)'],['lab','Labelled pages']];
 // worst first: not returned, then the highest rank, then the largest page distance
 const worst=r=>r.best_rank==null?1e9:r.best_rank+(r.best_page_distance||0)/1e3;
-const val=(r,k)=>k==='worst'?worst(r):k==='ret'?r.best_pages_returned.join(','):k==='lab'?r.best_pages_labelled.join(','):k==='any_page_hit'?(r.any_page_hit==null?-1:+r.any_page_hit):r[k];
+const val=(r,k)=>k==='worst'?worst(r):k==='ret'?r.best_pages_returned.join(','):k==='states'?(r.states||[]).join(','):k==='lab'?r.best_pages_labelled.join(','):k==='any_page_hit'?(r.any_page_hit==null?-1:+r.any_page_hit):r[k];
 const statCells=s=>'<td class="num">'+f(s.rank_mean)+'</td><td class="num">'+f(s.rank_median)+'</td>'+['top1','top5','top10','top50'].map(x=>'<td class="num">'+f(s[x])+'</td>').join('')+'<td class="num">'+f(s.page_distance_mean)+'</td>'+['page_hit','dist_le_1','dist_le_2','dist_le_5'].map(x=>'<td class="num">'+f(s[x])+'</td>').join('');
 const STATHEAD='<th class="num">Mean rank</th><th class="num">Median rank</th><th class="num">Top-1 %</th><th class="num">Top-5 %</th><th class="num">Top-10 %</th><th class="num">Top-50 %</th><th class="num">Mean page dist.</th><th class="num">Page hit %</th><th class="num">&le;1 page %</th><th class="num">&le;2 pages %</th><th class="num">&le;5 pages %</th>';
 function groupTable(title,obj,label){
  return '<h2>'+title+'</h2><div class="scroll"><table><tr><th>'+label+'</th><th class="num">Scored / questions</th><th class="num">Pairs</th>'+STATHEAD+'</tr>'+
  Object.entries(obj).map(([k,s])=>'<tr><td>'+esc(k)+'</td><td class="num">'+s.scored+' / '+s.questions+'</td><td class="num">'+f(s.pairs)+'</td>'+statCells(s)+'</tr>').join('')+'</table></div>';
 }
+let shown=100;
 function rows(){
  const q=REP.questions.filter(r=>r.n_eligible).sort((a,b)=>{const x=val(a,sortKey),y=val(b,sortKey);
   const nx=x==null,ny=y==null;if(nx||ny)return nx&&ny?0:nx?1:-1;   // empty values last in both directions
   return (x<y?-1:x>y?1:0)*sortDir*(sortKey==='worst'?-1:1);});
- return q.map(r=>'<tr'+(r.best_rank==null?' class="bad"':'')+'><td>'+esc(r.id)+'</td><td class="q">'+esc(r.question)+'</td><td>'+esc(r.crop)+'</td><td>'+esc(r.channel)+'</td><td>'+esc(r.scope||'-')+'</td><td class="num">'+r.n_eligible+' / '+r.n_sources+'</td><td class="num">'+(r.best_rank==null?'not returned':r.best_rank)+'</td><td class="num">'+f(r.best_page_distance)+'</td><td>'+(r.any_page_hit==null?'-':r.any_page_hit?'yes':'no')+'</td><td>'+esc(r.best_pages_returned.join(', '))+'</td><td>'+esc(r.best_pages_labelled.join(', '))+'</td></tr>').join('');
+ $('more').innerHTML=q.length>shown?'<button id="morebtn">Show '+Math.min(100,q.length-shown)+' more ('+shown+' of '+q.length+' shown)</button>':'<span class="sub">All '+q.length+' shown</span>';
+ return q.slice(0,shown).map(r=>'<tr'+(r.best_rank==null?' class="bad"':'')+'><td>'+esc(r.id)+'</td><td class="q">'+esc(r.question)+'</td><td>'+esc(r.crop)+'</td><td>'+esc(r.channel)+'</td><td>'+esc((r.states||[]).join(', ')||'-')+'</td><td class="num">'+r.n_eligible+' / '+r.n_sources+'</td><td class="num">'+(r.best_rank==null?'not returned':r.best_rank)+'</td><td class="num">'+f(r.best_page_distance)+'</td><td>'+(r.any_page_hit==null?'-':r.any_page_hit?'yes':'no')+'</td><td>'+esc(r.best_pages_returned.join(', '))+'</td><td>'+esc(r.best_pages_labelled.join(', '))+'</td></tr>').join('');
 }
-const table=()=>{$('qrows').innerHTML=rows();};
+const table=()=>{$('qrows').innerHTML=rows();const b=$('morebtn');if(b)b.onclick=()=>{shown+=100;table();};};
 function show(r){
  REP=r;const s=r.summary,st=r.settings,m=r.mode,el=r.eligibility;
  $('xlsx').href='/api/test/report?format=xlsx&run='+encodeURIComponent(r.run_id);$('json').href='/api/test/report?format=json&run='+encodeURIComponent(r.run_id);
  const reasons=el?Object.entries(el.excluded_by_reason).map(([k,v])=>'<li><b>'+esc(k)+':</b> '+v+'</li>').join(''):'';
- $('body').innerHTML=
-  (r.old_run?'<div class="note">Old run, before the eligibility filter: sources that resolved to an indexed document were scored whatever their language or text, and there is no state / central split. Run this method again for a comparable report.</div>':'')+
+ const html=
+  (r.old_run?'<div class="note">Old run, before the eligibility filter: sources that resolved to an indexed document were scored whatever their language or text, and there is no per-state split. Run this method again for a comparable report.</div>':'')+
   '<h2>Method <span class="tag">#'+m.number+'</span> '+esc(m.name)+'</h2><div class="panel" style="font-size:13.5px">'+esc(m.description)+(m.built_on?' <span class="sub">(built on #'+m.built_on+')</span>':'')+cfg(m)+'</div>'+
-  '<h2>Settings</h2><div class="panel sub" style="font-size:13.5px">Scope <b>'+esc(st.scope)+'</b> &middot; <b>'+st.percent+'%</b> of the labelled questions ('+st.questions_picked+' of '+st.questions_available+') &middot; seed '+st.seed+' &middot; '+r.seconds+' s total, '+f(r.seconds_per_searched_question)+' s per searched question<br>Files: '+esc(st.files.join(', '))+'<br>Run '+esc(r.run_id)+' ('+esc(r.created)+'). Headline = the best eligible source of each question; a question not returned counts as a miss in the rates and is left out of the mean and median.</div>'+
+  '<h2>Settings</h2><div class="panel sub" style="font-size:13.5px">Questions <b>'+esc(st.question_state||'-')+'</b> ('+esc(st.question_status||'closed')+') &middot; source-document states <b>'+esc(st.states_label||'all')+'</b> &middot; <b>'+st.percent+'%</b> of the labelled questions ('+st.questions_picked+' of '+st.questions_available+') &middot; seed '+st.seed+' &middot; '+r.seconds+' s total, '+f(r.seconds_per_searched_question)+' s per searched question<br>Files: '+esc(st.files.join(', '))+'<br>Run '+esc(r.run_id)+' ('+esc(r.created)+'). Headline = the best eligible source of each question; a question not returned counts as a miss in the rates and is left out of the mean and median.</div>'+
   '<h2>Summary: what is scored</h2><div class="panel" style="font-size:13.5px">'+(el?
-   '<div>'+esc(el.rule)+'</div><div style="margin-top:8px"><b>'+el.pairs_total+'</b> (question, document) pairs in the picked questions: <b>'+el.pairs_eligible+'</b> scored ('+el.pairs_eligible_state+' state, '+el.pairs_eligible_central+' central), <b>'+el.pairs_excluded+'</b> excluded, by reason:</div><ul class="cfg">'+reasons+'</ul><div>Questions: '+el.questions_scored+' scored, '+el.questions_not_scored+' not scored (no eligible source; not counted as misses).</div>':
+   '<div>'+esc(el.rule)+'</div><div style="margin-top:8px"><b>'+el.pairs_total+'</b> (question, document) pairs in the picked questions: <b>'+el.pairs_eligible+'</b> scored ('+Object.entries(el.pairs_eligible_by_state||{}).map(([k,v])=>v+' '+esc(k)).join(', ')+'), <b>'+el.pairs_excluded+'</b> excluded, by reason:</div><ul class="cfg">'+reasons+'</ul><div>Questions: '+el.questions_scored+' scored, '+el.questions_not_scored+' not scored (no eligible source; not counted as misses).</div>':
    '<div class="sub">Not available for an old run.</div>')+'</div>'+
   '<h2>Documents</h2><div class="cards">'+card(f(s.rank_mean),'mean rank (returned)')+card(f(s.rank_median),'median rank (returned)')+card(f(s.top1,'%'),'top-1')+card(f(s.top5,'%'),'top-5')+card(f(s.top10,'%'),'top-10')+card(f(s.top50,'%'),'top-50')+
   card(s.scored+' of '+s.questions,'questions scored')+card(s.not_returned,'scored, doc not returned')+card(el?el.pairs_excluded:'-','pairs excluded (of '+(el?el.pairs_total:'-')+')')+card(s.no_eligible_source,'questions with no eligible source')+'</div>'+
   '<h2>Pages (top 5 returned pages of the document)</h2><div class="cards">'+card(f(s.page_distance_mean),'mean page distance')+card(f(s.page_hit,'%'),'exact page hit')+card(f(s.dist_le_1,'%'),'within 1 page')+card(f(s.dist_le_2,'%'),'within 2 pages')+card(f(s.dist_le_5,'%'),'within 5 pages')+card(s.page_scored,'questions with labelled pages')+'</div>'+
   '<div class="sub" style="margin-top:6px">Page rates are over the '+s.page_scored+' scored questions that have labelled pages; a question whose document was not returned counts as a miss.</div>'+
-  (s.by_scope?groupTable('By scope of the labelled document',{'state (all eligible sources state)':s.by_scope.state,'central (all eligible sources central)':s.by_scope.central,'both (sources of both scopes)':s.by_scope.both,'overall':s},'Source scope'):'')+
+  (s.by_state?groupTable('By state of the labelled document (a question counts under every state of its sources\' documents)',{...s.by_state,'overall':s},'Source-document state'):'')+
   groupTable('By channel',s.by_channel,'Channel')+groupTable('By crop',s.by_crop,'Crop')+
-  '<h2>Questions scored ('+r.questions.filter(x=>x.n_eligible).length+')</h2><div class="sub">Click a header to sort; the default is worst first.</div><div class="scroll"><table id="qt"><tr>'+cols.map(c=>'<th data-k="'+c[0]+'">'+c[1]+'</th>').join('')+'</tr><tbody id="qrows"></tbody></table></div>'+
-  '<h2>Excluded ('+r.excluded.length+' pairs, in no metric)</h2>'+(r.excluded.length?'<div class="scroll"><table><tr><th>Question ID</th><th>Document</th><th>Scope</th><th>Reason</th><th>Detail</th><th>Pages</th></tr>'+r.excluded.map(x=>'<tr><td>'+esc(x.question_id)+'</td><td><a href="'+esc(x.link)+'">'+esc(x.name)+'</a></td><td>'+esc(x.scope||'-')+'</td><td>'+esc(x.reason)+'</td><td>'+esc(x.detail)+'</td><td>'+esc(x.pages_labelled.join(', '))+'</td></tr>').join('')+'</table></div>':'<div class="sub">None.</div>');
- sortKey='worst';sortDir=1;table();
- document.querySelectorAll('#qt th').forEach(th=>th.onclick=()=>{const k=th.dataset.k;if(k===sortKey)sortDir=-sortDir;else{sortKey=k;sortDir=1;}table();});
+  '<h2>Questions scored ('+r.questions.filter(x=>x.n_eligible).length+')</h2><div class="sub">Click a header to sort; the default is worst first.</div><div class="scroll"><table id="qt"><tr>'+cols.map(c=>'<th data-k="'+c[0]+'">'+c[1]+'</th>').join('')+'</tr><tbody id="qrows"></tbody></table></div><div id="more" style="margin:10px 0"></div>'+
+  '<h2>Excluded ('+r.excluded.length+' pairs, in no metric)</h2>'+(r.excluded.length?'<div class="scroll"><table><tr><th>Question ID</th><th>Document</th><th>States</th><th>Reason</th><th>Detail</th><th>Pages</th></tr><tbody id="exrows"></tbody></table></div><div id="exmore" style="margin:10px 0"></div>':'<div class="sub">None.</div>');
+ const exRow=x=>('<tr><td>'+esc(x.question_id)+'</td><td><a href="'+esc(x.link)+'">'+esc(x.name)+'</a></td><td>'+esc((x.states||[]).join(', ')||'-')+'</td><td>'+esc(x.reason)+'</td><td>'+esc(x.detail)+'</td><td>'+esc(x.pages_labelled.join(', '))+'</td></tr>');
+ $('body').innerHTML=html;
+ let exShown=100;
+ const exTable=()=>{const eb=$('exrows');if(!eb)return;eb.innerHTML=r.excluded.slice(0,exShown).map(exRow).join('');$('exmore').innerHTML=r.excluded.length>exShown?'<button id="exbtn">Show '+Math.min(100,r.excluded.length-exShown)+' more ('+exShown+' of '+r.excluded.length+' shown)</button>':'';const b=$('exbtn');if(b)b.onclick=()=>{exShown+=100;exTable();};};
+ exTable();
+ sortKey='worst';sortDir=1;shown=100;table();
+ document.querySelectorAll('#qt th').forEach(th=>th.onclick=()=>{const k=th.dataset.k;if(k===sortKey)sortDir=-sortDir;else{sortKey=k;sortDir=1;}shown=100;table();});
  document.querySelectorAll('#cmp tr[data-run]').forEach(tr=>tr.classList.toggle('cur',tr.dataset.run===r.run_id));
 }
 async function load(id){
@@ -104,12 +111,12 @@ async function load(id){
 function pick(id){$('run').value=id;history.pushState(null,'','/report?run='+encodeURIComponent(id));$('allbox').open=false;load(id);window.scrollTo(0,$('run').getBoundingClientRect().top+scrollY-10);}
 function compare(){
  const latest={};RUNS.forEach(r=>{if(!latest[r.mode])latest[r.mode]=r;});   // /api/test/runs is newest first
- $('cmp').innerHTML='<tr><th>#</th><th>Method</th><th>Latest run</th><th class="num">%</th><th>Scope</th><th class="num">Scored</th><th class="num">State scored</th><th class="num">Central scored</th><th class="num">Top-1 %</th><th class="num">Top-5 %</th><th class="num">Top-10 %</th><th class="num">Top-50 %</th><th class="num">Median rank</th><th class="num">Mean page dist.</th><th class="num">State top-10 %</th><th class="num">Central top-10 %</th></tr>'+
+ $('cmp').innerHTML='<tr><th>#</th><th>Method</th><th>Latest run</th><th class="num">%</th><th>Source states</th><th class="num">Scored</th><th class="num">Top-1 %</th><th class="num">Top-5 %</th><th class="num">Top-10 %</th><th class="num">Top-50 %</th><th class="num">Median rank</th><th class="num">Mean page dist.</th><th>By state: scored, top-10 %</th></tr>'+
   MODES.map(m=>{const r=latest[m.key];
    const nm='<td>'+m.number+'</td><td><details><summary>'+esc(m.name)+'</summary><div class="sub">'+esc(m.description)+(m.built_on?' (built on #'+m.built_on+')':'')+'</div>'+cfg(m)+'</details></td>';
-   if(!r)return '<tr>'+nm+'<td colspan="14" class="sub">no run yet</td></tr>';
-   return '<tr data-run="'+esc(r.run_id)+'">'+nm+'<td><a href="/report?run='+encodeURIComponent(r.run_id)+'" data-run="'+esc(r.run_id)+'" class="pk">'+esc(when(r.created))+'</a>'+(r.old_run?' <span class="sub">old run, before eligibility filter</span>':'')+'</td><td class="num">'+r.percent+'</td><td>'+esc(r.scope)+'</td><td class="num">'+r.scored+'</td><td class="num">'+f(r.state_scored)+'</td><td class="num">'+f(r.central_scored)+'</td>'+
-    ['top1','top5','top10','top50','rank_median','page_distance_mean','state_top10','central_top10'].map(k=>'<td class="num">'+f(r[k])+'</td>').join('')+'</tr>';}).join('');
+   if(!r)return '<tr>'+nm+'<td colspan="11" class="sub">no run yet</td></tr>';
+   return '<tr data-run="'+esc(r.run_id)+'">'+nm+'<td><a href="/report?run='+encodeURIComponent(r.run_id)+'" data-run="'+esc(r.run_id)+'" class="pk">'+esc(when(r.created))+'</a>'+(r.old_run?' <span class="sub">old run, before eligibility filter</span>':'')+'</td><td class="num">'+r.percent+'</td><td>'+esc(r.states)+'</td><td class="num">'+r.scored+'</td>'+
+    ['top1','top5','top10','top50','rank_median','page_distance_mean'].map(k=>'<td class="num">'+f(r[k])+'</td>').join('')+'<td>'+Object.entries(r.by_state).map(([k,v])=>esc(k)+' '+v.scored+', '+f(v.top10,'%')).join(' &middot; ')+'</td></tr>';}).join('');
  document.querySelectorAll('#cmp a.pk').forEach(a=>a.onclick=e=>{e.preventDefault();pick(a.dataset.run);});
 }
 (async()=>{
