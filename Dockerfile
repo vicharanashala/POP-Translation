@@ -3,21 +3,20 @@ FROM python:3.11-slim
 # ============================================
 # Install runtime dependencies
 # ============================================
-# tesseract-ocr: runtime OCR engine (used by pytesseract + tesserocr).
-# libtesseract-dev/libleptonica-dev/pkg-config/build-essential: headers and a
-# compiler needed to build the tesserocr C extension at pip-install time.
-# No tesseract-ocr-<lang> packages -- OCR always points at the bundled
-# tessdata_best/ models (see scripts/hash_and_embed_report_true.py), never
-# the system tessdata dir.
-# curl: downloads the s6-overlay release below.
+# pandoc: HTML -> DOCX, the one external binary the translation pipeline runs
+#   (convert_html_to_docx in scripts/run_pop_to_docx_updated_pagewise_docx.py).
+# curl + xz-utils: download and unpack the s6-overlay release below, which ships
+#   as .tar.xz. The slim base has no xz; it used to arrive only as a side effect
+#   of build-essential (dpkg-dev depends on xz-utils), so it is named here.
+# Deliberately absent: tesseract-ocr, its -dev headers and build-essential.
+# They were here to compile `tesserocr` for the upload-time duplicate check,
+# which no longer runs in the server (dashboard/dedup.py is gone). Every
+# package in requirements.lock ships a prebuilt wheel, so nothing here needs
+# a compiler. OCR for translation is the separate OCR_URL service.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pandoc \
-    tesseract-ocr \
-    libtesseract-dev \
-    libleptonica-dev \
-    pkg-config \
-    build-essential \
     curl \
+    xz-utils \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
@@ -37,11 +36,10 @@ RUN mkdir -p /etc/services.d/python
 WORKDIR /app
 
 COPY requirements.lock .
-# --extra-index-url: torch is pinned to the CPU-only build (see
-# pyproject.toml's [tool.uv.sources]/[[tool.uv.index]] for the matching uv
-# config) -- only download.pytorch.org hosts the "+cpu" tagged wheel.
-RUN pip install --no-cache-dir -r requirements.lock \
-    --extra-index-url https://download.pytorch.org/whl/cpu
+# Pure PyPI, wheels only: --only-binary makes a missing wheel fail the build
+# loudly instead of quietly compiling from source (which would need the
+# compiler this image no longer has).
+RUN pip install --no-cache-dir --only-binary=:all: -r requirements.lock
 
 COPY . .
 

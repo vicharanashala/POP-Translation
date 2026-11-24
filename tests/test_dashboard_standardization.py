@@ -164,14 +164,17 @@ def test_in_use_crop_survives_a_placement_delete(client, db):
 # -- language ----------------------------------------------------------------
 
 
-def test_languages_endpoint_is_the_tessdata_code_list(client):
-    """The language config lives in code (dashboard/dedup.py), not the
-    database, because it must match the tessdata_best models actually installed
-    on disk. The frontend populates its dropdown from this endpoint."""
-    from dashboard.dedup import LANGUAGES
+def test_languages_endpoint_serves_the_language_list(client):
+    """The language list lives in code (dashboard/languages.py) and is seeded
+    into the database by the corpus load; the frontend populates its dropdown
+    from this endpoint. Every code in the code list must be served, and the only
+    extra the database may carry is `non_english`, the OCR pass's verdict."""
+    from dashboard.languages import LANGUAGES
 
     body = client.get("/dashboard/languages").json()
-    assert {row["code"] for row in body} == set(LANGUAGES)
+    codes = {row["code"] for row in body}
+    assert set(LANGUAGES) <= codes
+    assert codes - set(LANGUAGES) <= {"non_english"}
     assert all(row["label"] for row in body)
 
 

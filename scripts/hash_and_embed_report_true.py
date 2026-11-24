@@ -1,4 +1,9 @@
 """
+Hand-run corpus tooling: NOT part of the server or its Docker image. Needs the
+`corpus-tools` extra (`uv sync --extra corpus-tools`, plus the system
+tesseract-ocr package) -- the upload-time duplicate check that used to import
+this (dashboard/dedup.py) is gone, and nothing the server loads reaches it.
+
 Single script, two phases, both over results/state_language_report/report_true.csv:
 
 Phase 1 -- SHA: for each unique pdf NAME, SHA-256 its file bytes (downloaded

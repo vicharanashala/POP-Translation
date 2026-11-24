@@ -2,12 +2,22 @@
 name = "pop-server"
 version = "0.1.0"
 requires-python = ">=3.11"
+# Exactly what pop_server.py and the modules it imports need at runtime -- and
+# nothing else. This is what the Docker image installs (through the pinned
+# requirements.lock). Torch, sentence-transformers, tesseract and friends are
+# NOT here: they belonged to the upload-time duplicate check (dashboard/dedup.py,
+# since deleted), cost ~1.3 GB of image and were never imported by the server.
+# The one-off corpus scripts that still need them live in the `corpus-tools`
+# extra below.
 dependencies = [
     # API server
     "fastapi>=0.110.0",
     "uvicorn[standard]>=0.29.0",
     "pydantic>=2.0.0",
     "python-multipart>=0.0.9",
+    # Imported directly (pop_server.py, dashboard/config.py and the pipeline
+    # script) -- it used to arrive only as a side effect of uvicorn[standard].
+    "python-dotenv>=1.0.0",
 
     # Gemini API
     "google-genai>=1.0.0",
@@ -18,24 +28,11 @@ dependencies = [
     # Claude API
     "anthropic>=0.60.0",
 
-    # Self-hosted OCR service (two-step translation); already pinned in the lock
+    # Zoho WorkDrive client and the self-hosted OCR service (two-step translation)
     "requests>=2.31.0",
 
-    # PDF processing
+    # PDF splitting and page rendering (imported as `fitz`)
     "pymupdf>=1.23.0",
-    "pdfplumber>=0.11.0",
-
-    # Local OCR-based language detection (tessdata_best/)
-    "pytesseract>=0.3.10",
-    "tesserocr>=2.6.0",
-
-    # Dashboard: dedup embedding (intfloat/multilingual-e5-base, CPU-only --
-    # see [tool.uv.sources] below for the matching CPU wheel index)
-    "sentence-transformers>=3.0.0",
-    "torch>=2.0.0",
-
-    # Legacy Indic font converters
-    "bijoy2unicode>=0.1.1",
 
     # HTML processing
     "beautifulsoup4>=4.12.0",
@@ -44,10 +41,24 @@ dependencies = [
     "python-docx>=1.1.0",
     "docxcompose>=1.4.0",
 
-    # Dashboard: MongoDB Atlas-backed document catalogue, with duplicate
-    # detection on Atlas Vector Search (replaces the previous Postgres +
-    # pgvector setup).
+    # Dashboard: MongoDB Atlas-backed document catalogue.
     "pymongo>=4.6.0",
+]
+
+[project.optional-dependencies]
+# For the hand-run corpus tooling only (scripts/hash_and_embed_report_true.py
+# and scripts/ocr_layout_common.py): Tesseract layout+OCR of a document's middle
+# page, then an intfloat/multilingual-e5-base embedding of the transcript. That
+# is how the ~8,000 corpus embeddings were produced. The server never imports
+# any of this. Install on a workstation with `uv sync --extra corpus-tools`;
+# the system `tesseract-ocr` package and its headers are needed to build
+# tesserocr. Never part of the image.
+corpus-tools = [
+    "pytesseract>=0.3.10",
+    "tesserocr>=2.6.0",
+    "pillow>=10.0.0",
+    "sentence-transformers>=3.0.0",
+    "torch>=2.0.0",
 ]
 
 [build-system]
@@ -55,8 +66,8 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.uv.sources]
-# CPU-only build -- matches dashboard/queue_worker.py's SentenceTransformer(device="cpu")
-# call and keeps the image from pulling in ~2GB of unused CUDA/cuDNN wheels.
+# CPU-only torch for the corpus-tools extra, so a workstation does not pull
+# ~2GB of unused CUDA/cuDNN wheels.
 torch = [{ index = "pytorch-cpu" }]
 
 [[tool.uv.index]]

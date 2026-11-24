@@ -58,19 +58,19 @@ tmp/
 tmp_2/
 fix/
 
-# scripts/ is ignored by default (mostly one-off analysis scripts), but these
-# are real application dependencies -- dashboard/dedup.py imports them, and
-# the production Docker image needs them (see .dockerignore).
+# scripts/ is ignored by default (mostly one-off analysis scripts). These are
+# kept by name: run_pop_to_docx_updated_pagewise_docx.py is the translation
+# pipeline the server imports, sync_lgd.py is the vocabulary sync, and the two
+# corpus scripts are the hand-run Tesseract + embedding tooling (the
+# `corpus-tools` extra in pyproject.toml; kept out of the Docker image by
+# .dockerignore -- no server code imports them).
 !scripts/
 scripts/*
 !scripts/hash_and_embed_report_true.py
 !scripts/ocr_layout_common.py
+!scripts/run_pop_to_docx_updated_pagewise_docx.py
+!scripts/sync_lgd.py
 !scripts/__init__.py
-
-# tessdata_best/: Tesseract's high-accuracy OCR models, a real runtime
-# dependency of dashboard/dedup.py (and scripts/hash_and_embed_report_true.py)
-# -- not a dev-scratch directory despite living next to ones that are.
-!tessdata_best/
 # Node dashboard backend
 node_modules/
 server/package-lock.json

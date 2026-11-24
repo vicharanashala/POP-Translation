@@ -2,10 +2,15 @@
 cropped_files_2/route_translate.py and scripts/hash_and_embed_report_true.py.
 
 Pulled out on its own (2026-08-27) so hash_and_embed_report_true.py -- which
-dashboard/dedup.py imports for the upload-dedup embedding path -- doesn't
+dashboard/dedup.py then imported for the upload-dedup embedding path -- didn't
 drag cropped_files_2/ (and transitively cropped_files/, ~1.1GB combined of
 dev-experiment scratch output) into the production Docker image just to
 reach these 5 names.
+
+dashboard/dedup.py has since been deleted and the server no longer runs any
+Tesseract: this module and hash_and_embed_report_true.py are hand-run corpus
+tooling only. They need the `corpus-tools` extra (`uv sync --extra
+corpus-tools`) and are excluded from the Docker image (.dockerignore).
 """
 from __future__ import annotations
 

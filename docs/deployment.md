@@ -264,7 +264,6 @@ scripts/**
 prompts/**
 Dockerfile
 requirements.lock
-requirements.txt
 pyproject.toml
 ```
 
@@ -311,7 +310,9 @@ Core runtime:
 | `requests` | Zoho WorkDrive HTTP client |
 | `python-dotenv` | `.env` file loading |
 
-Pin versions in `requirements.lock` for reproducible builds. `requirements.txt` is the loose top-level list used as a reference.
+`pyproject.toml` declares what the server needs; `requirements.lock` pins every version (including transitive ones) and is what the image installs, wheels only, so a build never compiles anything. `uv.lock` is the same set for workstations (`uv sync`). Keep the two locks in step: after changing `pyproject.toml`, resolve with the old lock as a constraint (`uv pip compile pyproject.toml --universal --python-version 3.11 -c requirements.lock`) so unrelated packages are not silently upgraded, and run `uv lock`.
+
+Not part of the image: the hand-run corpus tooling (`scripts/hash_and_embed_report_true.py`, `scripts/ocr_layout_common.py`) needs Tesseract and sentence-transformers. Install those on a workstation with `uv sync --extra corpus-tools`.
 
 ---
 

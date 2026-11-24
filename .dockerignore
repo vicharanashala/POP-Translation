@@ -89,8 +89,27 @@ results/
 tmp/
 tmp_2/
 
-# scripts/ and tessdata_best/ are NOT ignored -- dashboard/dedup.py imports
-# scripts/hash_and_embed_report_true.py at module load, and that module reads
-# tessdata_best/*.traineddata directly off disk at REPO_ROOT/tessdata_best.
-# Both must ship in the image for the dashboard's upload/dedup flow to work.
+# scripts/ ships, because scripts/run_pop_to_docx_updated_pagewise_docx.py IS the
+# translation pipeline. These two do not: they are the hand-run corpus tooling
+# (Tesseract + sentence-transformers, installed by the `corpus-tools` extra in
+# pyproject.toml, not by this image), so inside the container they could only
+# fail on import. Nothing the server loads reaches them.
+scripts/hash_and_embed_report_true.py
+scripts/ocr_layout_common.py
+
+# Nothing the server reads at runtime: docs and tests are for people, and the
+# rest are one-off exports, working files and office documents that sit in the
+# checkout (some hold credentials) and would otherwise be copied by `COPY . .`
+# on a local `docker compose up --build`.
+docs/
+tests/
+anara/
+exports/
+logs/
+*.odt
+*.ods
+*.xlsx
+*.docx
+*.pdf
+*.csv
 

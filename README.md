@@ -56,7 +56,7 @@ POP-Translation/
 ├── scripts/
 │   └── run_pop_to_docx_updated_pagewise_docx.py
 │
-├── requirements.txt
+├── requirements.lock
 ├── README.md
 └── .gitignore
 ```
@@ -79,7 +79,7 @@ POP_Work/
 │
 ├── prompts/
 ├── scripts/
-├── requirements.txt
+├── requirements.lock
 └── README.md
 ```
 
@@ -120,7 +120,7 @@ Python 3.11+
 
 Install required Python packages using:
 ```
-pip install -r requirements.txt
+pip install -r requirements.lock
 ```
 
 Pandoc is required for converting combined HTML into .docx.
@@ -143,7 +143,7 @@ venv\Scripts\activate
 ```
 3. Install dependencies:
 ```
-pip install -r requirements.txt
+pip install -r requirements.lock
 ```
 4. Set Gemini API key:
 ```
