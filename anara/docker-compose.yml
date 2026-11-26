@@ -1,0 +1,72 @@
+# Public Source Mapper: an app container on an INTERNAL network (no route to the host, its localhost services or the internet)
+# and an nginx proxy that is the only thing published, on 127.0.0.1:8050. Start/stop with ./deploy.sh (see INDEX.md).
+name: anara
+services:
+  app:
+    build: {context: ., dockerfile: Dockerfile}
+    image: anara-app:local
+    user: "10001:10001"              # no supplementary groups
+    read_only: true
+    tmpfs: ["/tmp:size=64m,mode=1777,noexec,nosuid,nodev"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      ANARA_DATA: /data
+      ANARA_RUNS: /runs
+      AUTH_DIR: /auth
+      ANARA_NO_DOTENV: "1"           # no .env is read (none is mounted either)
+      ANARA_KEYWORD_ONLY: "1"        # no embedding model, no MongoDB
+      ANARA_HOST: 0.0.0.0            # inside the internal network only
+      ANARA_FORWARDED_ALLOW_IPS: 172.29.250.0/24
+      AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-1}
+      AUTH_ALLOWED_HOSTS: ${AUTH_ALLOWED_HOSTS:-}
+      AUTH_ALLOWED_HOST_SUFFIXES: ${AUTH_ALLOWED_HOST_SUFFIXES:-}
+    volumes:
+      - ./deploy/data:/data:ro       # hard links to the data files the keyword modes read (deploy.sh sync-data); no secrets, no PDFs
+      - anara_runs:/runs             # writable: labelled-test results
+      - anara_auth:/auth             # writable: users, JWT secret, refresh tokens, allowed_hosts.txt
+    networks: [internal]
+    mem_limit: 4g
+    memswap_limit: 4g
+    cpus: 2
+    pids_limit: 256
+    restart: unless-stopped
+  proxy:
+    image: nginxinc/nginx-unprivileged:alpine@sha256:b5047b9b76845eac124358373c6852377c52e4b05834a47647e955dd91cb8f1e   # nginx 1.31.7, pinned by digest
+    user: "101:101"
+    read_only: true
+    tmpfs: ["/tmp:size=32m,mode=1777"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    volumes: ["./deploy/nginx.conf:/etc/nginx/nginx.conf:ro"]
+    ports: ["127.0.0.1:8050:8080"]   # loopback only, never 0.0.0.0
+    networks: [internal, edge]
+    mem_limit: 128m
+    pids_limit: 64
+    depends_on: {app: {condition: service_started}}
+    restart: unless-stopped
+  # Cloudflare QUICK tunnel (free, no account, random *.trycloudflare.com host). Only started by ./deploy.sh tunnel-up (profile "tunnel").
+  # It makes an OUTBOUND connection to Cloudflare and forwards to the proxy; it holds no secrets, no mounts, no published port.
+  tunnel:
+    profiles: [tunnel]
+    image: cloudflare/cloudflared:2026.11.2@sha256:55c7e3e8d89d5e8d20b75a82f3602cbf98e06db406e73e282073cfdc5a9a3af6
+    user: "65532:65532"
+    read_only: true
+    tmpfs: ["/tmp:size=16m,mode=1777,noexec,nosuid,nodev"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    command: ["tunnel", "--no-autoupdate", "--metrics", "127.0.0.1:20241", "--url", "http://proxy:8080"]   # metrics only inside the container
+    networks: {edge: {ipv4_address: 172.29.251.10}}     # fixed: nginx trusts CF-Connecting-IP from this address only
+    mem_limit: 256m
+    pids_limit: 64
+    restart: "no"
+volumes:
+  anara_runs: {}
+  anara_auth: {}
+networks:
+  internal:
+    internal: true                   # no route out
+    driver_opts: {com.docker.network.bridge.inhibit_ipv4: "true"}   # and no host-side address: the app cannot even reach the host's own ports
+    ipam: {config: [{subnet: 172.29.250.0/24}]}
+  edge:                              # outbound internet for the tunnel; the proxy is the only thing on it that listens
+    ipam: {config: [{subnet: 172.29.251.0/24}]}

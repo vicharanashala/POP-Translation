@@ -20,8 +20,9 @@ XLSX = HERE / "pop-documents-state-2026-11-12.xlsx"
 
 # Zoho credentials come from the repo's .env (read only). Mongo settings come
 # from anara/.env so the test DB never mixes with POP's.
-load_dotenv(ROOT / ".env")
-load_dotenv(HERE / ".env", override=True)
+if not os.environ.get("ANARA_NO_DOTENV"):        # the public container sets this: no .env is read
+    load_dotenv(ROOT / ".env")
+    load_dotenv(HERE / ".env", override=True)
 for p in (str(ROOT),):
     if p not in sys.path:
         sys.path.insert(0, p)

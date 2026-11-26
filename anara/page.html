@@ -64,7 +64,7 @@ button:hover{background:#2f3fb5}button:disabled{opacity:.6;cursor:wait}
 </style>
 <body><div class="wrap">
 <h1>Source Mapper</h1>
-<p class="lead">Find the document and the pages that answer a question. <a href="/documents">Document inventory</a> &middot; <a href="/report">Labelled test report</a></p>
+<p class="lead">Find the document and the pages that answer a question. <a href="/documents">Document inventory</a> &middot; <a href="/report">Labelled test report</a> &middot; <a href="#" id="logout">Log out</a></p>
 <form id="f" class="panel">
  <div class="row"><input id="q" placeholder="Ask a question, e.g. how to control pink bollworm in cotton" autofocus autocomplete="off"><button id="go">Search</button></div>
  <div class="row"><input id="link" placeholder="Optional: paste a document link to find it in the results" autocomplete="off">
@@ -263,7 +263,7 @@ async function run(){
 $('f').addEventListener('submit',e=>{e.preventDefault();run();});
 const P=new URLSearchParams(location.search);   // ?q=...&link=...&mode=hybrid runs a search on load; ?test=1 opens the test panel
 let MODES=[];const isC=k=>!!(MODES.find(m=>m.key===k)||{}).central;
-const modeLabel=m=>'#'+m.number+' '+m.name;
+const modeLabel=m=>'#'+m.number+' '+m.name+(m.available===false?' (not available here)':'');
 function showInfo(key){
  const m=MODES.find(x=>x.key===(key||modeOn()[0]));if(!m){$('minfo').innerHTML='';return;}
  $('minfo').innerHTML='<b class="n">#'+m.number+' '+esc(m.name)+'</b>'+(m.built_on?' <span class="sub">(built on #'+m.built_on+')</span>':'')+' &mdash; '+esc(m.description)+
@@ -303,9 +303,9 @@ $('rnd').onclick=async()=>{
 };
 (async()=>{
  MODES=await (await fetch('/api/modes')).json();
- const want=(P.get('mode')||'full').split(',').filter(k=>MODES.some(m=>m.key===k));
- $('mmodes').innerHTML=MODES.map(m=>'<label class="sub"><input type="checkbox" value="'+m.key+'"'+(want.includes(m.key)?' checked':'')+'> '+esc(modeLabel(m))+'</label>').join('');
- $('tmode').innerHTML=MODES.map(m=>'<option value="'+m.key+'">'+esc(modeLabel(m))+'</option>').join('');
+ const want=(P.get('mode')||(MODES.some(m=>m.key==='full'&&m.available!==false)?'full':'bm25nearcov')).split(',').filter(k=>MODES.some(m=>m.key===k&&m.available!==false));
+ $('mmodes').innerHTML=MODES.map(m=>'<label class="sub"><input type="checkbox" value="'+m.key+'"'+(m.available===false?' disabled':want.includes(m.key)?' checked':'')+'> '+esc(modeLabel(m))+'</label>').join('');
+ $('tmode').innerHTML=MODES.map(m=>'<option value="'+m.key+'"'+(m.available===false?' disabled':'')+'>'+esc(modeLabel(m))+'</option>').join('');
  const rs=await (await fetch('/api/random_question/states')).json();
  $('sstate').innerHTML=rs.filter(x=>x.state!=='All'&&x.state!=='Central').map(x=>'<option value="'+esc(x.state)+'">'+esc(x.state)+' ('+x.questions+')</option>').join('');
  if(P.get('vector'))$('vec').value=P.get('vector');

@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Source Mapper - sign in</title>
+<style>
+body{font:15px system-ui,sans-serif;background:#f4f5f8;margin:0;display:grid;place-items:center;min-height:100vh}
+form{background:#fff;padding:28px 30px;border-radius:10px;box-shadow:0 2px 12px #0002;width:300px}
+h1{font-size:19px;margin:0 0 16px}
+input{width:100%;box-sizing:border-box;padding:9px;margin:0 0 12px;border:1px solid #bbb;border-radius:6px;font:inherit}
+button{width:100%;padding:9px;border:0;border-radius:6px;background:#3b49c8;color:#fff;font:inherit;cursor:pointer}
+#err{color:#b00020;min-height:1.3em;margin-top:10px;font-size:13px}
+</style>
+<body>
+<form id="f" autocomplete="on">
+<h1>Source Mapper</h1>
+<input id="u" name="username" placeholder="Username" autocomplete="username" required maxlength="64">
+<input id="p" name="password" type="password" placeholder="Password" autocomplete="current-password" required maxlength="256">
+<button type="submit">Sign in</button>
+<div id="err"></div>
+</form>
+<script>
+// same-site path only: tabs and newlines are removed first (browsers ignore them in URLs, so "/\t/evil.com" would become "//evil.com")
+function dest(){
+ const n=(new URLSearchParams(location.search).get('next')||'/').replace(/[\t\r\n]/g,'');
+ try{const u=new URL(n,location.origin);
+  if(u.origin===location.origin&&n.startsWith('/')&&!n.startsWith('//')&&!n.startsWith('/\\'))return u.pathname+u.search;}catch(x){}
+ return '/';}
+document.getElementById('f').addEventListener('submit',async e=>{
+ e.preventDefault();
+ const err=document.getElementById('err');err.textContent='';
+ try{
+  const r=await fetch('/auth/login',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-Requested-With':'sm'},
+   body:JSON.stringify({username:document.getElementById('u').value,password:document.getElementById('p').value})});
+  if(r.ok){location.href=dest();return;}
+  err.textContent=r.status===429?'Too many attempts. Try again later.':'Invalid username or password.';
+ }catch(x){err.textContent='Could not reach the server.';}
+});
+</script>
+</html>

@@ -25,6 +25,7 @@ from __future__ import annotations
 import functools
 import glob
 import json
+import os
 import random
 import re
 import statistics
@@ -46,7 +47,7 @@ EXCLUDE_REASONS = ["not in index", "no extractable text", "not English", "outsid
 LIMIT = 3000        # documents asked of the ranking functions (a mode's whole list)
 RANK_CAP = 50        # a source document ranked below this (or not returned) is scored as RANK_CAP + 1
 TOP_PAGES = 5       # returned pages per document that are scored
-RUNS = common.DATA / "test_runs"
+RUNS = Path(os.environ["ANARA_RUNS"]) if os.environ.get("ANARA_RUNS") else common.DATA / "test_runs"   # ANARA_RUNS: a writable folder when data/ is read-only
 QUESTION_FILE = common.DATA / "labelled_db_questions.jsonl"
 QUESTION_GLOB = str(common.DATA / "questions_*_Punjab_closed.xlsx")   # fallback when QUESTION_FILE is missing
 DEFAULT_QUESTION_STATE = "Punjab"

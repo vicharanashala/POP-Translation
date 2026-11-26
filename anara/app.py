@@ -3,19 +3,23 @@
     .venv/bin/python3 anara/app.py        # then open http://127.0.0.1:8050
     GET /api/search?q=...&k=50  ->  search() output as JSON
 
-Listens on 127.0.0.1 only. Loads the embedding model once at startup.
+Listens on 127.0.0.1 only (ANARA_HOST=0.0.0.0 inside the container, whose network is internal). Loads the embedding model once at startup.
+ANARA_KEYWORD_ONLY=1 (the public container): no embedding model, no MongoDB; the embedding modes (full, hybrid, restrict) answer
+503 with a message, everything else works from the files in data/.
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
+import auth  # noqa: E402
 import common  # noqa: E402
 from db import EMBEDDINGS, UNIQUE_DOCS, get_db  # noqa: E402
 from embedder import get_model  # noqa: E402
@@ -29,14 +33,25 @@ from proximity import search_bm25near, search_bm25nearcov, search_bm25nearcov2, 
 from hybrid import keyword_groups, restrict_docs, search_hybrid, search_restrict  # noqa: E402
 
 
+KEYWORD_ONLY = bool(os.environ.get("ANARA_KEYWORD_ONLY"))
+EMBEDDING_MODES = ("full", "hybrid", "restrict")
+NO_EMBEDDINGS = "This mode needs the embedding model and the database, which are not part of the public deployment. Use a keyword mode (zone, proximity, bm25*)."
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    get_model()
-    get_db().command("ping")
+    import anyio.to_thread
+    # at most this many requests compute at once: a request that times out (auth.HEAVY_TIMEOUT) keeps its thread until it ends
+    anyio.to_thread.current_default_thread_limiter().total_tokens = int(os.environ.get("ANARA_THREADS", 8))
+    if not KEYWORD_ONLY:
+        get_model()
+        get_db().command("ping")
     yield
 
 
-app = FastAPI(lifespan=lifespan)
+# no /docs, /redoc or /openapi.json; every route is behind auth.py (login, JWT cookies, roles, security headers)
+app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+auth.install(app)
 
 PAGE_FILE = Path(__file__).with_name("page.html")   # read per request: UI edits need no restart
 REPORT_FILE = Path(__file__).with_name("report.html")
@@ -93,18 +108,18 @@ def add_page_groups(results: list[dict]) -> list[dict]:
 
 
 @app.get("/", response_class=HTMLResponse)
-def index():
-    return PAGE_FILE.read_text()
+def index(request: Request):
+    return auth.page(PAGE_FILE.name, request)
 
 
 @app.get("/report", response_class=HTMLResponse)
-def report_page():
-    return REPORT_FILE.read_text()
+def report_page(request: Request):
+    return auth.page(REPORT_FILE.name, request)
 
 
 @app.get("/documents", response_class=HTMLResponse)
-def docs_page():
-    return DOCS_FILE.read_text()
+def docs_page(request: Request):
+    return auth.page(DOCS_FILE.name, request)
 
 
 @app.get("/api/docs/summary")
@@ -126,8 +141,9 @@ def api_docs_export(state: str = "", verdict: str = "", lang: str = "", q: str =
 
 @app.get("/api/modes")
 def api_modes():
-    """The mode registry (modes.py): key, number in order of invention, short name, description, config."""
-    return modes.modes()
+    """The mode registry (modes.py): key, number in order of invention, short name, description, config; `available` is False
+    for an embedding mode on a keyword-only deployment."""
+    return [{**m, "available": not (KEYWORD_ONLY and m["key"] in EMBEDDING_MODES)} for m in modes.modes()]
 
 
 @app.get("/api/test/options")
@@ -138,7 +154,9 @@ def api_test_options():
 
 @app.post("/api/test/run")
 def api_test_run(body: dict = Body(...)):
-    """Start a labelled test (see labelled_test.py): {mode, percent, seed, question_state, status, states}. One run at a time."""
+    """Start a labelled test (see labelled_test.py): {mode, percent, seed, question_state, status, states}. One run at a time. Admin only (auth.py)."""
+    if KEYWORD_ONLY and body.get("mode") in EMBEDDING_MODES:
+        raise HTTPException(503, NO_EMBEDDINGS)
     try:
         return labelled_test.start(body.get("mode", "bm25nearcov"), float(body.get("percent", 10)),
                                    states=body.get("states") or None,
@@ -146,14 +164,15 @@ def api_test_run(body: dict = Body(...)):
                                    question_state=body.get("question_state") or labelled_test.DEFAULT_QUESTION_STATE,
                                    status=body.get("status") or "closed")
     except RuntimeError as e:
-        raise HTTPException(409, str(e))
+        raise HTTPException(409, auth.scrub(e))
     except ValueError as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, auth.scrub(e))
 
 
 @app.get("/api/test/status")
 def api_test_status():
-    return labelled_test.status()
+    st = labelled_test.status()
+    return {**st, "error": auth.scrub(st["error"])} if st.get("error") else st      # an exception text may hold file paths
 
 
 @app.post("/api/test/cancel")
@@ -185,23 +204,23 @@ MAX_DOCS = 50      # a normal query returns at most this many documents
 
 
 @app.get("/api/search")
-def api_search(q: str = Query(min_length=1), k: int | None = Query(None, ge=5, le=1000),
+def api_search(q: str = Query(min_length=1, max_length=500), k: int | None = Query(None, ge=5, le=100),
                rank: str = Query("top5", pattern="^(top5|count|best)$"),
                mode: str = Query("full", pattern="^(full|hybrid|restrict|zone|proximity|bm25sum|bm25near|bm25nearmax|bm25nearscaled|bm25nearown|bm25nearcov|bm25nearcov2)$"),
                cover: float = Query(0.75, ge=0.1, le=1.0), span: int = Query(6, ge=1, le=30), need_cap: int = Query(4, ge=0, le=20),
                vector: str = Query("original", pattern="^(original|scalar|binary)$"),
-               scope: str = Query("all", pattern="^(all|state|state_central|central)$"), state: str = Query(""),
+               scope: str = Query("all", pattern="^(all|state|state_central|central)$"), state: str = Query("", max_length=100),
                content: bool = Query(False)):
     """The ranked documents of the mode (see _search_all), at most MAX_DOCS (50) of them."""
     return _search_all(q, k, rank, mode, cover, span, need_cap, vector, scope, state, content)[:MAX_DOCS]
 
 
-def _search_all(q: str = Query(min_length=1), k: int | None = Query(None, ge=5, le=1000),
+def _search_all(q: str = Query(min_length=1, max_length=500), k: int | None = Query(None, ge=5, le=100),
                rank: str = Query("top5", pattern="^(top5|count|best)$"),
                mode: str = Query("full", pattern="^(full|hybrid|restrict|zone|proximity|bm25sum|bm25near|bm25nearmax|bm25nearscaled|bm25nearown|bm25nearcov|bm25nearcov2)$"),
                cover: float = Query(0.75, ge=0.1, le=1.0), span: int = Query(6, ge=1, le=30), need_cap: int = Query(4, ge=0, le=20),
                vector: str = Query("original", pattern="^(original|scalar|binary)$"),
-               scope: str = Query("all", pattern="^(all|state|state_central|central)$"), state: str = Query(""),
+               scope: str = Query("all", pattern="^(all|state|state_central|central)$"), state: str = Query("", max_length=100),
                content: bool = Query(False)):
     """mode=hybrid narrows by keywords (+/-2 pages) before the embedding search; mode=restrict keeps
     only documents containing every keyword group (see hybrid.py); mode=proximity matches keywords on 5-page BM25 pages, closest together first (see proximity.py);
@@ -209,6 +228,8 @@ def _search_all(q: str = Query(min_length=1), k: int | None = Query(None, ge=5, 
     page zones and scans them forward for the keyword groups (see zonesearch.py).
     scope: all = every document; state_central = `state`'s documents + Central; state = `state`'s documents only
     (with no `state`: state = every non-Central document); central. See common.scope_key."""
+    if KEYWORD_ONLY and mode in EMBEDDING_MODES:
+        raise HTTPException(503, NO_EMBEDDINGS)
     scope = common.scope_key(scope, state)
     if mode == "bm25nearcov2":  # bm25nearcov with coverage weights 0.9 (+/-1 page) and 0.7 (+/-2 pages) for neighbour-only groups
         return search_bm25nearcov2(q, scope=scope, content=content)
@@ -239,8 +260,10 @@ def _search_all(q: str = Query(min_length=1), k: int | None = Query(None, ge=5, 
 
 
 @app.get("/api/groups")
-def api_groups(q: str = Query(min_length=1)):
+def api_groups(q: str = Query(min_length=1, max_length=500)):
     """Keyword groups of a query and how many documents contain each (restrict mode)."""
+    if KEYWORD_ONLY:
+        raise HTTPException(503, NO_EMBEDDINGS)
     groups = keyword_groups(q)
     docs, counts = restrict_docs(groups)
     return {"used": groups, "unmatched": [], "doc_counts": counts, "candidate_docs": len(docs)}
@@ -253,15 +276,15 @@ def api_random_states():
 
 
 @app.get("/api/random_question")
-def api_random_question(state: str = Query(labelled_test.ALL_STATES), seed: int | None = Query(None)):
+def api_random_question(state: str = Query(labelled_test.ALL_STATES, max_length=100), seed: int | None = Query(None, ge=0, le=2**31)):
     """A random labelled closed question with an eligible source (indexed, English text, labelled pages) whose document
     is in `state` ("All" = any); see labelled_test.random_question."""
     return labelled_test.random_question(state, seed)
 
 
 @app.get("/api/known")
-def api_known(q: str = Query(min_length=1), mode: str = Query("bm25nearcov"),
-              scope: str = Query("all", pattern="^(all|state|state_central|central)$"), state: str = Query("")):
+def api_known(q: str = Query(min_length=1, max_length=500), mode: str = Query("bm25nearcov", pattern="^[a-z0-9]{1,20}$"),
+              scope: str = Query("all", pattern="^(all|state|state_central|central)$"), state: str = Query("", max_length=100)):
     """Labelled questions with exactly this text and their sources/pages (see labelled_test.known_question). A source whose
     document is outside the search scope (as in /api/search) is reported as not checkable, not as a miss."""
     names = labelled_test.doc_state_names()
@@ -271,7 +294,7 @@ def api_known(q: str = Query(min_length=1), mode: str = Query("bm25nearcov"),
 
 
 @app.get("/api/link")
-def api_link(url: str = Query(min_length=1)):
+def api_link(url: str = Query(min_length=1, max_length=2000)):
     """The document behind a pasted link: {"found": bool, "indexed": bool, ...}."""
     doc_id = common.doc_for_link(url)
     if doc_id is None:
@@ -285,7 +308,7 @@ def api_link(url: str = Query(min_length=1)):
 
 
 def _link_doc(doc_id: str) -> dict:
-    row = get_db()[UNIQUE_DOCS].find_one({"_id": doc_id})
+    row = None if KEYWORD_ONLY else get_db()[UNIQUE_DOCS].find_one({"_id": doc_id})
     if row:
         return {"found": True, "indexed": True, "modes": "all", "doc_id": doc_id, "name": row["name"],
                 "link": row["link"], "pages": row["pages"]}
@@ -303,4 +326,10 @@ def _link_doc(doc_id: str) -> dict:
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8050)
+    # loopback by default; the public tunnel (expose.sh) connects through the container's proxy, whose X-Forwarded-For (rightmost
+    # entry, appended by the tunnel's edge) is trusted for the client address, and only from ANARA_FORWARDED_ALLOW_IPS
+    # Limits (audit L4): idle keep-alive connections are closed after 5 s, at most 64 requests in flight (more get 503), request line +
+    # headers over 16 KB are refused (h11). Slow-header (slowloris) protection is the proxy's job: the container's nginx does it.
+    uvicorn.run(app, host=os.environ.get("ANARA_HOST", "127.0.0.1"), port=8050, proxy_headers=True,
+                forwarded_allow_ips=os.environ.get("ANARA_FORWARDED_ALLOW_IPS", "127.0.0.1"), server_header=False,
+                http="h11", h11_max_incomplete_event_size=16 * 1024, timeout_keep_alive=5, limit_concurrency=64)
